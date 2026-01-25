@@ -1,0 +1,25 @@
+{
+  "name": "Claude Plugin Marketplace",
+  "version": "1.0.0",
+  "description": "A collection of useful Claude Code plugins",
+  "author": "kennethx",
+  "repository": "https://github.com/kennethx/claude-plugin-marketplace",
+  "plugins": [
+    {
+      "id": "claude_md",
+      "name": "Claude MD",
+      "description": "A plugin for managing CLAUDE.md configurations",
+      "version": "1.0.0",
+      "path": "plugins/claude_md",
+      "tags": ["configuration", "productivity"]
+    },
+    {
+      "id": "Socratic_Questioning",
+      "name": "Socratic Questioning",
+      "description": "A plugin that guides Claude to use Socratic questioning methods",
+      "version": "1.0.0",
+      "path": "plugins/Socratic_Questioning",
+      "tags": ["thinking", "methodology"]
+    }
+  ]
+}

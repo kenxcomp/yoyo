@@ -1,0 +1,12 @@
+{
+  "name": "Socratic_Questioning",
+  "version": "1.0.0",
+  "description": "A plugin that guides Claude to use Socratic questioning methods",
+  "author": "kennethx",
+  "license": "MIT",
+  "keywords": ["thinking", "methodology", "questioning"],
+  "commands": [],
+  "agents": [],
+  "skills": [],
+  "dependencies": {}
+}

@@ -1,0 +1,12 @@
+{
+  "name": "claude_md",
+  "version": "1.0.0",
+  "description": "A plugin for managing CLAUDE.md configurations",
+  "author": "kennethx",
+  "license": "MIT",
+  "keywords": ["configuration", "productivity", "claude"],
+  "commands": [],
+  "agents": [],
+  "skills": [],
+  "dependencies": {}
+}
