@@ -1,5 +1,5 @@
 {
-  "name": "Socratic_Questioning",
+  "name": "socratic-questioning",
   "description": "A plugin that guides Claude to use Socratic questioning methods to clarify unclear user prompts before taking action",
   "author": {
     "name": "kenxcomp"

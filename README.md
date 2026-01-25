@@ -22,8 +22,8 @@ First, add this marketplace to Claude Code:
 Then install the plugins you need:
 
 ```
-/plugin install claude_md@kenxcomp-yoyo
-/plugin install Socratic_Questioning@kenxcomp-yoyo
+/plugin install claude-md@kenxcomp-yoyo
+/plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
 ### Method 2: Interactive UI

@@ -22,8 +22,8 @@
 然后安装所需的插件：
 
 ```
-/plugin install claude_md@kenxcomp-yoyo
-/plugin install Socratic_Questioning@kenxcomp-yoyo
+/plugin install claude-md@kenxcomp-yoyo
+/plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
 ### 方法二：交互式界面

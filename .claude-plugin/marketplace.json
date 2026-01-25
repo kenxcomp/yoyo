@@ -1,13 +1,16 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "yoyo",
-  "description": "A curated collection of useful plugins for Claude Code",
   "owner": {
     "name": "kenxcomp"
   },
+  "metadata": {
+    "description": "A curated collection of useful plugins for Claude Code",
+    "version": "1.0.0"
+  },
   "plugins": [
     {
-      "name": "claude_md",
+      "name": "claude-md",
       "description": "A plugin for managing CLAUDE.md configurations with auto-update detection",
       "version": "1.0.0",
       "source": "./plugins/claude_md",
@@ -15,7 +18,7 @@
       "tags": ["configuration", "productivity", "hooks"]
     },
     {
-      "name": "Socratic_Questioning",
+      "name": "socratic-questioning",
       "description": "A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action",
       "version": "1.0.0",
       "source": "./plugins/Socratic_Questioning",
