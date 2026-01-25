@@ -6,8 +6,8 @@
 
 | 插件 | 描述 | 标签 |
 |------|------|------|
-| [claude_md](./plugins/claude_md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
-| [Socratic_Questioning](./plugins/Socratic_Questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
+| [claude_md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
+| [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
 
 ## 安装方法
 
@@ -42,7 +42,7 @@
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo.git
-claude --plugin-dir ./yoyo/plugins/claude_md
+claude --plugin-dir ./yoyo/plugins/claude-md
 ```
 
 > **注意**: 需要 Claude Code 1.0.33 或更高版本。使用 `claude --version` 检查版本。
@@ -78,9 +78,9 @@ plugin-name/
 - **功能性变更**：新增功能、删除功能、修改 API 接口
 - **配置/规范变更**：修改项目配置、编码规范、依赖更新
 
-### Socratic_Questioning 插件
+### socratic-questioning 插件
 
-`Socratic_Questioning` 插件使用苏格拉底式提问方法，确保在行动前充分理解用户需求。主要特性：
+`socratic-questioning` 插件使用苏格拉底式提问方法，确保在行动前充分理解用户需求。主要特性：
 
 - **UserPromptSubmit 钩子**：评估每个用户提示的清晰度
 - **多轮对话**：每次只问一个聚焦的问题，直到需求明确

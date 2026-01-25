@@ -6,8 +6,8 @@ A curated collection of useful plugins for Claude Code.
 
 | Plugin | Description | Tags |
 |--------|-------------|------|
-| [claude_md](./plugins/claude_md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
-| [Socratic_Questioning](./plugins/Socratic_Questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
+| [claude_md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
+| [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
 
 ## Installation
 
@@ -42,7 +42,7 @@ Clone the repository and load plugins locally for development/testing:
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo.git
-claude --plugin-dir ./yoyo/plugins/claude_md
+claude --plugin-dir ./yoyo/plugins/claude-md
 ```
 
 > **Note**: Requires Claude Code version 1.0.33 or later. Check with `claude --version`.
@@ -72,9 +72,9 @@ The `claude_md` plugin provides automatic detection of major updates during your
 - **Smart Detection**: Uses LLM to identify code architecture, functional, and configuration changes
 - **Update Skill**: Guides users through updating or creating CLAUDE.md
 
-### Socratic_Questioning Plugin
+### socratic-questioning Plugin
 
-The `Socratic_Questioning` plugin uses Socratic questioning methodology to ensure clarity before taking action. Key features:
+The `socratic-questioning` plugin uses Socratic questioning methodology to ensure clarity before taking action. Key features:
 
 - **UserPromptSubmit Hook**: Evaluates every user prompt for clarity
 - **Multi-round Dialogue**: Asks ONE focused question at a time until requirements are clear
