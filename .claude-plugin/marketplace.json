@@ -10,7 +10,7 @@
       "name": "claude_md",
       "description": "A plugin for managing CLAUDE.md configurations with auto-update detection",
       "version": "1.0.0",
-      "source": "plugins/claude_md",
+      "source": "./plugins/claude_md",
       "category": "productivity",
       "tags": ["configuration", "productivity", "hooks"]
     },
@@ -18,7 +18,7 @@
       "name": "Socratic_Questioning",
       "description": "A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action",
       "version": "1.0.0",
-      "source": "plugins/Socratic_Questioning",
+      "source": "./plugins/Socratic_Questioning",
       "category": "productivity",
       "tags": ["thinking", "methodology", "hooks", "questioning"]
     }
