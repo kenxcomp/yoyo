@@ -65,7 +65,7 @@ socratic-questioning/
 ├── hooks/
 │   └── hooks.json            # UserPromptSubmit hook definition
 ├── skills/
-│   └── socratic-clarify.md   # Questioning methodology skill
+│   └── socratic-clarify/SKILL.md   # Questioning methodology skill
 ├── commands/                 # Custom commands (reserved)
 ├── agents/                   # Custom agents (reserved)
 └── README.md                 # This file
