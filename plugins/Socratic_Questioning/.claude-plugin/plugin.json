@@ -1,12 +1,13 @@
 {
   "name": "Socratic_Questioning",
   "version": "1.0.0",
-  "description": "A plugin that guides Claude to use Socratic questioning methods",
+  "description": "A plugin that guides Claude to use Socratic questioning methods to clarify unclear user prompts before taking action",
   "author": "kennethx",
   "license": "MIT",
-  "keywords": ["thinking", "methodology", "questioning"],
+  "keywords": ["thinking", "methodology", "questioning", "clarification", "hooks"],
   "commands": [],
   "agents": [],
-  "skills": [],
+  "skills": ["socratic-clarify"],
+  "hooks": ["UserPromptSubmit"],
   "dependencies": {}
 }

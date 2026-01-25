@@ -1,12 +1,12 @@
 {
   "name": "claude_md",
   "version": "1.0.0",
-  "description": "A plugin for managing CLAUDE.md configurations",
+  "description": "A plugin for managing CLAUDE.md configurations with auto-update detection",
   "author": "kennethx",
   "license": "MIT",
-  "keywords": ["configuration", "productivity", "claude"],
+  "keywords": ["configuration", "productivity", "claude", "claude.md"],
   "commands": [],
   "agents": [],
-  "skills": [],
+  "skills": ["update-claude-md"],
   "dependencies": {}
 }

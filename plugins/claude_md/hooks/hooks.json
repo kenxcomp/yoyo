@@ -1,0 +1,16 @@
+{
+  "description": "Detect major updates and prompt for CLAUDE.md updates",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are evaluating whether this session involves a MAJOR UPDATE that warrants updating CLAUDE.md.\n\nContext of work completed:\n$ARGUMENTS\n\nFIRST CHECK: Is the current working directory a git repository?\n- If NOT a git repository: respond with {\"ok\": true} immediately (no further evaluation needed)\n- If IS a git repository: continue with the evaluation below\n\nA MAJOR UPDATE includes:\n1. Code architecture changes (new modules, refactoring, core logic changes)\n2. Functional changes (new features, removed features, API changes)\n3. Configuration/specification changes (project config, coding standards, dependencies)\n\nAnalyze the session and determine:\n- Is this a major update? (not minor fixes, typos, or small adjustments)\n- Would updating CLAUDE.md benefit future development?\n\nRespond with ONLY valid JSON:\n- If NOT a git repo OR NOT a major update: {\"ok\": true}\n- If IS a major update in a git repo: {\"ok\": false, \"reason\": \"Detected major update: [brief description]. Ask user if they want to update CLAUDE.md.\"}",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
