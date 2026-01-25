@@ -8,14 +8,14 @@ A plugin for managing CLAUDE.md configurations with automatic update detection.
 
 ```
 /plugin marketplace add kenxcomp/yoyo
-/plugin install claude_md@kenxcomp-yoyo
+/plugin install claude-md@kenxcomp-yoyo
 ```
 
 ### Method 2: Local Development
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo
-claude --plugin-dir ./yoyo/plugins/claude_md
+claude --plugin-dir ./yoyo/plugins/claude-md
 ```
 
 > **Note**: Requires Claude Code version 1.0.33 or later.
@@ -41,13 +41,13 @@ When a major update is detected, the plugin can guide you through updating or cr
 ## Directory Structure
 
 ```
-claude_md/
+claude-md/
 ├── .claude-plugin/
 │   └── plugin.json           # Plugin metadata
 ├── hooks/
 │   └── hooks.json            # Stop hook definition
 ├── skills/
-│   └── update-claude-md.md   # CLAUDE.md update skill
+│   └── update-claude-md/SKILL.md   # CLAUDE.md update skill
 ├── commands/                 # Custom commands (reserved)
 ├── agents/                   # Custom agents (reserved)
 └── README.md                 # This file

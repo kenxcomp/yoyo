@@ -6,7 +6,7 @@
 
 | 插件 | 描述 | 标签 |
 |------|------|------|
-| [claude_md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
+| [claude-md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
 
 ## 安装方法
@@ -64,9 +64,9 @@ plugin-name/
 
 ## 插件功能
 
-### claude_md 插件
+### claude-md 插件
 
-`claude_md` 插件提供工作会话期间的重大更新自动检测功能。主要特性：
+`claude-md` 插件提供工作会话期间的重大更新自动检测功能。主要特性：
 
 - **Stop 钩子**：自动评估变更是否需要更新 CLAUDE.md
 - **智能检测**：使用 LLM 识别代码架构、功能和配置变更

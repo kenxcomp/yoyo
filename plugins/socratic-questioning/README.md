@@ -8,14 +8,14 @@ A plugin that guides Claude to use Socratic questioning methods for requirement 
 
 ```
 /plugin marketplace add kenxcomp/yoyo
-/plugin install Socratic_Questioning@kenxcomp-yoyo
+/plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
 ### Method 2: Local Development
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo
-claude --plugin-dir ./yoyo/plugins/Socratic_Questioning
+claude --plugin-dir ./yoyo/plugins/socratic-questioning
 ```
 
 > **Note**: Requires Claude Code version 1.0.33 or later.
@@ -59,7 +59,7 @@ The plugin automatically detects the user's input language and responds accordin
 ## Directory Structure
 
 ```
-Socratic_Questioning/
+socratic-questioning/
 ├── .claude-plugin/
 │   └── plugin.json           # Plugin metadata
 ├── hooks/

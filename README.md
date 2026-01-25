@@ -6,7 +6,7 @@ A curated collection of useful plugins for Claude Code.
 
 | Plugin | Description | Tags |
 |--------|-------------|------|
-| [claude_md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
+| [claude-md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
 
 ## Installation
@@ -64,9 +64,9 @@ plugin-name/
 
 ## Plugin Features
 
-### claude_md Plugin
+### claude-md Plugin
 
-The `claude_md` plugin provides automatic detection of major updates during your work session. Key features:
+The `claude-md` plugin provides automatic detection of major updates during your work session. Key features:
 
 - **Stop Hook**: Automatically evaluates if changes warrant a CLAUDE.md update
 - **Smart Detection**: Uses LLM to identify code architecture, functional, and configuration changes
