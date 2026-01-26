@@ -37,7 +37,7 @@ This plugin uses a **UserPromptSubmit hook** to automatically evaluate every use
 
 1. Gather project context (files, docs, recent commits)
 2. Identify what information is missing or ambiguous
-3. Ask **ONE focused question** (preferring multiple choice format)
+3. Ask **ONE multiple choice question** with (A), (B), (C) options
 4. Wait for user response before proceeding
 5. Repeat until the request is clear enough for action
 
@@ -51,23 +51,29 @@ The hook evaluates prompts against three key areas:
 | **Constraints** | What limitations, boundaries, or requirements must be respected? |
 | **Success Criteria** | How will we know when this is done correctly? |
 
-### Multiple Choice Questions (Preferred)
+### Multiple Choice Questions (Required)
 
-The plugin **prefers multiple choice questions** when options can be reasonably bounded:
+The plugin **always uses multiple choice questions** with (A), (B), (C) options:
 
 ```
+"您希望进行哪种分析：
+ (A) 个股基本面分析
+ (B) 技术指标分析
+ (C) 投资组合分析
+ (D) 综合分析？"
+
 "Which approach do you prefer:
  (A) Optimize for speed
  (B) Optimize for readability
  (C) Balance both?"
 
-"Should the changes be:
- (A) Limited to this file only
- (B) Across the entire module
- (C) Project-wide?"
+"What output format do you need:
+ (A) Summary report
+ (B) Detailed analysis
+ (C) Visualization charts?"
 ```
 
-Open-ended questions are used when options can't be easily enumerated.
+Open-ended questions are only used when options genuinely cannot be enumerated (rare).
 
 ### One Question Per Message
 
@@ -116,8 +122,8 @@ UserPromptSubmit hook evaluates clarity
 ├──────────┬───────────────────────────────────┤
 │  YES     │  NO                               │
 │  ↓       │  ↓                                │
-│ Proceed  │ Ask ONE question                  │
-│ normally │ (prefer multiple choice)          │
+│ Proceed  │ Ask ONE multiple choice           │
+│ normally │ question with (A)(B)(C) options   │
 └──────────┴───────────────────────────────────┘
                     ↓
            User responds
@@ -148,11 +154,15 @@ UserPromptSubmit hook evaluates clarity
 (B) Across the entire module
 (C) Project-wide?"
 
-### Example 3: Open-Ended When Needed
+### Example 3: Bug Report Clarification
 
 **User**: "Fix the login bug"
 
-**Claude**: "To help fix this bug effectively, what specific behavior are you experiencing when trying to log in?"
+**Claude**: "To help fix this bug, what behavior are you experiencing:
+(A) Page crashes or shows error
+(B) Login fails silently (no error message)
+(C) Incorrect credentials are accepted
+(D) Session expires immediately after login?"
 
 ### Example 4: Clear Request (No Questions)
 
