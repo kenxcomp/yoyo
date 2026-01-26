@@ -42,30 +42,40 @@ This context helps form more relevant, specific questions rather than generic on
 | **Constraints** | What limitations must be respected? | "Are there performance/compatibility requirements?" |
 | **Success Criteria** | How do we know it's done correctly? | "What would a successful outcome look like?" |
 
-### Question Format Preference
+### Question Format: Multiple Choice is REQUIRED
 
-**PREFER multiple choice questions** when options can be reasonably bounded:
+**CRITICAL: You MUST use multiple choice format with (A), (B), (C) options.**
+
+This is NOT optional. Every clarification question MUST provide concrete options for the user to choose from.
 
 ```
-Multiple Choice (Preferred):
+CORRECT Format (REQUIRED):
+"您希望进行哪种分析：
+ (A) 个股基本面分析
+ (B) 技术指标分析
+ (C) 投资组合分析
+ (D) 综合分析？"
+
 "Which approach do you prefer:
  (A) Optimize for speed
  (B) Optimize for readability
  (C) Balance both?"
 
-"Should the changes be:
- (A) Limited to this file only
- (B) Across the entire module
- (C) Project-wide?"
+"What output format do you need:
+ (A) Summary report
+ (B) Detailed analysis
+ (C) Visualization charts
+ (D) Raw data export?"
 ```
 
-**Open-ended questions** are fine when options can't be easily enumerated:
+```
+WRONG Format (DO NOT USE):
+❌ "What specific analysis do you want to perform?"
+❌ "What is the desired output?"
+❌ "Can you provide more details about what you need?"
+```
 
-```
-Open-ended (When Needed):
-"What specific behavior are you seeing when the bug occurs?"
-"What constraints or limitations should I be aware of?"
-```
+**Open-ended questions are only acceptable when you genuinely cannot enumerate ANY reasonable options** (this should be extremely rare - most questions can have options).
 
 ### One Question Per Message Rule
 
@@ -83,7 +93,7 @@ Claude gathers context (files, docs, commits)
      ↓
 Hook evaluates clarity
      ↓
-[UNCLEAR] → Ask ONE focused question (prefer multiple choice)
+[UNCLEAR] → Ask ONE multiple choice question with (A), (B), (C) options
      ↓
 User responds
      ↓
@@ -127,10 +137,10 @@ Evaluate response clarity
 
 ## Anti-Patterns to Avoid
 
-1. ❌ Asking multiple questions at once
-2. ❌ Making assumptions and proceeding
-3. ❌ Skipping context gathering before questioning
-4. ❌ Using only open-ended questions when multiple choice would work
+1. ❌ **Using open-ended questions** - ALWAYS use multiple choice format with (A), (B), (C) options
+2. ❌ Asking multiple questions at once
+3. ❌ Making assumptions and proceeding
+4. ❌ Skipping context gathering before questioning
 5. ❌ Over-questioning simple, clear requests
 6. ❌ Ignoring context from ongoing conversation
 7. ❌ Asking generic questions without checking project context first
