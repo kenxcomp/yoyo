@@ -22,27 +22,58 @@ claude --plugin-dir ./yoyo/plugins/socratic-questioning
 
 ## Features
 
+### Context-Aware Questioning
+
+Before asking clarification questions, Claude first gathers context:
+- **Project State**: Reviews files, directory structure, and codebase architecture
+- **Documentation**: Checks README, CHANGELOG, and relevant docs
+- **Recent Commits**: Examines commit history to understand project direction
+
+This context helps form more relevant, specific questions rather than generic ones.
+
 ### UserPromptSubmit Hook
 
-This plugin uses a **UserPromptSubmit hook** to automatically evaluate every user prompt for clarity before proceeding. When unclear points are detected, Claude will:
+This plugin uses a **UserPromptSubmit hook** to automatically evaluate every user prompt for clarity. When unclear points are detected, Claude will:
 
-1. Identify what information is missing or ambiguous
-2. Ask ONE focused Socratic question to clarify the most critical point
-3. Wait for user response before proceeding
-4. Repeat until the request is clear enough for action
+1. Gather project context (files, docs, recent commits)
+2. Identify what information is missing or ambiguous
+3. Ask **ONE focused question** (preferring multiple choice format)
+4. Wait for user response before proceeding
+5. Repeat until the request is clear enough for action
 
-### Clarity Criteria
+### Focus Areas
 
-The hook evaluates prompts against these criteria:
+The hook evaluates prompts against three key areas:
 
-| Criterion | Description |
-|-----------|-------------|
-| **Specificity** | Are vague terms like "better", "improve", "fix" defined? |
-| **Context** | Is sufficient scope, environment, or background provided? |
-| **Requirements** | Are expected outcomes or acceptance criteria clear? |
-| **Assumptions** | Are implicit assumptions that need confirmation identified? |
-| **Constraints** | Are limitations or boundaries specified when relevant? |
-| **Edge Cases** | For technical tasks, are error handling requirements mentioned? |
+| Area | Description |
+|------|-------------|
+| **Purpose** | What is the user trying to achieve? What problem are they solving? |
+| **Constraints** | What limitations, boundaries, or requirements must be respected? |
+| **Success Criteria** | How will we know when this is done correctly? |
+
+### Multiple Choice Questions (Preferred)
+
+The plugin **prefers multiple choice questions** when options can be reasonably bounded:
+
+```
+"Which approach do you prefer:
+ (A) Optimize for speed
+ (B) Optimize for readability
+ (C) Balance both?"
+
+"Should the changes be:
+ (A) Limited to this file only
+ (B) Across the entire module
+ (C) Project-wide?"
+```
+
+Open-ended questions are used when options can't be easily enumerated.
+
+### One Question Per Message
+
+- Claude asks **ONE question at a time** - never multiple questions
+- If a topic needs more exploration, it breaks into sequential questions
+- This makes it easier for users to respond clearly
 
 ### Bilingual Support
 
@@ -76,16 +107,18 @@ socratic-questioning/
 ```
 User submits prompt
         ↓
+Claude gathers context (files, docs, commits)
+        ↓
 UserPromptSubmit hook evaluates clarity
         ↓
-┌──────────────────────────────────┐
-│ Is the prompt clear enough?      │
-├──────────┬───────────────────────┤
-│  YES     │  NO                   │
-│  ↓       │  ↓                    │
-│ Proceed  │ Ask ONE Socratic      │
-│ normally │ question              │
-└──────────┴───────────────────────┘
+┌──────────────────────────────────────────────┐
+│ Is the prompt clear enough?                   │
+├──────────┬───────────────────────────────────┤
+│  YES     │  NO                               │
+│  ↓       │  ↓                                │
+│ Proceed  │ Ask ONE question                  │
+│ normally │ (prefer multiple choice)          │
+└──────────┴───────────────────────────────────┘
                     ↓
            User responds
                     ↓
@@ -96,19 +129,32 @@ UserPromptSubmit hook evaluates clarity
 
 ## Example Interactions
 
-### Example 1: Vague Request
+### Example 1: Multiple Choice Question
+
+**User**: "Improve the performance"
+
+**Claude**: "To help improve performance, I'd like to understand your priority. Which aspect should I focus on:
+(A) Reduce load time
+(B) Decrease memory usage
+(C) Improve response speed
+(D) All of the above?"
+
+### Example 2: Scope Clarification
+
+**User**: "Add error handling"
+
+**Claude**: "I'd like to add error handling. Should the changes be:
+(A) Limited to the specific file you're working with
+(B) Across the entire module
+(C) Project-wide?"
+
+### Example 3: Open-Ended When Needed
 
 **User**: "Fix the login bug"
 
-**Claude**: "To help fix this bug effectively, I need to understand it better. What specific behavior are you experiencing when trying to log in - for example, does the page crash, show an error message, or fail silently?"
+**Claude**: "To help fix this bug effectively, what specific behavior are you experiencing when trying to log in?"
 
-### Example 2: Missing Context
-
-**User**: "Add a new feature"
-
-**Claude**: "I'd like to help you add this feature. What specific functionality should this new feature provide?"
-
-### Example 3: Clear Request (No Questions)
+### Example 4: Clear Request (No Questions)
 
 **User**: "Add a logout button to the navigation bar in `src/components/Nav.tsx` that calls the `logout()` function from `auth.ts`"
 
@@ -118,10 +164,10 @@ UserPromptSubmit hook evaluates clarity
 
 | Type | Purpose | Example |
 |------|---------|---------|
-| **Clarifying** | Understand what was said | "When you say 'better performance', what metrics matter most?" |
-| **Probing assumptions** | Expose hidden beliefs | "What makes you certain this approach will work?" |
-| **Probing reasons** | Understand the why | "What led you to this conclusion?" |
-| **Questioning viewpoints** | Explore alternatives | "Have you considered approaching this differently?" |
+| **Clarifying** | Understand what was said | "When you say 'improve', do you mean: (A) faster, (B) cleaner, or (C) fewer bugs?" |
+| **Probing assumptions** | Expose hidden beliefs | "Are you assuming: (A) users have network, (B) offline needed, or (C) hybrid?" |
+| **Probing reasons** | Understand the why | "What led you to this approach?" |
+| **Questioning viewpoints** | Explore alternatives | "Have you considered alternative approaches?" |
 | **Probing implications** | Explore consequences | "If we do this, what might be affected?" |
 
 ## Configuration
@@ -130,6 +176,7 @@ The hook uses LLM-based evaluation with the following settings:
 - **Timeout**: 30 seconds for evaluation
 - **Triggers on**: Every user prompt submission
 - **Language**: Auto-detected from user input
+- **Context Gathering**: Automatic review of project state before questioning
 
 ## Use Cases
 
