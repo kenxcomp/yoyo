@@ -81,7 +81,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 | Plugin | Version | Description |
 |--------|---------|-------------|
 | `claude-md` | 1.0.0 | Auto-detect major updates and prompt for CLAUDE.md updates |
-| `socratic-questioning` | 1.1.3 | Clarify unclear prompts using multiple choice Socratic questions |
+| `socratic-questioning` | 1.1.4 | Clarify unclear prompts using multiple choice Socratic questions |
 
 ## Lessons Learned
 
