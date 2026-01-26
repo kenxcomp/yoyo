@@ -1,6 +1,17 @@
 # Socratic Questioning Plugin
 
-A plugin that guides Claude to use Socratic questioning methods for requirement clarification. Instead of making assumptions about unclear user prompts, Claude will ask focused questions to ensure accurate understanding before taking action.
+A plugin that guides Claude to use Socratic questioning methods for requirement clarification. Instead of making assumptions about unclear user prompts, Claude will ask focused multiple choice questions to ensure accurate understanding before taking action.
+
+## What's New in v2.0.0
+
+**Major Architecture Change:** Migrated from hook-based to skill-based approach.
+
+| v1.x (Hook-based) | v2.0 (Skill-based) |
+|-------------------|-------------------|
+| `UserPromptSubmit` hook blocks input | Skill guides Claude's natural responses |
+| Questions appear as blocking prompts | Questions appear in Claude's reply |
+| Answering "A" could trigger loops | Natural conversation flow |
+| Context lost between evaluations | Full conversation history preserved |
 
 ## Installation
 
@@ -22,28 +33,55 @@ claude --plugin-dir ./yoyo/plugins/socratic-questioning
 
 ## Features
 
+### Skill-Based Approach
+
+This plugin uses a **skill-based architecture** that guides Claude's behavior naturally:
+
+1. **SessionStart Hook**: Injects skill awareness when a session begins
+2. **socratic-clarify Skill**: Teaches Claude how to ask clarifying questions
+3. **`/clarify` Command**: Allows explicit invocation of clarification
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  SKILL-BASED FLOW                   │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  Session Starts                                     │
+│       │                                             │
+│       ▼                                             │
+│  Skill awareness injected into context              │
+│       │                                             │
+│       ▼                                             │
+│  User: "优化性能" ──────────────────────────────►   │
+│       │                                             │
+│       ▼                                             │
+│  Claude evaluates clarity internally                │
+│       │                                             │
+│       ├─── Clear ───► Execute directly              │
+│       │                                             │
+│       └─── Unclear ──► Ask (A)(B)(C) in response    │
+│                           │                         │
+│                           ▼                         │
+│  User: "A" ─────────────────────────────────────►   │
+│       │                                             │
+│       ▼                                             │
+│  Claude continues (full context preserved)          │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
 ### Context-Aware Questioning
 
-Before asking clarification questions, Claude first gathers context:
+Before asking clarification questions, Claude gathers context:
 - **Project State**: Reviews files, directory structure, and codebase architecture
-- **Documentation**: Checks README, CHANGELOG, and relevant docs
-- **Recent Commits**: Examines commit history to understand project direction
-
-This context helps form more relevant, specific questions rather than generic ones.
-
-### UserPromptSubmit Hook
-
-This plugin uses a **UserPromptSubmit hook** to automatically evaluate every user prompt for clarity. When unclear points are detected, Claude will:
-
-1. Gather project context (files, docs, recent commits)
-2. Identify what information is missing or ambiguous
-3. Ask **ONE multiple choice question** with (A), (B), (C) options
-4. Wait for user response before proceeding
-5. Repeat until the request is clear enough for action
+- **Conversation History**: Understands ongoing discussion context
+- **Documentation**: Checks README and relevant docs
 
 ### Focus Areas
 
-The hook evaluates prompts against three key areas:
+The skill evaluates prompts against three key areas:
 
 | Area | Description |
 |------|-------------|
@@ -56,30 +94,35 @@ The hook evaluates prompts against three key areas:
 The plugin **always uses multiple choice questions** with (A), (B), (C) options:
 
 ```
-"您希望进行哪种分析：
- (A) 个股基本面分析
- (B) 技术指标分析
- (C) 投资组合分析
- (D) 综合分析？"
-
-"Which approach do you prefer:
- (A) Optimize for speed
- (B) Optimize for readability
- (C) Balance both?"
-
-"What output format do you need:
- (A) Summary report
- (B) Detailed analysis
- (C) Visualization charts?"
+What aspect of performance is most important?
+(A) Reduce initial load time
+(B) Decrease memory usage
+(C) Improve response speed
+(D) All of the above
 ```
 
-Open-ended questions are only used when options genuinely cannot be enumerated (rare).
+```
+您希望进行哪种分析：
+(A) 个股基本面分析
+(B) 技术指标分析
+(C) 投资组合分析
+(D) 综合分析？
+```
 
 ### One Question Per Message
 
 - Claude asks **ONE question at a time** - never multiple questions
-- If a topic needs more exploration, it breaks into sequential questions
 - This makes it easier for users to respond clearly
+- Follow-up questions are asked sequentially as needed
+
+### `/clarify` Command
+
+Explicitly invoke clarification when needed:
+
+```
+/clarify
+/clarify what performance optimization?
+```
 
 ### Bilingual Support
 
@@ -89,48 +132,28 @@ The plugin automatically detects the user's input language and responds accordin
 
 ### What It Does NOT Do
 
-- **Does not infer**: Even if Claude can guess the likely intent, it will ask to confirm
-- **Does not over-question**: Simple, clear requests and follow-ups pass through without delay
-- **Does not block**: Greetings, confirmations, and ongoing conversation context are recognized as clear
+- **Does not block**: Questions appear naturally in Claude's response
+- **Does not loop**: Answering "A"/"B"/"C" flows naturally without re-triggering
+- **Does not over-question**: Clear requests proceed without delay
 
 ## Directory Structure
 
 ```
 socratic-questioning/
 ├── .claude-plugin/
-│   └── plugin.json           # Plugin metadata
+│   └── plugin.json           # Plugin metadata (v2.0.0)
 ├── hooks/
-│   └── hooks.json            # UserPromptSubmit hook definition
+│   └── hooks.json            # SessionStart hook for skill injection
+├── scripts/
+│   └── inject-skill.sh       # Context injection script
 ├── skills/
-│   └── socratic-clarify/SKILL.md   # Questioning methodology skill
-├── commands/                 # Custom commands (reserved)
-├── agents/                   # Custom agents (reserved)
+│   ├── socratic-clarify/
+│   │   └── SKILL.md          # Main questioning methodology skill
+│   └── clarify/
+│       └── SKILL.md          # /clarify command skill
+├── commands/                 # Reserved
+├── agents/                   # Reserved
 └── README.md                 # This file
-```
-
-## How It Works
-
-```
-User submits prompt
-        ↓
-Claude gathers context (files, docs, commits)
-        ↓
-UserPromptSubmit hook evaluates clarity
-        ↓
-┌──────────────────────────────────────────────┐
-│ Is the prompt clear enough?                   │
-├──────────┬───────────────────────────────────┤
-│  YES     │  NO                               │
-│  ↓       │  ↓                                │
-│ Proceed  │ Ask ONE multiple choice           │
-│ normally │ question with (A)(B)(C) options   │
-└──────────┴───────────────────────────────────┘
-                    ↓
-           User responds
-                    ↓
-           Re-evaluate clarity
-                    ↓
-           (Loop until clear)
 ```
 
 ## Example Interactions
@@ -139,32 +162,35 @@ UserPromptSubmit hook evaluates clarity
 
 **User**: "Improve the performance"
 
-**Claude**: "To help improve performance, I'd like to understand your priority. Which aspect should I focus on:
-(A) Reduce load time
+**Claude**:
+```
+I'd be happy to help optimize this. To focus on the right area:
+
+What aspect of performance is most important?
+(A) Reduce initial load time
 (B) Decrease memory usage
-(C) Improve response speed
-(D) All of the above?"
+(C) Improve response speed for user interactions
+(D) All of the above - comprehensive optimization
+```
 
-### Example 2: Scope Clarification
+**User**: "A"
 
-**User**: "Add error handling"
+**Claude**: *Proceeds to optimize load time*
 
-**Claude**: "I'd like to add error handling. Should the changes be:
-(A) Limited to the specific file you're working with
-(B) Across the entire module
-(C) Project-wide?"
-
-### Example 3: Bug Report Clarification
+### Example 2: Bug Report Clarification
 
 **User**: "Fix the login bug"
 
-**Claude**: "To help fix this bug, what behavior are you experiencing:
+**Claude**:
+```
+To help fix this bug, what behavior are you experiencing:
 (A) Page crashes or shows error
 (B) Login fails silently (no error message)
 (C) Incorrect credentials are accepted
-(D) Session expires immediately after login?"
+(D) Session expires immediately after login?
+```
 
-### Example 4: Clear Request (No Questions)
+### Example 3: Clear Request (No Questions)
 
 **User**: "Add a logout button to the navigation bar in `src/components/Nav.tsx` that calls the `logout()` function from `auth.ts`"
 
@@ -178,15 +204,15 @@ UserPromptSubmit hook evaluates clarity
 | **Probing assumptions** | Expose hidden beliefs | "Are you assuming: (A) users have network, (B) offline needed, or (C) hybrid?" |
 | **Probing reasons** | Understand the why | "What led you to this approach?" |
 | **Questioning viewpoints** | Explore alternatives | "Have you considered alternative approaches?" |
-| **Probing implications** | Explore consequences | "If we do this, what might be affected?" |
 
-## Configuration
+## Migration from v1.x
 
-The hook uses LLM-based evaluation with the following settings:
-- **Timeout**: 30 seconds for evaluation
-- **Triggers on**: Every user prompt submission
-- **Language**: Auto-detected from user input
-- **Context Gathering**: Automatic review of project state before questioning
+If upgrading from v1.x:
+
+1. **Behavior Change**: Questions now appear in Claude's response, not as blocking prompts
+2. **No More Loops**: The "A"/"B"/"C" infinite loop issue is resolved
+3. **New Command**: `/clarify` available for explicit clarification requests
+4. **Context Preserved**: Conversation history is maintained throughout
 
 ## Use Cases
 

@@ -1,149 +1,165 @@
 ---
 name: socratic-clarify
-description: Guide multi-round Socratic questioning for requirement clarification
+description: Clarify unclear requirements using Socratic multiple choice questions. Use when user requests are vague, ambiguous, or missing key information about purpose, constraints, or success criteria.
 ---
 
 # Socratic Clarification Skill
 
-When the UserPromptSubmit hook detects an unclear prompt, use this skill to guide the clarification process.
+Guide Claude to ask targeted clarifying questions when requirements are unclear.
+
+## When to Use This Skill
+
+**Invoke this skill when:**
+- User's request is vague (e.g., "improve the code", "fix the bug", "optimize this")
+- Missing critical information: Purpose, Constraints, or Success Criteria
+- Multiple interpretations are possible
+- User explicitly invokes `/clarify`
+
+**DO NOT use when:**
+- Request is already specific and actionable
+- User says "just do it" or "proceed with your judgment"
+- Following up on an established task with clear context
+- Simple greetings, confirmations, or built-in commands (starting with `/`)
 
 ## Core Principle
 
 **NEVER assume or infer** - even when you think you understand, ask to confirm. The goal is to help users articulate their actual needs, not to guess what they might mean.
 
-## Understanding the Idea (Before Questioning)
+## Questioning Methodology
 
-**IMPORTANT**: Before asking clarification questions, Claude should first gather context:
+### Step 1: Gather Context First
 
-1. **Check Project State**
-   - Review current files and directory structure
-   - Understand the codebase architecture
-   - Identify relevant components or modules
-
-2. **Review Documentation**
-   - Read README, CHANGELOG, or relevant docs
-   - Understand existing conventions and patterns
-   - Note any documented constraints or guidelines
-
-3. **Examine Recent Commits**
-   - Look at recent commit history
-   - Understand the project direction
-   - Identify ongoing work or recent changes
+Before asking questions, quickly assess:
+- Current project state (files, architecture)
+- Recent conversation history
+- Any relevant documentation (README, etc.)
 
 This context helps form more relevant, specific questions rather than generic ones.
 
-## Questioning Methodology
+### Step 2: Identify the Gap
 
-### Focus Areas (In Priority Order)
+Focus on ONE of these areas (in priority order):
 
-| Area | Key Questions | Example |
-|------|---------------|---------|
-| **Purpose** | What problem are you solving? What's the goal? | "What should this feature accomplish?" |
-| **Constraints** | What limitations must be respected? | "Are there performance/compatibility requirements?" |
-| **Success Criteria** | How do we know it's done correctly? | "What would a successful outcome look like?" |
+| Area | When to Ask | Example Gap |
+|------|-------------|-------------|
+| **Purpose** | "What" is unclear | "Improve performance" - what aspect? |
+| **Constraints** | "How" is unclear | "Add feature" - any limitations? |
+| **Success Criteria** | "Done" is unclear | "Fix bug" - what is correct behavior? |
 
-### Question Format: Multiple Choice is REQUIRED
+### Step 3: Ask ONE Multiple Choice Question
 
-**CRITICAL: You MUST use multiple choice format with (A), (B), (C) options.**
+**CRITICAL: Always use (A), (B), (C) format**
 
-This is NOT optional. Every clarification question MUST provide concrete options for the user to choose from.
+This is REQUIRED, not optional. Users respond better to concrete options.
 
+#### English Format:
 ```
-CORRECT Format (REQUIRED):
-"您希望进行哪种分析：
- (A) 个股基本面分析
- (B) 技术指标分析
- (C) 投资组合分析
- (D) 综合分析？"
+To help you better, I need to clarify one thing:
 
-"Which approach do you prefer:
- (A) Optimize for speed
- (B) Optimize for readability
- (C) Balance both?"
-
-"What output format do you need:
- (A) Summary report
- (B) Detailed analysis
- (C) Visualization charts
- (D) Raw data export?"
+What type of [improvement/fix/feature] are you looking for?
+(A) [Specific option 1]
+(B) [Specific option 2]
+(C) [Specific option 3]
+(D) Other (please specify)
 ```
 
+#### Chinese Format:
 ```
-WRONG Format (DO NOT USE):
-❌ "What specific analysis do you want to perform?"
-❌ "What is the desired output?"
-❌ "Can you provide more details about what you need?"
+为了更好地帮助您，我需要确认一点：
+
+您希望进行哪种[改进/修复/功能]？
+(A) [具体选项1]
+(B) [具体选项2]
+(C) [具体选项3]
+(D) 其他（请说明）
 ```
 
-**Open-ended questions are only acceptable when you genuinely cannot enumerate ANY reasonable options** (this should be extremely rare - most questions can have options).
-
-### One Question Per Message Rule
+## One Question Per Message Rule
 
 - Ask **ONE question at a time** - never multiple questions
 - If a topic needs more exploration, break it into sequential questions
 - Wait for the answer before asking the next question
 - This makes it easier for users to respond clearly
 
-## Dialogue Flow
+## Response Examples
 
+### Example 1: Vague Performance Request
+
+**User:** "Make this faster"
+
+**Claude's Response:**
 ```
-User submits prompt
-     ↓
-Claude gathers context (files, docs, commits)
-     ↓
-Hook evaluates clarity
-     ↓
-[UNCLEAR] → Ask ONE multiple choice question with (A), (B), (C) options
-     ↓
-User responds
-     ↓
-Evaluate response clarity
-     ↓
-[Still unclear on same topic] → Ask follow-up question
-[New topic unclear] → Ask about new topic
-[Clear enough] → Proceed with action
+I'd be happy to help optimize this. To focus on the right area:
+
+What aspect of performance is most important?
+(A) Reduce initial load time
+(B) Decrease memory usage
+(C) Improve response speed for user interactions
+(D) All of the above - comprehensive optimization
+```
+
+### Example 2: Unclear Bug Fix (Chinese)
+
+**User:** "修复登录问题"
+
+**Claude's Response:**
+```
+我来帮您修复登录问题。请先确认一下：
+
+您遇到的是哪种情况？
+(A) 页面崩溃或显示错误
+(B) 登录失败但没有错误提示
+(C) 登录成功但立即退出
+(D) 其他问题（请描述）
+```
+
+### Example 3: Unclear Scope
+
+**User:** "Add error handling"
+
+**Claude's Response:**
+```
+I'd like to add error handling. Should the changes be:
+(A) Limited to the specific file you're working with
+(B) Across the entire module
+(C) Project-wide implementation
+```
+
+### Example 4: Clear Request (No Questions Needed)
+
+**User:** "Add a logout button to the Nav component in src/components/Nav.tsx that calls the logout() function from auth.ts"
+
+**Claude's Response:**
+```
+I'll add the logout button to Nav.tsx right away.
+[Proceeds directly with implementation]
 ```
 
 ## Question Types (Socratic Style)
 
-| Type | Purpose | Example (Multiple Choice When Possible) |
+| Type | Purpose | Example |
 |------|---------|---------|
-| **Clarifying** | Understand what was said | "When you say 'improve', do you mean: (A) faster, (B) cleaner code, or (C) fewer bugs?" |
-| **Probing assumptions** | Expose hidden beliefs | "Are you assuming: (A) users always have network, (B) offline support is needed, or (C) hybrid approach?" |
-| **Probing reasons** | Understand the why | "What led you to this approach?" (open-ended) |
-| **Questioning viewpoints** | Explore alternatives | "Have you considered: (A) alternative A, (B) alternative B, or (C) current approach is best?" |
-| **Probing implications** | Explore consequences | "If we do this, what might be affected?" (open-ended) |
+| **Clarifying** | Understand what was said | "When you say 'improve', do you mean: (A) faster, (B) cleaner, or (C) fewer bugs?" |
+| **Probing assumptions** | Expose hidden beliefs | "Are you assuming: (A) users have network, (B) offline needed, or (C) hybrid?" |
+| **Probing reasons** | Understand the why | "What led you to this approach?" (open-ended, rare) |
+| **Questioning viewpoints** | Explore alternatives | "Have you considered: (A) alternative A, (B) alternative B?" |
 
-## Bilingual Interaction
+## Bilingual Detection
 
-- **Detect language**: Match the user's input language
 - **English input** → English questions
-- **Chinese input** → Chinese questions
-- **Mixed input** → Prefer the dominant language
-
-### Chinese Multiple Choice Examples
-
-```
-"您希望采用哪种方式：
- (A) 优先考虑性能
- (B) 优先考虑可读性
- (C) 两者兼顾？"
-
-"改动范围应该是：
- (A) 仅限当前文件
- (B) 整个模块
- (C) 全项目？"
-```
+- **Chinese input** → Chinese questions (中文输入 → 中文提问)
+- **Mixed input** → Use the dominant language
 
 ## Anti-Patterns to Avoid
 
-1. ❌ **Using open-ended questions** - ALWAYS use multiple choice format with (A), (B), (C) options
-2. ❌ Asking multiple questions at once
-3. ❌ Making assumptions and proceeding
-4. ❌ Skipping context gathering before questioning
-5. ❌ Over-questioning simple, clear requests
-6. ❌ Ignoring context from ongoing conversation
-7. ❌ Asking generic questions without checking project context first
+| DO NOT | DO INSTEAD |
+|--------|------------|
+| Ask open-ended questions | Always provide (A), (B), (C) options |
+| Ask multiple questions at once | Ask ONE question, wait for answer |
+| Re-ask if user already answered | Proceed with user's choice |
+| Question clear requests | Just execute them |
+| Assume without asking | Clarify first, then act |
+| Ask generic questions | Check project context first |
 
 ## When to Stop Questioning
 
