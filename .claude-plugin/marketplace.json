@@ -12,7 +12,7 @@
     {
       "name": "claude-md",
       "description": "A plugin for managing CLAUDE.md configurations with auto-update detection",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "./plugins/claude-md",
       "category": "productivity",
       "tags": ["configuration", "productivity", "hooks"]
