@@ -7,6 +7,7 @@ A curated collection of useful plugins for Claude Code.
 | Plugin | Description | Tags |
 |--------|-------------|------|
 | [claude-md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
+| [darwin](./plugins/darwin) | Automatic error-fixing plugin that offloads runtime errors to dedicated agents, preserving main conversation context | error-handling, agents, automation |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
 
 ## Installation
@@ -23,6 +24,7 @@ Then install the plugins you need:
 
 ```
 /plugin install claude-md@kenxcomp-yoyo
+/plugin install darwin@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
@@ -71,6 +73,24 @@ The `claude-md` plugin provides automatic detection of major updates during your
 - **Stop Hook**: Automatically evaluates if changes warrant a CLAUDE.md update
 - **Smart Detection**: Uses LLM to identify code architecture, functional, and configuration changes
 - **Update Skill**: Guides users through updating or creating CLAUDE.md
+
+### darwin Plugin
+
+The `darwin` plugin provides automatic error-fixing by offloading runtime errors to dedicated agents. Key features:
+
+- **SessionStart Hook**: Injects skill awareness at session start
+- **Auto-Fixer Skill**: Triggers when runtime errors are encountered (Python, Bash, build, test failures)
+- **Error-Fixer Agent**: Analyzes errors, implements fixes, verifies solutions, and returns summaries
+- **Config-Fixer Agent**: Logs solutions and updates configurations for future reference
+
+**Error Categories Handled:**
+- File/Path errors (FileNotFoundError, missing directories)
+- Import errors (ModuleNotFoundError, missing dependencies)
+- Syntax errors (Python syntax, JSON parse errors)
+- Runtime errors (TypeError, AttributeError)
+- Build errors (npm, cargo, make, gradle failures)
+- Test failures (pytest, jest, vitest)
+- Permission errors
 
 ### socratic-questioning Plugin
 

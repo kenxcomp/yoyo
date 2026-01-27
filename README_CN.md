@@ -7,6 +7,7 @@
 | 插件 | 描述 | 标签 |
 |------|------|------|
 | [claude-md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
+| [darwin](./plugins/darwin) | 自动错误修复插件，将运行时错误交给专用代理处理，保留主对话上下文 | 错误处理, 代理, 自动化 |
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
 
 ## 安装方法
@@ -23,6 +24,7 @@
 
 ```
 /plugin install claude-md@kenxcomp-yoyo
+/plugin install darwin@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
@@ -77,6 +79,24 @@ plugin-name/
 - **代码架构变更**：新增模块、重构代码结构、修改核心逻辑
 - **功能性变更**：新增功能、删除功能、修改 API 接口
 - **配置/规范变更**：修改项目配置、编码规范、依赖更新
+
+### darwin 插件
+
+`darwin` 插件通过将运行时错误交给专用代理处理，实现自动错误修复。主要特性：
+
+- **SessionStart 钩子**：在会话启动时注入技能感知
+- **Auto-Fixer 技能**：遇到运行时错误时自动触发（Python、Bash、构建、测试失败）
+- **Error-Fixer 代理**：分析错误、实施修复、验证方案并返回摘要
+- **Config-Fixer 代理**：记录解决方案并更新配置以供未来参考
+
+**支持的错误类型：**
+- 文件/路径错误（FileNotFoundError、目录缺失）
+- 导入错误（ModuleNotFoundError、依赖缺失）
+- 语法错误（Python 语法错误、JSON 解析错误）
+- 运行时错误（TypeError、AttributeError）
+- 构建错误（npm、cargo、make、gradle 失败）
+- 测试失败（pytest、jest、vitest）
+- 权限错误
 
 ### socratic-questioning 插件
 
