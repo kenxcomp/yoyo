@@ -64,10 +64,10 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 
 ### Hook Development
 
-- Hooks use LLM-based evaluation with `type: "prompt"`
-- Always set reasonable `timeout` (default: 30 seconds)
-- Return valid JSON: `{"ok": true}` or `{"ok": false, "reason": "..."}`
-- **IMPORTANT**: Claude Code only displays the `reason` field when blocking. If you need to ask a question, include it IN the `reason` field.
+- Prefer `type: "command"` with shell scripts for reliable JSON output
+- Use `type: "prompt"` only when LLM evaluation is necessary (note: JSON output is not guaranteed)
+- For skill injection, use `SessionStart` hook with `additionalContext` in `hookSpecificOutput`
+- Always set reasonable `timeout` (default: 30 seconds for prompts, 5 seconds for commands)
 
 ### Socratic Questioning Plugin Conventions
 
@@ -80,7 +80,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 
 | Plugin | Version | Description |
 |--------|---------|-------------|
-| `claude-md` | 1.0.0 | Auto-detect major updates and prompt for CLAUDE.md updates |
+| `claude-md` | 1.1.0 | Auto-detect major updates and prompt for CLAUDE.md updates (skill-based) |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
 
 ## Lessons Learned
