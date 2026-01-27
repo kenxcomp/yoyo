@@ -12,6 +12,7 @@ yoyo/
 │   └── marketplace.json      # Marketplace registry (lists all plugins with versions)
 ├── plugins/
 │   ├── claude-md/            # Plugin for CLAUDE.md auto-update detection
+│   ├── darwin/               # Plugin for automatic error-fixing
 │   └── socratic-questioning/ # Plugin for Socratic clarification questions
 └── CLAUDE.md                 # This file
 ```
@@ -81,6 +82,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 | Plugin | Version | Description |
 |--------|---------|-------------|
 | `claude-md` | 1.1.0 | Auto-detect major updates and prompt for CLAUDE.md updates (skill-based) |
+| `darwin` | 1.0.0 | Automatic error-fixing via dedicated agent, preserves main conversation context |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
 
 ## Lessons Learned

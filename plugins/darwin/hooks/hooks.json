@@ -1,0 +1,17 @@
+{
+  "description": "Inject auto-fixer skill awareness at session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

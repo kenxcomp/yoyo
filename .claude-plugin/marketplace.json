@@ -24,6 +24,14 @@
       "source": "./plugins/socratic-questioning",
       "category": "productivity",
       "tags": ["thinking", "methodology", "skills", "questioning"]
+    },
+    {
+      "name": "darwin",
+      "description": "Automatic error-fixing plugin that offloads runtime error resolution to a dedicated agent, saving main conversation context",
+      "version": "1.0.0",
+      "source": "./plugins/darwin",
+      "category": "productivity",
+      "tags": ["error-fixing", "debugging", "agents", "automation"]
     }
   ]
 }
