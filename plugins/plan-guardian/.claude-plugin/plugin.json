@@ -1,6 +1,6 @@
 {
   "name": "plan-guardian",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Plan review workflow plugin that ensures plans are rigorously reviewed before execution. Includes a plan-reviewer agent, ExitPlanMode/EnterPlanMode hooks, and a /plan-review skill.",
   "author": {
     "name": "kenxcomp"
