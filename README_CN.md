@@ -8,6 +8,7 @@
 |------|------|------|
 | [claude-md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
 | [darwin](./plugins/darwin) | 自动错误修复插件，将运行时错误交给专用代理处理，保留主对话上下文 | 错误处理, 代理, 自动化 |
+| [plan-guardian](./plugins/plan-guardian) | 计划审查工作流插件，确保计划在执行前经过严格审查 | 规划, 审查, 代理, 质量 |
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
 
 ## 安装方法
@@ -25,6 +26,7 @@
 ```
 /plugin install claude-md@kenxcomp-yoyo
 /plugin install darwin@kenxcomp-yoyo
+/plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
@@ -97,6 +99,23 @@ plugin-name/
 - 构建错误（npm、cargo、make、gradle 失败）
 - 测试失败（pytest、jest、vitest）
 - 权限错误
+
+### plan-guardian 插件
+
+`plan-guardian` 插件强制在执行前对计划进行严格审查。主要特性：
+
+- **SessionStart 钩子**：在每个会话启动时注入计划模式规则作为 additionalContext
+- **ExitPlanMode 钩子**：在计划审查代理批准计划之前阻止退出计划模式
+- **EnterPlanMode 钩子**：进入新的规划会话时清除之前的审查状态
+- **Plan-Reviewer 代理**：根据 8 项质量标准评估计划（边界情况、异常场景、风格一致性、逻辑一致性、验证步骤、不明确意图、语义歧义、用户意图）
+- **/plan-review 技能**：随时手动触发计划审查
+
+**审查工作流程：**
+1. 进入计划模式 → 清除之前的审查状态
+2. 将计划写入 `.plan-review/yoplan.md`
+3. 启动 plan-reviewer 代理 → 评估所有 8 项标准
+4. 如果通过，解除 ExitPlanMode 阻塞
+5. 如果被阻塞，重新运行 plan-reviewer 并重试
 
 ### socratic-questioning 插件
 

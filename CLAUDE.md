@@ -13,6 +13,7 @@ yoyo/
 ├── plugins/
 │   ├── claude-md/            # Plugin for CLAUDE.md auto-update detection
 │   ├── darwin/               # Plugin for automatic error-fixing
+│   ├── plan-guardian/        # Plugin for plan review workflow enforcement
 │   └── socratic-questioning/ # Plugin for Socratic clarification questions
 └── CLAUDE.md                 # This file
 ```
@@ -83,6 +84,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 |--------|---------|-------------|
 | `claude-md` | 1.1.0 | Auto-detect major updates and prompt for CLAUDE.md updates (skill-based) |
 | `darwin` | 1.0.0 | Automatic error-fixing via dedicated agent, preserves main conversation context |
+| `plan-guardian` | 1.0.0 | Plan review workflow enforcement via agent, hooks, and skill |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
 
 ## Lessons Learned

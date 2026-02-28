@@ -8,6 +8,7 @@ A curated collection of useful plugins for Claude Code.
 |--------|-------------|------|
 | [claude-md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
 | [darwin](./plugins/darwin) | Automatic error-fixing plugin that offloads runtime errors to dedicated agents, preserving main conversation context | error-handling, agents, automation |
+| [plan-guardian](./plugins/plan-guardian) | Plan review workflow plugin that ensures plans are rigorously reviewed before execution | planning, review, agents, quality |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
 
 ## Installation
@@ -25,6 +26,7 @@ Then install the plugins you need:
 ```
 /plugin install claude-md@kenxcomp-yoyo
 /plugin install darwin@kenxcomp-yoyo
+/plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
 ```
 
@@ -91,6 +93,23 @@ The `darwin` plugin provides automatic error-fixing by offloading runtime errors
 - Build errors (npm, cargo, make, gradle failures)
 - Test failures (pytest, jest, vitest)
 - Permission errors
+
+### plan-guardian Plugin
+
+The `plan-guardian` plugin enforces rigorous plan review before execution. Key features:
+
+- **SessionStart Hook**: Injects Plan Mode Rules into every session as additionalContext
+- **ExitPlanMode Hook**: Blocks exiting plan mode until the plan-reviewer agent has approved the plan
+- **EnterPlanMode Hook**: Clears previous review state when entering a new planning session
+- **Plan-Reviewer Agent**: Evaluates plans against 8 quality criteria (edge cases, abnormal scenarios, style consistency, logical consistency, verification steps, unclear intentions, semantic ambiguity, user intent)
+- **/plan-review Skill**: Manually trigger a plan review at any time
+
+**Review Workflow:**
+1. Enter plan mode → previous review state is cleared
+2. Write plan to `.plan-review/yoplan.md`
+3. Launch plan-reviewer agent → evaluates all 8 criteria
+4. If approved, ExitPlanMode is unblocked
+5. If blocked, re-run plan-reviewer and retry
 
 ### socratic-questioning Plugin
 

@@ -1,0 +1,39 @@
+{
+  "description": "Plan review workflow hooks: SessionStart injection, ExitPlanMode blocker, EnterPlanMode cleaner",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ ! -f ./.plan-review/yoplan.md ] || ! grep -q '\\- \\[x\\] Have I reviewed this plan?' ./.plan-review/yoplan.md; then echo 'BLOCKED: Plan review required. Launch plan-reviewer subagent (Agent tool, subagent_type: plan-reviewer), wait for completion, then retry ExitPlanMode.'; exit 1; fi",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "EnterPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f ./.plan-review/yoplan.md ]; then > ./.plan-review/yoplan.md; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
