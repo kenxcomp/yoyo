@@ -10,6 +10,7 @@
 | [darwin](./plugins/darwin) | 自动错误修复插件，将运行时错误交给专用代理处理，保留主对话上下文 | 错误处理, 代理, 自动化 |
 | [plan-guardian](./plugins/plan-guardian) | 计划审查工作流插件，确保计划在执行前经过严格审查 | 规划, 审查, 代理, 质量 |
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
+| [bug-fix-testcase](./plugins/bug-fix-testcase) | 在修复 Bug 时自动在隔离的 git worktree 中生成子代理编写回归测试用例 | 测试, 修复, 回归, 代理, worktree |
 
 ## 安装方法
 
@@ -28,6 +29,7 @@
 /plugin install darwin@kenxcomp-yoyo
 /plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
+/plugin install bug-fix-testcase@kenxcomp-yoyo
 ```
 
 ### 方法二：交互式界面
@@ -132,6 +134,23 @@ plugin-name/
 - 需求（预期结果是否明确？）
 - 假设（是否识别了隐含信念？）
 - 约束（是否说明了限制条件？）
+
+### bug-fix-testcase 插件
+
+`bug-fix-testcase` 插件在修复 Bug 时生成专用代理编写回归测试。主要特性：
+
+- **SessionStart 钩子**：在会话启动时注入技能感知
+- **UserPromptSubmit 钩子**：自动检测修复 Bug 的关键词（fix bug、bugfix、hotfix、patch、regression、defect、修复）
+- **Bug-Fix 技能**：使用 Bug 上下文协调 testcase-writer 代理调用
+- **Testcase-Writer 代理**（opus）：在隔离的 git worktree 中编写回归测试
+
+**支持的测试框架：**
+- Python (pytest)、JavaScript (Jest, Vitest)、TypeScript、Rust (cargo test)、Go (go test)、Ruby (RSpec)、Java (JUnit)
+
+**Worktree 隔离：**
+- 测试在 `.bug-fix-testcase/worktree-<timestamp>` 中的独立分支上编写
+- 通过 `git cherry-pick`、`git checkout -- <file>` 或 `git merge` 合并
+- 使用 `git worktree remove <path>` 清理
 
 ## 贡献指南
 

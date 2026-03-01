@@ -10,6 +10,7 @@ A curated collection of useful plugins for Claude Code.
 | [darwin](./plugins/darwin) | Automatic error-fixing plugin that offloads runtime errors to dedicated agents, preserving main conversation context | error-handling, agents, automation |
 | [plan-guardian](./plugins/plan-guardian) | Plan review workflow plugin that ensures plans are rigorously reviewed before execution | planning, review, agents, quality |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
+| [bug-fix-testcase](./plugins/bug-fix-testcase) | Spawns a subagent in an isolated git worktree to write regression test cases while fixing bugs | testing, bugfix, regression, agents, worktree |
 
 ## Installation
 
@@ -28,6 +29,7 @@ Then install the plugins you need:
 /plugin install darwin@kenxcomp-yoyo
 /plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
+/plugin install bug-fix-testcase@kenxcomp-yoyo
 ```
 
 ### Method 2: Interactive UI
@@ -126,6 +128,23 @@ The `socratic-questioning` plugin uses Socratic questioning methodology to ensur
 - Requirements (are expected outcomes clear?)
 - Assumptions (are implicit beliefs identified?)
 - Constraints (are limitations specified?)
+
+### bug-fix-testcase Plugin
+
+The `bug-fix-testcase` plugin spawns a dedicated agent to write regression tests while you fix bugs. Key features:
+
+- **SessionStart Hook**: Injects skill awareness at session start
+- **UserPromptSubmit Hook**: Auto-detects bug-fixing keywords (fix bug, bugfix, hotfix, patch, regression, defect)
+- **Bug-Fix Skill**: Orchestrates the testcase-writer agent invocation with bug context
+- **Testcase-Writer Agent** (opus): Writes regression tests in an isolated git worktree
+
+**Supported Test Frameworks:**
+- Python (pytest), JavaScript (Jest, Vitest), TypeScript, Rust (cargo test), Go (go test), Ruby (RSpec), Java (JUnit)
+
+**Worktree Isolation:**
+- Tests are written in `.bug-fix-testcase/worktree-<timestamp>` on a separate branch
+- Merge via `git cherry-pick`, `git checkout -- <file>`, or `git merge`
+- Clean up with `git worktree remove <path>`
 
 ## Contributing
 

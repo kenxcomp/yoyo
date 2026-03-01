@@ -14,7 +14,8 @@ yoyo/
 │   ├── claude-md/            # Plugin for CLAUDE.md auto-update detection
 │   ├── darwin/               # Plugin for automatic error-fixing
 │   ├── plan-guardian/        # Plugin for plan review workflow enforcement
-│   └── socratic-questioning/ # Plugin for Socratic clarification questions
+│   ├── socratic-questioning/ # Plugin for Socratic clarification questions
+│   └── bug-fix-testcase/     # Plugin for regression test generation during bug fixes
 └── CLAUDE.md                 # This file
 ```
 
@@ -86,6 +87,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 | `darwin` | 1.0.0 | Automatic error-fixing via dedicated agent, preserves main conversation context |
 | `plan-guardian` | 1.0.0 | Plan review workflow enforcement via agent, hooks, and skill |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
+| `bug-fix-testcase` | 1.0.0 | Spawn subagent in isolated git worktree to write regression tests while fixing bugs |
 
 ## Lessons Learned
 

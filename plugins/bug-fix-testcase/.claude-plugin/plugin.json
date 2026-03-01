@@ -1,0 +1,8 @@
+{
+  "name": "bug-fix-testcase",
+  "version": "1.0.0",
+  "description": "Automatically spawns a subagent in an isolated git worktree to write regression test cases while you fix bugs, preventing the same bug from recurring.",
+  "author": {
+    "name": "kenxcomp"
+  }
+}

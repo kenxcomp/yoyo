@@ -40,6 +40,14 @@
       "source": "./plugins/plan-guardian",
       "category": "productivity",
       "tags": ["planning", "review", "agents", "quality"]
+    },
+    {
+      "name": "bug-fix-testcase",
+      "description": "Automatically spawns a subagent in an isolated git worktree to write regression test cases while fixing bugs",
+      "version": "1.0.0",
+      "source": "./plugins/bug-fix-testcase",
+      "category": "productivity",
+      "tags": ["testing", "bugfix", "regression", "agents", "worktree"]
     }
   ]
 }
