@@ -1,6 +1,6 @@
 ---
 name: plan-review
-description: "Manually trigger a plan review. Use when you have a plan and want to validate it before execution, or when ExitPlanMode was blocked and you need to run the reviewer."
+description: "Manually trigger a plan review. Use when you have a plan and want to validate it before execution."
 user_invocable: true
 ---
 

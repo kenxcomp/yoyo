@@ -85,7 +85,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 |--------|---------|-------------|
 | `claude-md` | 1.1.0 | Auto-detect major updates and prompt for CLAUDE.md updates (skill-based) |
 | `darwin` | 1.0.0 | Automatic error-fixing via dedicated agent, preserves main conversation context |
-| `plan-guardian` | 1.0.0 | Plan review workflow enforcement via agent, hooks, and skill |
+| `plan-guardian` | 1.2.0 | Non-blocking plan review via agent and /plan-review skill |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
 | `bug-fix-testcase` | 1.0.0 | Spawn subagent in isolated git worktree to write regression tests while fixing bugs |
 

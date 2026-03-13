@@ -1,22 +1,21 @@
 # plan-guardian
 
-A Claude Code plugin that enforces rigorous plan review before execution. Consolidates the plan-review workflow (agent, hooks, context injection) into a single distributable plugin.
+A Claude Code plugin that provides rigorous plan review capabilities. Claude autonomously decides when to invoke the reviewer based on plan complexity and risk, or users can trigger it manually via `/plan-review`.
 
 ## Features
 
 - **Plan-reviewer agent** — A dedicated agent that reviews plans against 8 quality criteria (edge cases, abnormal scenarios, style consistency, logical consistency, verification steps, unclear intentions, semantic ambiguity, user intent alignment)
-- **ExitPlanMode hook** — Blocks exiting plan mode until the plan-reviewer has completed and approved the plan
 - **EnterPlanMode hook** — Clears the previous review state when entering a new planning session
-- **SessionStart injection** — Automatically injects Plan Mode Rules into every session as additionalContext
+- **SessionStart injection** — Injects plan review guidelines into every session as additionalContext
 - **/plan-review skill** — Manually trigger a plan review at any time
 
 ## How It Works
 
-1. When you enter plan mode, the `EnterPlanMode` hook clears any previous review state in `.plan-review/yoplan.md`.
-2. You write your plan to `.plan-review/yoplan.md`.
-3. You launch the `plan-reviewer` agent, which evaluates the plan against all 8 criteria.
-4. If the plan passes, the agent marks `- [x] Have I reviewed this plan?` in the file.
-5. The `ExitPlanMode` hook checks for this checkbox — only allowing you to exit plan mode if the review passed.
+1. When you enter plan mode, the `EnterPlanMode` hook clears any previous review state.
+2. You write your plan.
+3. Claude may autonomously launch the `plan-reviewer` agent based on its judgment, or you can invoke `/plan-review` manually.
+4. The agent evaluates the plan against all 8 criteria, proposes fixes for any issues, and reports results.
+5. ExitPlanMode is **not blocked** — the review is advisory, not a gate.
 
 ## Review Criteria
 
@@ -55,4 +54,4 @@ plan-guardian/
 
 - The `.plan-review/` directory is created in the project working directory. Consider adding it to `.gitignore`.
 - The plan-reviewer agent uses `memory: user` for persistent learning across sessions.
-- Version: 1.0.0
+- Version: 1.2.0

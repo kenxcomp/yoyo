@@ -35,8 +35,8 @@
     },
     {
       "name": "plan-guardian",
-      "description": "Plan review workflow plugin that ensures plans are rigorously reviewed before execution via a dedicated agent, hooks, and skill",
-      "version": "1.1.0",
+      "description": "Plan review workflow plugin with a plan-reviewer agent for rigorous plan quality checks. Non-blocking — Claude autonomously decides when to review, or users trigger via /plan-review",
+      "version": "1.2.0",
       "source": "./plugins/plan-guardian",
       "category": "productivity",
       "tags": ["planning", "review", "agents", "quality"]

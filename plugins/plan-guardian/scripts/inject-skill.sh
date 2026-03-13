@@ -5,7 +5,7 @@ cat << 'EOF'
 {
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
-    "additionalContext": "MANDATORY Plan Mode Rules (plan-guardian plugin): Before calling ExitPlanMode, you MUST complete the following steps in order: (1) Ensure ./.plan-review/ directory exists (create it if not). (2) Write the complete plan to the plan file (Claude Code manages the plan file location automatically). Do NOT copy or write the plan into ./.plan-review/review-status.md — that file is reserved for the review checklist only. (3) Launch the plan-reviewer subagent (Agent tool, subagent_type: plan-reviewer). (4) Wait for the plan-reviewer to complete and confirm ./.plan-review/review-status.md contains '- [x] Have I reviewed this plan?'. (5) Only then call ExitPlanMode. If ExitPlanMode is blocked by a hook error, immediately launch the plan-reviewer subagent, then retry. NEVER manually add '- [x] Have I reviewed this plan?' — only the plan-reviewer subagent may do so."
+    "additionalContext": "Plan Review Guidelines (plan-guardian plugin): After writing a plan and before exiting plan mode, you SHOULD consider launching the plan-reviewer subagent (Agent tool, subagent_type: plan-reviewer) to review the plan for quality. This is recommended but NOT mandatory — use your judgment based on plan complexity and risk. The user can also manually trigger a review via /plan-review. When using the reviewer: (1) Ensure ./.plan-review/ directory exists. (2) The review checklist lives in ./.plan-review/review-status.md (separate from the plan file). (3) NEVER manually add '- [x] Have I reviewed this plan?' — only the plan-reviewer subagent may do so."
   }
 }
 EOF
