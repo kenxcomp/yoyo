@@ -109,31 +109,32 @@ You are executing a structured 6-phase bug fix workflow. Follow each phase seque
 
 ### Step 4a: Spawn Testcase-Writer Agent
 
-Before writing any fix code, spawn the testcase-writer agent to work in parallel:
+Before writing any fix code, you MUST spawn the testcase-writer agent to work in parallel. This is NOT optional.
 
-```
-Agent tool call:
-- subagent_type: "bug-fix-testcase:testcase-writer"
-- isolation: "worktree"
-- run_in_background: true
-- prompt: |
+**Prerequisites check before spawning**:
+- Run `git rev-parse --is-inside-work-tree` to verify this is a git repository
+- If NOT a git repo, skip the agent spawn, note that tests must be written manually, and proceed with the fix only
+
+**If in a git repo, immediately call the Agent tool** with these exact parameters:
+- **subagent_type**: `bug-fix-testcase:testcase-writer`
+- **isolation**: `worktree`
+- **run_in_background**: `true`
+- **description**: `Write module regression tests for [one-line bug summary from Phase 1]`
+- **prompt**: Compose the prompt by filling in the template below with actual values from Phase 1 and Phase 3:
+
     Write regression test cases for the following bug:
 
-    **Bug Description**: <symptoms from Phase 1>
-    **Root Cause**: <root cause from Phase 1>
-    **Affected Files**: <affected files list>
-    **Fix Approach**: <proposed fix from Phase 3>
-    **Relevant Context**: <test framework, existing test patterns, related modules>
+    **Bug Description**: [fill in symptoms from Phase 1]
+    **Root Cause**: [fill in root cause from Phase 1]
+    **Affected Files**: [fill in affected files list]
+    **Fix Approach**: [fill in proposed fix from Phase 3]
+    **Relevant Context**: [fill in test framework, existing test patterns, related modules]
 
     Focus on module-level and integration-level tests that verify the bug is fixed
     and does not recur. These should test the component's public interface and
     behavior, not internal implementation details.
-- description: "Write module regression tests for <one-line bug summary>"
-```
 
-**Prerequisites check before spawning**:
-- Verify this is a git repository: `git rev-parse --is-inside-work-tree`
-- If NOT a git repo, skip the agent spawn, note that tests must be written manually, and proceed with the fix only
+Do NOT wrap this in a code block or treat it as an example. You must actually invoke the Agent tool NOW before proceeding to Step 4b.
 
 ### Step 4b: Implement the Fix
 
