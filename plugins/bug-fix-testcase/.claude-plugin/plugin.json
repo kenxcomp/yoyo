@@ -1,7 +1,7 @@
 {
   "name": "bug-fix-testcase",
-  "version": "1.0.0",
-  "description": "Automatically spawns a subagent in an isolated git worktree to write regression test cases while you fix bugs, preventing the same bug from recurring.",
+  "version": "1.1.0",
+  "description": "End-to-end bug fix workflow with /bugfix command: analyze, research, plan, fix + parallel test generation, merge, and verify. Also spawns subagent in isolated git worktree for regression tests.",
   "author": {
     "name": "kenxcomp"
   }

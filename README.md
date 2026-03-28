@@ -10,7 +10,7 @@ A curated collection of useful plugins for Claude Code.
 | [darwin](./plugins/darwin) | Automatic error-fixing plugin that offloads runtime errors to dedicated agents, preserving main conversation context | error-handling, agents, automation |
 | [plan-guardian](./plugins/plan-guardian) | Plan review workflow plugin that ensures plans are rigorously reviewed before execution | planning, review, agents, quality |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
-| [bug-fix-testcase](./plugins/bug-fix-testcase) | Spawns a subagent in an isolated git worktree to write regression test cases while fixing bugs | testing, bugfix, regression, agents, worktree |
+| [bug-fix-testcase](./plugins/bug-fix-testcase) | End-to-end `/bugfix` command + subagent in isolated git worktree for regression tests | testing, bugfix, regression, agents, worktree |
 
 ## Installation
 
@@ -137,6 +137,12 @@ The `bug-fix-testcase` plugin spawns a dedicated agent to write regression tests
 - **UserPromptSubmit Hook**: Auto-detects bug-fixing keywords (fix bug, bugfix, hotfix, patch, regression, defect)
 - **Bug-Fix Skill**: Orchestrates the testcase-writer agent invocation with bug context
 - **Testcase-Writer Agent** (opus): Writes regression tests in an isolated git worktree
+- **/bugfix Command**: End-to-end workflow — analyze → web search → plan → fix + parallel tests → merge → verify
+
+**Usage:**
+```
+/bug-fix-testcase:bugfix <bug description or issue reference>
+```
 
 **Supported Test Frameworks:**
 - Python (pytest), JavaScript (Jest, Vitest), TypeScript, Rust (cargo test), Go (go test), Ruby (RSpec), Java (JUnit)

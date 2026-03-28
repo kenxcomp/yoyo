@@ -14,6 +14,7 @@ When you're fixing a bug, this plugin can spawn a dedicated **testcase-writer** 
 | `detect-bugfix.sh` | UserPromptSubmit Hook | Auto-detects bug-fixing keywords in user prompts |
 | `bug-fix-testcase` | Skill | Orchestrates the testcase-writer agent invocation |
 | `testcase-writer` | Agent (opus) | Writes regression tests in an isolated git worktree |
+| `bugfix` | Command | End-to-end bug fix workflow: analyze, research, plan, fix + test, merge, verify |
 
 ## Usage
 
@@ -29,6 +30,38 @@ When detected, Claude will suggest spawning the testcase-writer agent.
 
 ```
 /bug-fix-testcase
+```
+
+### /bugfix Command
+
+Full end-to-end bug fix workflow:
+
+```
+/bug-fix-testcase:bugfix <bug description or issue reference>
+```
+
+**Workflow:**
+
+| Phase | Name | Description |
+|-------|------|-------------|
+| 1 | **Analyze** | Read code, trace the bug, identify root cause |
+| 2 | **Web Search** | Search Stack Overflow / GitHub Issues for solutions |
+| 3 | **Plan & Confirm** | Present fix plan, wait for user approval |
+| 4 | **Fix + Module Tests** | Implement fix + spawn testcase-writer agent in parallel |
+| 5 | **Merge + Unit Tests** | Cherry-pick module tests, then write additional unit tests |
+| 6 | **Verify** | Run full test suite, iterate if failures remain |
+
+**Examples:**
+
+```bash
+# Describe the bug in natural language
+/bug-fix-testcase:bugfix login form crashes when email contains a plus sign
+
+# Reference a specific file
+/bug-fix-testcase:bugfix negative prices in src/pricing.py when discount > 100%
+
+# Reference an issue
+/bug-fix-testcase:bugfix #42 session timeout not handled correctly
 ```
 
 ## Supported Test Frameworks
@@ -61,7 +94,7 @@ bug-fix-testcase/
 ├── agents/
 │   └── testcase-writer.md       # Testcase-writer agent definition
 ├── commands/
-│   └── .gitkeep
+│   └── bugfix.md              # End-to-end bug fix workflow command
 └── README.md                    # This file
 ```
 
@@ -107,4 +140,5 @@ git branch -d <branch-name>
 
 | Version | Changes |
 |---------|---------|
+| 1.1.0 | Add `/bugfix` command for end-to-end bug fix workflow (analyze, research, plan, fix + parallel tests, merge, verify) |
 | 1.0.0 | Initial release: SessionStart + UserPromptSubmit hooks, testcase-writer agent, auto-detection |
