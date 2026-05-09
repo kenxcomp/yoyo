@@ -1,0 +1,8 @@
+{
+  "name": "codex-cr-loop",
+  "version": "1.0.0",
+  "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR).",
+  "author": {
+    "name": "kenxcomp"
+  }
+}
