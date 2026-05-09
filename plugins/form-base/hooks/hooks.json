@@ -1,0 +1,17 @@
+{
+  "description": "form-base hooks: SessionStart skill injection so the agent knows when to call create_form / render_response.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

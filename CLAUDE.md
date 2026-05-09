@@ -15,7 +15,9 @@ yoyo/
 │   ├── darwin/               # Plugin for automatic error-fixing
 │   ├── plan-guardian/        # Plugin for plan review workflow enforcement
 │   ├── socratic-questioning/ # Plugin for Socratic clarification questions
-│   └── bug-fix-testcase/     # Plugin for regression test generation during bug fixes
+│   ├── bug-fix-testcase/     # Plugin for regression test generation during bug fixes
+│   ├── codex-cr-loop/        # Plugin for /codex:review loop with three completion modes
+│   └── form-base/            # MCP-backed HTML form & rich-response base (Claude Code + Codex)
 └── CLAUDE.md                 # This file
 ```
 
@@ -35,6 +37,32 @@ plugin-name/
 ├── agents/                   # Custom agents (reserved)
 └── README.md                 # Plugin documentation
 ```
+
+### Plugins that ship an MCP server
+
+`form-base` is the first plugin in this marketplace that bundles a local MCP server. The pattern:
+
+```
+form-base/
+├── .claude-plugin/plugin.json
+├── .mcp.json                  # tells Claude Code to spawn the bundled server
+├── mcp-server/                 # publishable as @yoyo/form-base-mcp
+│   ├── package.json            # bin: form-base-mcp
+│   ├── tsconfig.json
+│   ├── src/                    # MCP entry, HTTP server, tool implementations
+│   └── public/                 # browser-side HTML/CSS/JS served by the embedded HTTP
+├── commands/, hooks/, skills/, scripts/  # standard plugin pieces
+└── README.md / README_CN.md
+```
+
+Key wiring:
+- `.mcp.json` uses `${CLAUDE_PLUGIN_ROOT}` so the server runs from the plugin directory:
+  ```json
+  { "mcpServers": { "form-base": { "command": "bun", "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/src/index.ts"] } } }
+  ```
+- The MCP server starts an embedded HTTP server on `localhost:0` and serves both `/forms/<id>` (writable) and `/responses/<id>` (read-only) under that random port.
+- All persistent state lives under `<cwd>/.form-base/` (project-scoped); the MCP server's own working directory is whatever Claude Code / Codex spawns it with.
+- For Codex, install via `~/.codex/config.toml` referencing the same `mcp-server/src/index.ts` (or `bunx @yoyo/form-base-mcp` once published).
 
 ## Development Guidelines
 
@@ -87,7 +115,9 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 | `darwin` | 1.0.0 | Automatic error-fixing via dedicated agent, preserves main conversation context |
 | `plan-guardian` | 1.2.0 | Non-blocking plan review via agent and /plan-review skill |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
-| `bug-fix-testcase` | 1.1.0 | End-to-end /bugfix command + subagent in isolated git worktree for regression tests |
+| `bug-fix-testcase` | 1.1.1 | End-to-end /bugfix command + subagent in isolated git worktree for regression tests |
+| `codex-cr-loop` | 1.0.0 | Iterate `/codex:review` until two clean rounds; three completion modes (stop / merge / PR) |
+| `form-base` | 1.0.0 | MCP-backed HTML interaction base for Claude Code + Codex: forms (radio/checkbox/text/markdown + color/font/slider) and rich-response views with business-prominent / technical-collapsed toggle |
 
 ## Lessons Learned
 

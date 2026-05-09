@@ -48,6 +48,22 @@
       "source": "./plugins/bug-fix-testcase",
       "category": "productivity",
       "tags": ["testing", "bugfix", "regression", "agents", "worktree"]
+    },
+    {
+      "name": "codex-cr-loop",
+      "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR)",
+      "version": "1.0.0",
+      "source": "./plugins/codex-cr-loop",
+      "category": "productivity",
+      "tags": ["codex", "review", "loop", "commands", "ci"]
+    },
+    {
+      "name": "form-base",
+      "description": "HTML interaction base for Claude Code & Codex: agent-emitted forms (radio/checkbox/text/markdown + color/font/slider) and rich-response views (business-prominent, technical-collapsed). MCP server + slash commands + skill + SessionStart hook.",
+      "version": "1.0.0",
+      "source": "./plugins/form-base",
+      "category": "productivity",
+      "tags": ["mcp", "html", "forms", "responses", "ui", "codex", "agents"]
     }
   ]
 }

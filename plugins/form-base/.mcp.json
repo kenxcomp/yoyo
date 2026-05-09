@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "form-base": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/src/index.ts"]
+    }
+  }
+}

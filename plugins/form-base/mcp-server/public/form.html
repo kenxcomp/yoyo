@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{TITLE}} · form-base</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "marked": "https://cdn.jsdelivr.net/npm/marked@12/lib/marked.esm.js"
+        }
+      }
+    </script>
+    <script>
+      /*__FORM_DATA__*/
+    </script>
+  </head>
+  <body>
+    <main>
+      <header class="fb-header">
+        <h1 class="fb-title" id="fb-title">{{TITLE}}</h1>
+        <div class="fb-meta">
+          <span>表单 · <code id="fb-form-id"></code></span>
+          <span id="fb-status"></span>
+        </div>
+      </header>
+
+      <div id="fb-description" class="fb-description" hidden></div>
+      <div id="fb-style-suggestions"></div>
+
+      <form id="fb-form" novalidate>
+        <div id="fb-items"></div>
+
+        <div class="fb-savebar">
+          <span id="fb-savebar-status" class="fb-status">
+            <span class="dot"></span>
+            <span class="label">未保存</span>
+          </span>
+          <button id="fb-save" type="submit" class="fb-button">保存答案</button>
+        </div>
+      </form>
+
+      <div id="fb-saved-banner" class="fb-saved-banner" hidden>
+        <strong>已保存。</strong> 请回到 Claude Code / Codex,告诉智能体「我完成了」即可继续。
+      </div>
+    </main>
+
+    <script type="module" src="/assets/form-app.js"></script>
+  </body>
+</html>
