@@ -25,7 +25,7 @@ command = "bun"
 args = ["/abs/path/to/yoyo/plugins/form-base/mcp-server/src/index.ts"]
 ```
 
-(Once published to npm: `command = "bunx"`, `args = ["@yoyo/form-base-mcp"]`.)
+(Once published to npm: `command = "bunx"`, `args = ["@kenxyoyo/form-base-mcp"]`.)
 
 ## How it works
 

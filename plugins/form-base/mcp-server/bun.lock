@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@yoyo/form-base-mcp",
+      "name": "@kenxyoyo/form-base-mcp",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.0.0",
         "hono": "^4.0.0",

@@ -46,7 +46,7 @@ plugin-name/
 form-base/
 ├── .claude-plugin/plugin.json
 ├── .mcp.json                  # tells Claude Code to spawn the bundled server
-├── mcp-server/                 # publishable as @yoyo/form-base-mcp
+├── mcp-server/                 # publishable as @kenxyoyo/form-base-mcp
 │   ├── package.json            # bin: form-base-mcp
 │   ├── tsconfig.json
 │   ├── src/                    # MCP entry, HTTP server, tool implementations
@@ -62,7 +62,7 @@ Key wiring:
   ```
 - The MCP server starts an embedded HTTP server on `localhost:0` and serves both `/forms/<id>` (writable) and `/responses/<id>` (read-only) under that random port.
 - All persistent state lives under `<cwd>/.form-base/` (project-scoped); the MCP server's own working directory is whatever Claude Code / Codex spawns it with.
-- For Codex, install via `~/.codex/config.toml` referencing the same `mcp-server/src/index.ts` (or `bunx @yoyo/form-base-mcp` once published).
+- For Codex, install via `~/.codex/config.toml` referencing the same `mcp-server/src/index.ts` (or `bunx @kenxyoyo/form-base-mcp` once published).
 
 ## Development Guidelines
 

@@ -1,5 +1,5 @@
 {
-  "name": "@yoyo/form-base-mcp",
+  "name": "@kenxyoyo/form-base-mcp",
   "version": "1.0.0",
   "description": "MCP server for form-base: HTML form collection + rich response rendering for Claude Code & Codex.",
   "type": "module",
