@@ -1,15 +1,16 @@
 {
   "name": "@kenxyoyo/form-base-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for form-base: HTML form collection + rich response rendering for Claude Code & Codex.",
   "type": "module",
   "bin": {
-    "form-base-mcp": "./src/index.ts"
+    "form-base-mcp": "bin/form-base-mcp.mjs"
   },
   "main": "./src/index.ts",
   "files": [
     "src",
-    "public"
+    "public",
+    "bin"
   ],
   "scripts": {
     "start": "bun run src/index.ts",
