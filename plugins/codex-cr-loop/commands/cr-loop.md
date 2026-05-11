@@ -30,7 +30,7 @@ different review base (e.g., a release branch, an integration branch named
 
 Read these once during preflight; defaults shown:
 
-- `CR_LOOP_ROUND_CAP=20` — hard ceiling on rounds. Hitting cap stops the loop, writes a handoff, and surfaces to the user. Prevents indefinite ping-pong.
+- `CR_LOOP_ROUND_CAP=` — **opt-in** ceiling on rounds (unset by default → no cap). When set to a positive integer N, hitting `ROUND_NUM >= N` stops the loop, writes a handoff, and surfaces to the user. Leave unset to let the loop run until it converges, hits the file-family widening guard, drifts, or you cancel manually.
 - `CR_LOOP_WIDEN_AFTER=5` — after this many consecutive dirty rounds whose findings stay inside the same file family, stop and surface a widening hint instead of attempting a 6th symptomatic fix.
 - `CR_LOOP_SKIP_P3=1` — when `1` (default), rounds whose findings are exclusively P3 are treated as clean (P3 ≈ defensive / style / nit; doesn't block convergence). Set to `0` for strict mode where P3s also block convergence and must be fixed.
 
@@ -87,7 +87,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
      - Reset `DIRTY_STREAK = 0` and `STREAK_FILE_SET = ∅` (the dirty streak ends here, even though findings exist — they're just below the action threshold).
      - **Check convergence**: if `CLEAN_STREAK >= 2`, jump to step 8 (stop). This check is load-bearing — without it the loop keeps re-entering step 3 forever because no fix is applied, HEAD never changes, every subsequent round is the same P3-only set, `CLEAN_STREAK` increments without bound, and step 8 is never reached.
      - Log `Round N: P3-only ignored (CR_LOOP_SKIP_P3=1, CLEAN_STREAK=k/2)`.
-     - Apply step 4c round cap (it still applies — a misconfigured env var with persistent P3 findings shouldn't burn rounds silently).
+     - Apply step 4c round cap (only when the user has opted in via `CR_LOOP_ROUND_CAP` — a misconfigured env var with persistent P3 findings shouldn't burn rounds silently when a ceiling has been set).
      - Otherwise return to step 3 for the confirmation round.
    - **Note on no-commit semantics**: this path deliberately does NOT commit anything (P3s are skipped, not fixed). HEAD stays at `REVIEWED_HEAD`, so the next round's `REVIEWED_HEAD` will equal `LAST_REVIEWED_HEAD` and the second pass will satisfy `CLEAN_STREAK >= 2` immediately if Codex returns the same P3-only verdict (or genuinely clean). If Codex returns a higher-severity finding next round, the dirty path takes over normally — `CLEAN_STREAK` resets, `DIRTY_STREAK` starts at 1 with the new file set.
    - If any finding is P0/P1/P2, ignore this filter (proceed to step 4b + 5 with the full finding list, including the P3 entries — fix them alongside the higher-severity ones).
@@ -98,7 +98,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
    - If `DIRTY_STREAK > 0` and `ROUND_FILES ⊄ STREAK_FILE_SET` (this round cited a *new* file family — the bug surface moved): reset `STREAK_FILE_SET = ROUND_FILES`, `DIRTY_STREAK = 1`. Proceed to step 5. (A genuinely shifting surface is healthy progress; the widening guard only fires when we're spinning on the same file family.)
    - Always reset `CLEAN_STREAK = 0` and `LAST_REVIEWED_HEAD` on any dirty round (the upcoming step 6 commit produces a new HEAD that must be re-reviewed from scratch).
 
-   **4c. Hard round cap.** After classification, if `ROUND_NUM >= CR_LOOP_ROUND_CAP` (default 20): write a handoff (step 9) with `Stop reason: round-cap-reached`, surface, exit. The cap exists to bound worst-case token spend on a single `/cr-loop` invocation; the user can resume by re-invoking with the cap raised (`CR_LOOP_ROUND_CAP=40 /cr-loop ...`) or take the surfaced state and decide manually.
+   **4c. Optional round cap.** After classification, if `CR_LOOP_ROUND_CAP` is set to a positive integer AND `ROUND_NUM >= CR_LOOP_ROUND_CAP`: write a handoff (step 9) with `Stop reason: round-cap-reached`, surface, exit. The cap is **opt-in** — when `CR_LOOP_ROUND_CAP` is unset or empty (the default), this step is a no-op and the loop runs uncapped (it still stops on convergence, widening guard, head-drift, or manual cancel). Set it (e.g. `CR_LOOP_ROUND_CAP=20 /cr-loop ...`) to bound worst-case token spend on a single invocation; the user can resume by re-invoking with a higher cap or take the surfaced state and decide manually.
 
 5. **Fix each finding in order (highest severity first: P0 > P1 > P2 > P3):**
    - Read the cited file + line range first; do not act on the headline alone.
@@ -166,7 +166,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 - **Don't reformat files the reviewer didn't flag.** Scope each commit to the findings it resolves.
 - **Don't fix pre-existing issues** the reviewer surfaces in files outside this branch's diff — acknowledge them in the summary and ask before expanding scope.
 - **If the same finding recurs after a fix**, the fix was too narrow. Re-read the reviewer's explanation and widen — do NOT burn another round on the same symptom. If the same finding recurs **a third time** after two distinct widening attempts, stop and surface to the user (this is a stricter, finer-grained version of the file-family widening guard in 4b — both can fire; whichever fires first wins).
-- **Round budget IS bounded** (`CR_LOOP_ROUND_CAP`, default 20). The cap exists because a 30-round loop has produced 30× model-token spend with diminishing per-round value; if you're past 15 rounds and still dirty, stop and let the user restructure (squash + reorganize, raise the cap explicitly, or split the work into multiple PRs).
+- **Round budget is uncapped by default** (`CR_LOOP_ROUND_CAP` is opt-in, unset by default). The loop stops on convergence, the file-family widening guard, head-drift, or manual cancel — not on a default round count. If you're past ~15 rounds and still dirty, the widening guard (`CR_LOOP_WIDEN_AFTER`, default 5) should already have fired with a handoff; if it hasn't (genuinely shifting bug surface), token spend grows linearly with rounds, so consider squash + reorganize or splitting the work into multiple PRs. Set `CR_LOOP_ROUND_CAP=N` when you want an explicit ceiling for the run.
 - **Keep the user informed between rounds** with one-line status. Always include both streaks: "Round N: M findings (Pn×a, Pn×b), DIRTY_STREAK=k/<CR_LOOP_WIDEN_AFTER>, applying fixes." On a clean round, include the clean streak: "Round N: clean (CLEAN_STREAK=1/2, running confirmation round)" or "Round N: clean (CLEAN_STREAK=2/2, stopping — no push, no PR, no merge)".
 - **Don't `ScheduleWakeup` while waiting for a round.** Use `Monitor` against the codex companion PID (or block on the foreground bash). Wakeup-stacking creates redundant `/cr-loop` re-entries that confuse state and waste tokens.
 

@@ -2,7 +2,7 @@
 
 Three slash commands that wrap `/codex:review` (from the `openai-codex` plugin) into a **convergence loop**: iterate `/codex:review --wait`, fix every P0/P1/P2/P3 finding it returns, commit, re-run, and stop only when **two consecutive rounds** return no actionable findings.
 
-The three commands share the entire review-loop body — P3 skip filter, file-family widening guard, hard round cap, head-drift detection, handoff file format — and differ only in what they do *after* convergence:
+The three commands share the entire review-loop body — P3 skip filter, file-family widening guard, optional opt-in round cap, head-drift detection, handoff file format — and differ only in what they do *after* convergence:
 
 | Command | After convergence |
 |---|---|
@@ -35,7 +35,7 @@ Pass an explicit base ref as the first argument when you want to review against 
 
 All three commands honor:
 
-- `CR_LOOP_ROUND_CAP=20` — hard ceiling on rounds.
+- `CR_LOOP_ROUND_CAP=` — **opt-in** ceiling on rounds (unset by default → no cap). Set to a positive integer to bound the run.
 - `CR_LOOP_WIDEN_AFTER=5` — consecutive-same-file-family rounds before the widening guard fires.
 - `CR_LOOP_SKIP_P3=1` — treat rounds with only P3 findings as clean.
 
