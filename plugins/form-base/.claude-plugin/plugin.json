@@ -1,6 +1,6 @@
 {
   "name": "form-base",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "HTML interaction base for Claude Code & Codex: agent-emitted forms (radio/checkbox/text/markdown + color/font/slider) and rich-response views (business-prominent, technical-collapsed). MCP server + slash commands + skill + SessionStart hook.",
   "author": {
     "name": "kenxcomp"

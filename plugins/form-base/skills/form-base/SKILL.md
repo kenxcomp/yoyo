@@ -15,6 +15,7 @@ Use it when the user has described a need but **key information is unclear** and
 - "I want to build a [thing]" — but you don't know platform / target users / must-have features / style direction
 - "Help me design [X]" — but constraints / deadlines / scope are vague
 - The user's request is **broad** and a structured form would save 5+ rounds of back-and-forth
+- **UI / style / placement decisions** — confirming where a button goes, which color, which font, which component variant. Prefer a form with `radio` / `color` / `font` / `style_suggestions` items over asking text questions like "does this look right?". **Works in plan mode too** — MCP tool calls are not restricted by plan mode's filesystem-write gate, so it's fine to call `create_form` while drafting a plan and then `ExitPlanMode` after the user has chosen.
 
 Pack the questions into one `create_form` call. Use the right item types:
 
