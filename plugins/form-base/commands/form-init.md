@@ -11,12 +11,14 @@ Run these steps:
    - `.form-base/config.json`:
      ```json
      {
+       "role": "product-manager",
        "default_user_role": "non-developer",
        "response_threshold_chars": 600,
        "response_threshold_lines": 30,
        "auto_open_browser": false
      }
      ```
+     (`role` shapes how the agent answers — `product-manager` / `developer` / `lawyer` / `null`. Switch via `/form-base:role`.)
    - `.form-base/.gitignore`:
      ```
      # form-base — keep prompts/content under review, ignore live state and answers.

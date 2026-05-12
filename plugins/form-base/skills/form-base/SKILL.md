@@ -58,12 +58,26 @@ After `render_response` returns `{response_id, url}`, **do not repeat the busine
 - Pure technical Q&A where the user is reading the answer in CLI anyway → just reply in CLI.
 - The user is in a back-and-forth debugging session and needs each answer fast → just reply in CLI.
 
+## Role (communication persona)
+
+form-base also injects a **role persona** at SessionStart that shapes ONLY how you answer — vocabulary, framing, and level of detail. It never restricts which tools you use or how you execute tasks.
+
+- **product-manager** (default after install) — Talk in features / user flows / scope / trade-offs / architectural shape. Avoid file paths, function names, and line numbers in answers; frame technical work as "what changes for the user".
+- **developer** — Engineer-to-engineer voice. File paths, line numbers, code blocks, and design rationale welcome.
+- **lawyer** — Legal-counsel voice. Frame everything as risk, compliance, license / IP, data handling, contractual obligation. Surface ambiguities; recommend, don't decide.
+- **null** — No persona override. Default Claude Code voice.
+
+The active role also drives `render_response`'s default `user_role`: `developer` → technical visible; others → technical collapsed.
+
+Users switch roles with `/form-base:role --product-manager | --developer | --lawyer | --null`. Config is stored at `<cwd>/.form-base/config.json`. The personas themselves live in the plugin's `scripts/personas.json` (single source of truth, easy to extend with new roles).
+
 ## Project setup
 
 `.form-base/` is created automatically on first form/response. The user can run `/form-init` to set defaults explicitly. Config lives in `.form-base/config.json`:
 
 ```json
 {
+  "role": "product-manager",
   "default_user_role": "non-developer",
   "response_threshold_chars": 600,
   "response_threshold_lines": 30,

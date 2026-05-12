@@ -59,11 +59,11 @@
     },
     {
       "name": "form-base",
-      "description": "HTML interaction base for Claude Code & Codex: agent-emitted forms (radio/checkbox/text/markdown + color/font/slider) and rich-response views (business-prominent, technical-collapsed). MCP server + slash commands + skill + SessionStart hook. Nudges form usage for UI style/placement decisions, including in plan mode.",
-      "version": "1.0.1",
+      "description": "HTML interaction base for Claude Code & Codex: agent-emitted forms (radio/checkbox/text/markdown + color/font/slider), rich-response views (business-prominent, technical-collapsed), and a switchable SessionStart-injected communication role (product-manager default; developer / lawyer / null switchable via /form-base:role). Role shapes answers only, never restricts tool use.",
+      "version": "1.1.0",
       "source": "./plugins/form-base",
       "category": "productivity",
-      "tags": ["mcp", "html", "forms", "responses", "ui", "codex", "agents"]
+      "tags": ["mcp", "html", "forms", "responses", "ui", "codex", "agents", "role", "persona"]
     }
   ]
 }

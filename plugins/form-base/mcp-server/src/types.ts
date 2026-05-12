@@ -130,9 +130,19 @@ export interface ResponseMeta {
   archived_at?: string;
 }
 
+// ────────────────────────── ROLE ──────────────────────────
+
+// Role shapes ONLY how the agent answers (vocabulary, framing, level of detail).
+// It never restricts which tools the agent uses or how tasks are executed.
+// `null` means no persona injection — default Claude Code voice.
+export type FormBaseRole = "product-manager" | "developer" | "lawyer" | null;
+
+export const KNOWN_ROLES = ["product-manager", "developer", "lawyer"] as const;
+
 // ────────────────────────── CONFIG ──────────────────────────
 
 export interface FormBaseConfig {
+  role: FormBaseRole;
   default_user_role: "non-developer" | "developer";
   response_threshold_chars: number;
   response_threshold_lines: number;
@@ -140,6 +150,7 @@ export interface FormBaseConfig {
 }
 
 export const DEFAULT_CONFIG: FormBaseConfig = {
+  role: "product-manager",
   default_user_role: "non-developer",
   response_threshold_chars: 600,
   response_threshold_lines: 30,

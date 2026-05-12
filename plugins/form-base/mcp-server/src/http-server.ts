@@ -21,6 +21,14 @@ import {
   writeResponseMeta,
 } from "./response-store.ts";
 import { renderResponseHtml } from "./response-renderer.ts";
+import type { FormBaseConfig } from "./types.ts";
+
+// `developer` role wants code-by-default; PM/lawyer/null fall back to the
+// explicit `default_user_role` config (which itself defaults to non-developer).
+function roleToUserRoleDefault(config: FormBaseConfig): "non-developer" | "developer" {
+  if (config.role === "developer") return "developer";
+  return config.default_user_role;
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = resolve(join(__dirname, "..", "public"));
@@ -71,7 +79,7 @@ export function startHttpServer(cwd: string): HttpServerHandle {
     // touch meta to mark "viewed_at" if you ever want — not used now.
     readResponseMeta(cwd, id);
     const config = readConfig(cwd);
-    const role = def.user_role ?? config.default_user_role;
+    const role = def.user_role ?? roleToUserRoleDefault(config);
     return c.html(renderResponseHtml(id, def, role));
   });
 
