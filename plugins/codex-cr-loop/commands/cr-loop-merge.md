@@ -225,12 +225,11 @@ The loop is sequential by design — each round's diff depends on the previous r
 
 ## Differences from `/cr-loop`
 
-This command is a fork of `/cr-loop` with three behavioral changes:
+This command is a fork of `/cr-loop` with two behavioral changes:
 
 1. **Default base is local `main`, not `origin/main`.** Reviewing against the local merge target keeps the diff scoped to exactly what's about to be merged.
 2. **After convergence, merge into local `${CR_MERGE_TARGET:-main}` instead of pushing to the remote.** No `git fetch origin`, no `git push`, no remote interaction at all. The current worktree is preserved after merge so the user can keep iterating from the same feature branch — manual `git worktree remove` is the user's call.
-3. **Auto-widening sweep is enabled by default (step 4d).** Hitting the file-family widening guard auto-escalates to a systematic root-cause sweep instead of stopping; the user is only paged after `CR_LOOP_MAX_WIDENING_SWEEPS` (default 2) sweeps fail to converge. `cr-loop` keeps the original "stop and hand off" behavior. Set `CR_LOOP_AUTO_WIDEN=0` here to match `cr-loop`'s manual-only mode.
 
-Everything else — the review loop semantics, P3 skip filter, round cap, head-drift detection, handoff file format — is identical.
+Everything else — the review loop semantics, P3 skip filter, file-family widening guard, **auto-widening sweep** with `CR_LOOP_MAX_WIDENING_SWEEPS` budget, round cap, head-drift detection, handoff file format — is identical across all three commands.
 
-Use `/cr-loop` when you want the reviewed commits to land on the remote (typical PR workflow, multi-dev). Use `/cr-loop-merge` when you want the reviewed commits to land on the local integration branch with no remote interaction (single-dev workflow, local-first setups, or staging changes for a manual push later).
+Use `/cr-loop` when you want Codex to gate the work but the integration step (push / merge / PR) is manual or handled by a different workflow. Use `/cr-loop-pr` when you want the reviewed commits to land on the remote and a PR opened automatically (typical multi-dev workflow). Use `/cr-loop-merge` when you want the reviewed commits to land on the local integration branch with no remote interaction (single-dev workflow, local-first setups, or staging changes for a manual push later).

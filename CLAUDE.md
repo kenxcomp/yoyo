@@ -116,7 +116,7 @@ git commit -m "feat: new feature in plugin-name v1.1.0"
 | `plan-guardian` | 1.2.0 | Non-blocking plan review via agent and /plan-review skill |
 | `socratic-questioning` | 2.0.0 | Clarify unclear prompts using multiple choice Socratic questions (skill-based) |
 | `bug-fix-testcase` | 1.1.1 | End-to-end /bugfix command + subagent in isolated git worktree for regression tests |
-| `codex-cr-loop` | 1.1.0 | Iterate `/codex:review` until two clean rounds; three completion modes (stop / merge / PR). Round cap is opt-in (no default ceiling) |
+| `codex-cr-loop` | 1.2.0 | Iterate `/codex:review` until two clean rounds; three completion modes (stop / merge / PR). Auto-widening sweep is shared by all three commands (default ON, capped at `CR_LOOP_MAX_WIDENING_SWEEPS=2` per invocation). Round cap is opt-in (no default ceiling) |
 | `form-base` | 1.1.0 | MCP-backed HTML interaction base for Claude Code + Codex: forms (radio/checkbox/text/markdown + color/font/slider), rich-response views, and a SessionStart-injected role persona (product-manager default; developer / lawyer / null via `/form-base:role`). Role shapes answer style only. |
 
 ## Lessons Learned

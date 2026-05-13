@@ -26,12 +26,25 @@ otherwise reviewer findings won't map cleanly to what reviewers will see in
 the PR. Override only when you genuinely want to review against a different
 ref (e.g., a release branch).
 
+**Auto-widening behavior (default ON)**: when the same file family keeps producing
+findings round after round (a sign that fixes are symptomatic, not root-cause),
+the loop auto-escalates to a **widening sweep round** (step 4d) instead of stopping:
+read the full file family, hypothesize one root cause, sweep the codebase for all
+matching positions, fix them in one commit + add a pattern-level regression test,
+then continue the loop. The widening commit is itself reviewed by Codex on the next
+round, so quality is still gated by the reviewer. The user is only paged when
+`CR_LOOP_MAX_WIDENING_SWEEPS` (default 2) consecutive sweeps fail to converge —
+that's when the surface is genuinely beyond auto-fix scope and needs human judgment.
+Set `CR_LOOP_AUTO_WIDEN=0` to restore the original "stop and hand off" behavior.
+
 ## Tunable knobs (env overrides)
 
 Read these once during preflight; defaults shown:
 
-- `CR_LOOP_ROUND_CAP=` — **opt-in** ceiling on rounds (unset by default → no cap). When set to a positive integer N, hitting `ROUND_NUM >= N` stops the loop, writes a handoff, and surfaces to the user. Leave unset to let the loop run until it converges, hits the file-family widening guard, drifts, or you cancel manually.
-- `CR_LOOP_WIDEN_AFTER=5` — after this many consecutive dirty rounds whose findings stay inside the same file family, stop and surface a widening hint instead of attempting a 6th symptomatic fix.
+- `CR_LOOP_ROUND_CAP=` — **opt-in** ceiling on rounds (unset by default → no cap). When set to a positive integer N, hitting `ROUND_NUM >= N` stops the loop, writes a handoff, and surfaces to the user. Leave unset to let the loop run until it converges, hits the file-family widening guard, drifts, exhausts the auto-widening sweep budget, or you cancel manually.
+- `CR_LOOP_WIDEN_AFTER=5` — after this many consecutive dirty rounds whose findings stay inside the same file family, escalate to a widening sweep (or stop, depending on `CR_LOOP_AUTO_WIDEN`).
+- `CR_LOOP_AUTO_WIDEN=1` — when `1` (default), triggering the widening guard does NOT stop the loop. Instead the agent enters a single **widening sweep round** (step 4d) that reads the full file family, articulates one root-cause hypothesis, sweeps the codebase for matching positions, fixes them in one commit, and adds a pattern-level regression test, then resumes the normal loop. Set to `0` to restore the original "stop and hand off to user" behavior — useful when the user wants to inspect every escalation manually.
+- `CR_LOOP_MAX_WIDENING_SWEEPS=2` — cap on automatic widening sweeps per `/cr-loop-pr` invocation. After this many sweeps, the next widening trigger writes a `widening-sweeps-exhausted` handoff and stops. Prevents the agent from indefinitely rewriting larger and larger swaths of code without human judgment when sweeps aren't converging.
 - `CR_LOOP_SKIP_P3=1` — when `1` (default), rounds whose findings are exclusively P3 are treated as clean (P3 ≈ defensive / style / nit; doesn't block convergence). Set to `0` for strict mode where P3s also block convergence and must be fixed.
 - `CR_PR_BASE=main` — the remote branch the PR targets (`origin/<base>`). Override for projects whose integration branch is named differently (e.g., `develop`, `trunk`).
 - `CR_PR_REMOTE=origin` — the git remote the feature branch is pushed to and the PR is opened against. Override for forks (`upstream`) or self-hosted setups.
@@ -56,6 +69,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
    - **Verify the PR target exists on the remote.** `git rev-parse --verify "refs/remotes/${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}"`. If missing, abort and tell the user to push the integration branch to the remote first or override `CR_PR_BASE` / `CR_PR_REMOTE`.
    - Initialize `CLEAN_STREAK=0` — tracks consecutive clean rounds; loop ends when it reaches 2.
    - Initialize `DIRTY_STREAK=0` and `STREAK_FILE_SET=∅` — see step 4b for widening guard semantics.
+   - Initialize `WIDENING_SWEEPS_DONE=0` and `WIDENING_SWEEP_HISTORY=[]` — counter + per-sweep root-cause record (used by step 4d and the handoff in step 9a).
    - Initialize `ROUND_NUM=0`.
 
 2. **Locate the Codex companion script.**
@@ -101,11 +115,29 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 
    **4b. File-family widening guard.** Extract the set of cited file paths from the finding bullets (the `<file>` portion of `- [Pn] <headline> — <file>:<line>`). Call this `ROUND_FILES`.
    - If `DIRTY_STREAK == 0` (this is the first dirty round of a new streak): set `STREAK_FILE_SET = ROUND_FILES`, `DIRTY_STREAK = 1`. Proceed to step 5.
-   - If `DIRTY_STREAK > 0` and `ROUND_FILES ⊆ STREAK_FILE_SET` (every cited file in this round was also cited in some prior dirty round of this streak): increment `DIRTY_STREAK`, keep `STREAK_FILE_SET` as-is. If `DIRTY_STREAK >= CR_LOOP_WIDEN_AFTER` (default 5): **stop**. Write a handoff (step 9) with `Stop reason: widening-hint`, including (a) the file family list (`STREAK_FILE_SET`), (b) the last `CR_LOOP_WIDEN_AFTER` rounds' findings verbatim, (c) suggested wider sweep targets (sibling files in the same module / call graph that weren't explicitly cited but might share the bug pattern). Surface the handoff path to the user and exit. The user runs the widening sweep manually or expands the fix scope and re-invokes `/cr-loop-pr`.
+   - If `DIRTY_STREAK > 0` and `ROUND_FILES ⊆ STREAK_FILE_SET` (every cited file in this round was also cited in some prior dirty round of this streak): increment `DIRTY_STREAK`, keep `STREAK_FILE_SET` as-is. If `DIRTY_STREAK >= CR_LOOP_WIDEN_AFTER` (default 5): **branch by widening mode**:
+     - **Auto-widen path** (`CR_LOOP_AUTO_WIDEN=1` AND `WIDENING_SWEEPS_DONE < CR_LOOP_MAX_WIDENING_SWEEPS`, both defaults; and `CR_LOOP_ROUND_CAP` either unset or `ROUND_NUM < CR_LOOP_ROUND_CAP`): jump to **step 4d (widening sweep)** instead of stopping. The agent reads the full family, hypothesizes one root cause, sweeps for bystander positions, fixes them in one commit + adds a pattern-level test, resets streak state, and resumes the loop. The next round's reviewer reviews the sweep commit, so quality stays gated.
+     - **Manual path** (`CR_LOOP_AUTO_WIDEN=0` OR `WIDENING_SWEEPS_DONE >= CR_LOOP_MAX_WIDENING_SWEEPS`): **stop**. Write a handoff (step 9) with `Stop reason: widening-hint` (auto-widen disabled) or `widening-sweeps-exhausted` (cap reached). Handoff includes (a) the file family list (`STREAK_FILE_SET`), (b) the last `CR_LOOP_WIDEN_AFTER` rounds' findings verbatim, (c) `WIDENING_SWEEP_HISTORY` (every prior auto-sweep's root-cause headline + commit SHA + post-sweep verdict), (d) suggested wider sweep targets the agent didn't try. Surface the handoff path to the user and exit. The user runs the widening sweep manually or expands the fix scope and re-invokes `/cr-loop-pr`.
    - If `DIRTY_STREAK > 0` and `ROUND_FILES ⊄ STREAK_FILE_SET` (this round cited a *new* file family — the bug surface moved): reset `STREAK_FILE_SET = ROUND_FILES`, `DIRTY_STREAK = 1`. Proceed to step 5. (A genuinely shifting surface is healthy progress; the widening guard only fires when we're spinning on the same file family.)
    - Always reset `CLEAN_STREAK = 0` and `LAST_REVIEWED_HEAD` on any dirty round (the upcoming step 6 commit produces a new HEAD that must be re-reviewed from scratch).
 
-   **4c. Optional round cap.** After classification, if `CR_LOOP_ROUND_CAP` is set to a positive integer AND `ROUND_NUM >= CR_LOOP_ROUND_CAP`: write a handoff (step 9) with `Stop reason: round-cap-reached`, surface, exit. The cap is **opt-in** — when `CR_LOOP_ROUND_CAP` is unset or empty (the default), this step is a no-op and the loop runs uncapped (it still stops on convergence, widening guard, head-drift, or manual cancel). Set it (e.g. `CR_LOOP_ROUND_CAP=20 /cr-loop-pr ...`) to bound worst-case token spend on a single invocation; the user can resume by re-invoking with a higher cap or take the surfaced state and decide manually.
+   **4c. Optional round cap.** After classification, if `CR_LOOP_ROUND_CAP` is set to a positive integer AND `ROUND_NUM >= CR_LOOP_ROUND_CAP`: write a handoff (step 9) with `Stop reason: round-cap-reached`, surface, exit. The cap is **opt-in** — when `CR_LOOP_ROUND_CAP` is unset or empty (the default), this step is a no-op and the loop runs uncapped (it still stops on convergence, widening guard, head-drift, widening-sweeps-exhausted, or manual cancel). Set it (e.g. `CR_LOOP_ROUND_CAP=20 /cr-loop-pr ...`) to bound worst-case token spend on a single invocation; the user can resume by re-invoking with a higher cap or take the surfaced state and decide manually.
+
+   **4d. Auto widening sweep** (entered from 4b when auto-widen is enabled and the cap isn't yet reached). Goal: turn this round into a *systematic root-cause fix* instead of another symptomatic patch. **This step replaces step 5's per-finding loop for one round.**
+
+   Full execution manual: **`.claude/rules/cr-loop-widening-sweep.md`** — read it before running a sweep. Phase summary:
+
+   - **A — Read the full family** end-to-end (not just cited line ranges).
+   - **B — Hypothesize one root cause** that explains every prior round's findings; if no clean hypothesis emerges, fall through to manual handoff with `Stop reason: widening-hint-no-clear-root-cause`. Never invent a hypothesis to justify a sweep.
+   - **C — Sweep the codebase** for bystander positions matching the same pattern (grep / LSP / Glob); build `BYSTANDER_FILES = STREAK_FILE_SET ∪ matches`.
+   - **D — Apply one systematic fix** at the contract / abstraction layer, not per-call-site patches.
+   - **E — Add a pattern-level regression test** (parameterized or invariant-style); flag any skip in the commit.
+   - **F — Run the affected test target(s)**; if red, debug before committing.
+   - **G — Commit** as `fix(<scope>): widening sweep <K> — <root-cause headline>` with the structured body in the rule file.
+   - **H — Reset streak state**: `DIRTY_STREAK = 0`, `STREAK_FILE_SET = ∅`, `WIDENING_SWEEPS_DONE += 1`, `CLEAN_STREAK = 0`, clear `LAST_REVIEWED_HEAD`, append to `WIDENING_SWEEP_HISTORY`.
+   - **I — Continue** to the next review round (step 3).
+
+   The reviewer round that follows gates the sweep's quality — a wrong sweep gets flagged and the regular loop catches it. The `MAX_WIDENING_SWEEPS` cap (default 2) bounds unattended retry: after that many failed sweeps, the loop stops with `widening-sweeps-exhausted` and hands off.
 
 5. **Fix each finding in order (highest severity first: P0 > P1 > P2 > P3):**
    - Read the cited file + line range first; do not act on the headline alone.
@@ -195,13 +227,13 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 
    - **Worktree is NOT removed.** The current worktree is left in place after PR creation so the user can keep iterating from the same feature branch — adding follow-up commits (review feedback from human reviewers, polish), re-running `/cr-loop-pr` against the next batch of work (push will update the same PR), or pulling reviewer changes. When the user is genuinely done with the feature line (PR merged, branch deleted on remote), they remove the worktree manually: `cd <main-checkout> && git worktree remove <path-to-this-worktree> && git branch -d "$FEATURE_BRANCH"` (the `-d` lowercase form refuses unless the branch is merged into local main, which is a useful safety check — for a remote-merged PR, follow up with `git fetch ${CR_PR_REMOTE:-origin} --prune` first to update the local merged-into-main view, or use `-D` if you know the PR was squash-merged and the local commit SHA won't appear on local main).
 
-9. **Stop / handoff.** Reached either after a successful push + PR-open / PR-update (step 8) or whenever the loop bails out without converging (round-cap, widening-hint, head-drift, push-deferred, pr-deferred).
+9. **Stop / handoff.** Reached either after a successful push + PR-open / PR-update (step 8) or whenever the loop bails out without converging (round-cap, widening-hint, widening-sweeps-exhausted, widening-hint-no-clear-root-cause, head-drift, push-deferred, pr-deferred).
 
    **9a. Handoff file (only when stopping without a successful push + PR).** Write `.cr-loop-handoff-round-<N>.md` at the repo root with:
-   - Stop reason (one of: `round-cap-reached` / `widening-hint` / `head-drift-during-review` / `push-deferred-<which-precondition>` / `push-rejected` / `pr-create-failed`).
+   - Stop reason (one of: `round-cap-reached` / `widening-hint` / `widening-sweeps-exhausted` / `widening-hint-no-clear-root-cause` / `head-drift-during-review` / `push-deferred-<which-precondition>` / `push-rejected` / `pr-create-failed`).
    - Current `HEAD` SHA + commit count ahead of base.
    - `START` SHA (loop entry point).
-   - For widening-hint: `STREAK_FILE_SET` + the last `CR_LOOP_WIDEN_AFTER` rounds' raw findings + suggested wider sweep targets.
+   - For widening-hint / widening-sweeps-exhausted / widening-hint-no-clear-root-cause: `STREAK_FILE_SET` + the last `CR_LOOP_WIDEN_AFTER` rounds' raw findings + `WIDENING_SWEEP_HISTORY` (every prior auto-sweep's root-cause headline + commit SHA + post-sweep verdict, so the user can see what was already tried before the loop bailed) + suggested wider sweep targets the agent didn't try.
    - For round-cap: the per-round finding histogram (P0/P1/P2/P3 counts), commit list, advice on whether to raise the cap or restructure.
    - For head-drift: `git log --oneline "$REVIEWED_HEAD"..HEAD` + `git status -sb`.
    - For push-deferred: which precondition failed + its diagnostic + the exact manual command the user should run (e.g., `git pull --rebase ${CR_PR_REMOTE:-origin} $FEATURE_BRANCH` to resolve non-fast-forward).
@@ -230,8 +262,8 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 - **Never skip hooks** (`--no-verify`). Fix the hook failure instead.
 - **Never reformat files the reviewer didn't flag.** Scope each commit to the findings it resolves.
 - **Don't fix pre-existing issues** the reviewer surfaces in files outside this branch's diff — acknowledge them in the summary and ask before expanding scope.
-- **If the same finding recurs after a fix**, the fix was too narrow. Re-read the reviewer's explanation and widen — do NOT burn another round on the same symptom. If the same finding recurs **a third time** after two distinct widening attempts, stop and surface to the user (this is a stricter, finer-grained version of the file-family widening guard in 4b — both can fire; whichever fires first wins).
-- **Round budget is uncapped by default** (`CR_LOOP_ROUND_CAP` is opt-in, unset by default). The loop stops on convergence, the file-family widening guard, head-drift, or manual cancel — not on a default round count. If you're past ~15 rounds and still dirty, the widening guard (`CR_LOOP_WIDEN_AFTER`, default 5) should already have fired with a handoff; if it hasn't (genuinely shifting bug surface), token spend grows linearly with rounds, so consider squash + reorganize or splitting the work into multiple PRs. Set `CR_LOOP_ROUND_CAP=N` when you want an explicit ceiling for the run.
+- **If the same finding recurs after a fix**, the fix was too narrow. Re-read the reviewer's explanation and widen — do NOT burn another round on the same symptom. With auto-widen ON (default), step 4b's widening guard will auto-escalate to a systematic root-cause sweep (step 4d) before the third recurrence; the user is only paged when `CR_LOOP_MAX_WIDENING_SWEEPS` sweeps have already failed to converge.
+- **Round budget is uncapped by default** (`CR_LOOP_ROUND_CAP` is opt-in, unset by default). The loop stops on convergence, the file-family widening guard, head-drift, widening-sweeps-exhausted, or manual cancel — not on a default round count. If you're past ~15 rounds and still dirty, the widening guard (`CR_LOOP_WIDEN_AFTER`, default 5) should already have fired (either auto-sweeping or handing off); if it hasn't (genuinely shifting bug surface), token spend grows linearly with rounds, so consider squash + reorganize or splitting the work into multiple PRs. Set `CR_LOOP_ROUND_CAP=N` when you want an explicit ceiling for the run.
 - **Keep the user informed between rounds** with one-line status. Always include both streaks: "Round N: M findings (Pn×a, Pn×b), DIRTY_STREAK=k/<CR_LOOP_WIDEN_AFTER>, applying fixes." On a clean round, include the clean streak: "Round N: clean (CLEAN_STREAK=1/2, running confirmation round)" or "Round N: clean (CLEAN_STREAK=2/2, pushing + opening PR against ${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main})".
 - **Don't `ScheduleWakeup` while waiting for a round.** Use `Monitor` against the codex companion PID (or block on the foreground bash). Wakeup-stacking creates redundant `/cr-loop-pr` re-entries that confuse state and waste tokens.
 - **`gh` is required.** Don't fall back to opening the PR via `git push` + browser URL — the title/body/draft state would be inconsistent with what this command's contract says it produces. If `gh` is missing, abort at preflight.
@@ -247,7 +279,7 @@ This command is a fork of `/cr-loop-merge` with two behavioral changes:
 1. **Default base is `origin/main` (matching `/cr-loop`), not local `main`.** The PR's diff is what reviewers will see (`origin/main..HEAD`); reviewing against the same base keeps Codex findings aligned with reviewer expectations.
 2. **After convergence, push the feature branch and open a PR against `origin/${CR_PR_BASE:-main}` instead of merging into local `${CR_MERGE_TARGET:-main}`.** No local branch checkout, no merge commit, no remote integration-branch push. If a PR already exists for this head branch, the push appends commits to it and the existing PR's URL is reported (no duplicate PR is created). The current worktree is preserved after PR creation so the user can keep iterating — manual `git worktree remove` is the user's call after the PR is merged on the remote.
 
-Everything else — the review loop semantics, P3 skip filter, file-family widening guard, round cap, head-drift detection, handoff file format — is identical.
+Everything else — the review loop semantics, P3 skip filter, file-family widening guard, **auto-widening sweep** with `CR_LOOP_MAX_WIDENING_SWEEPS` budget, round cap, head-drift detection, handoff file format — is identical.
 
 | When to use | Command |
 |---|---|

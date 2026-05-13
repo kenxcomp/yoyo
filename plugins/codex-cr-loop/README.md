@@ -2,7 +2,7 @@
 
 Three slash commands that wrap `/codex:review` (from the `openai-codex` plugin) into a **convergence loop**: iterate `/codex:review --wait`, fix every P0/P1/P2/P3 finding it returns, commit, re-run, and stop only when **two consecutive rounds** return no actionable findings.
 
-The three commands share the entire review-loop body — P3 skip filter, file-family widening guard, optional opt-in round cap, head-drift detection, handoff file format — and differ only in what they do *after* convergence:
+The three commands share the entire review-loop body — P3 skip filter, file-family widening guard, **auto-widening sweep** (default ON, bounded by `CR_LOOP_MAX_WIDENING_SWEEPS`), optional opt-in round cap, head-drift detection, handoff file format — and differ only in what they do *after* convergence:
 
 | Command | After convergence |
 |---|---|
@@ -37,11 +37,12 @@ All three commands honor:
 
 - `CR_LOOP_ROUND_CAP=` — **opt-in** ceiling on rounds (unset by default → no cap). Set to a positive integer to bound the run.
 - `CR_LOOP_WIDEN_AFTER=5` — consecutive-same-file-family rounds before the widening guard fires.
+- `CR_LOOP_AUTO_WIDEN=1` — when `1` (default), the widening guard auto-escalates to a systematic root-cause sweep (one commit, pattern-level regression test) and resumes the loop instead of stopping. Set to `0` to restore the original "stop and hand off" behavior.
+- `CR_LOOP_MAX_WIDENING_SWEEPS=2` — cap on automatic widening sweeps per invocation. After this many sweeps, the next widening trigger writes a `widening-sweeps-exhausted` handoff and stops.
 - `CR_LOOP_SKIP_P3=1` — treat rounds with only P3 findings as clean.
 
 `/cr-loop-merge` adds:
 
-- `CR_LOOP_AUTO_WIDEN=1`, `CR_LOOP_MAX_WIDENING_SWEEPS=2` — auto-escalate to a systematic root-cause sweep instead of stopping at the widening guard.
 - `CR_MERGE_TARGET=main`, `CR_MERGE_FF=auto` — local merge configuration.
 
 `/cr-loop-pr` adds:
