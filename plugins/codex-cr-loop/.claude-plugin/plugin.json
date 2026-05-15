@@ -1,7 +1,7 @@
 {
   "name": "codex-cr-loop",
-  "version": "1.2.0",
-  "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR).",
+  "version": "1.3.0",
+  "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR). Always-on interaction-logic guard blocks user-visible UX changes (gestures, dialog/menu types, shortcuts, navigation) until the user explicitly confirms.",
   "author": {
     "name": "kenxcomp"
   }

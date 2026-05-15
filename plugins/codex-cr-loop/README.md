@@ -56,9 +56,24 @@ See each command file for the full procedure, guardrails, and handoff-file seman
 
 Each command's contract is unambiguous: `/cr-loop-merge` will *never* push to remote; `/cr-loop-pr` will *always* end with a PR URL or a deferred handoff explaining why one wasn't created; `/cr-loop` will *never* touch any branch other than the one you started on. A single command with `--push` / `--pr` / `--merge` flags was rejected because the failure modes (push deferred, PR target moved, target locked in another worktree, gh unauthenticated) compound nontrivially and a flag-driven variant of one command would obscure which post-convergence step is actually authoritative.
 
+## Interaction-logic guard (v1.3.0+)
+
+User-visible interaction contracts — *which gesture triggers which response*, *which UI element receives a tap or long-press*, *dialog vs dropdown vs inline editor vs sheet*, *keyboard shortcuts*, *accessibility actions*, *navigation flow*, *default actions on Return / primary-button / outside-tap* — are sacred. Codex reviewers (and the agent's own root-cause analysis) routinely suggest "naturally cleaner" fixes that quietly change those contracts. The codex-cr-loop refuses to let those changes land silently.
+
+When any fix — Codex finding or agent-inferred, single-finding or part of a widening sweep — would shift the visible action→response contract, the loop:
+
+1. **Halts before the commit.** No fix is applied, no widening sweep advances, no merge / push / PR runs.
+2. **Surfaces a structured prompt** with the current behavior, Codex's proposed change, and 2–3 alternative options that address the underlying finding while preserving or minimally changing the current UX (plus an explicit "skip / leave as-is" option).
+3. **Prefers the [`form-base`](../form-base/) MCP** (yoyo's HTML interaction base) for the prompt — emitted as one radio question via `create_form` — so the user can compare options visually. Falls back to plain text A/B/C if `form-base` isn't loaded.
+4. **Blocks on the user's reply.** "No response" is never treated as consent.
+5. **Applies only the user-approved variant**, and records the decision in the commit body as `Interaction decision: <summary>` / `Original Codex finding: <Pn> ...` trailers, so the trail back to the original finding is auditable.
+
+The guard is **always on** and has no env override — interaction contracts belong to the user, not the reviewer or the agent. Pure correctness fixes inside an event handler (the long-press still opens the same dialog, but a stale-state bug inside the handler is fixed) proceed normally; only changes that shift the visible contract trigger the guard. See each command file's **step 5a** for the full classification rules and **step 4d phase D** for how the guard composes with the automatic widening sweep.
+
 ## Safety guarantees
 
 - `--no-verify`, `--force`, `--force-with-lease` are forbidden in all three commands.
 - Pre-commit / pre-push hook failures defer to the user with the hook output surfaced; the loop never bypasses them.
 - The post-review HEAD-drift check refuses to classify any round whose HEAD moved during review (catches concurrent agents / auto-commit hooks).
+- The **interaction-logic guard** (see section above) blocks any commit that would change user-visible interaction behavior until the user has explicitly chosen an option. No severity level can override it.
 - All three commands write a `.cr-loop-handoff-round-<N>.md` file at the repo root on any non-converged exit, so a fresh session can resume exactly where the loop bailed. Handoffs are auto-cleaned on the next successful convergence.

@@ -37,6 +37,21 @@ round, so quality is still gated by the reviewer. The user is only paged when
 that's when the surface is genuinely beyond auto-fix scope and needs human judgment.
 Set `CR_LOOP_AUTO_WIDEN=0` to restore the original "stop and hand off" behavior.
 
+**Interaction-logic guard (always ON, cannot be disabled)**: any fix — Codex-flagged
+or agent-inferred, single-finding or widening sweep — that would change
+**user-visible interaction behavior** (which gesture triggers which response, which
+UI element is the hit target, dialog vs dropdown vs inline editor vs sheet, keyboard
+shortcuts, accessibility actions, navigation flow, default actions on Return /
+primary-button / outside-tap) pauses the loop and waits for explicit user
+confirmation before the fix lands. The loop presents the current behavior, Codex's
+proposed change, and 2–3 alternative options that preserve or minimally change the
+current UX, then blocks on the user's reply — "no response" is never treated as
+consent. Pure correctness fixes inside an event handler that preserve the visible
+action→response contract proceed normally. See **step 5a** for the full rule, **step
+4d phase D** for how the guard applies inside automatic widening sweeps, and the
+Guardrails section for the one-line summary. There is no env override — interaction
+contracts belong to the user, not the reviewer or the agent.
+
 ## Tunable knobs (env overrides)
 
 Read these once during preflight; defaults shown:
@@ -130,7 +145,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
    - **A — Read the full family** end-to-end (not just cited line ranges).
    - **B — Hypothesize one root cause** that explains every prior round's findings; if no clean hypothesis emerges, fall through to manual handoff with `Stop reason: widening-hint-no-clear-root-cause`. Never invent a hypothesis to justify a sweep.
    - **C — Sweep the codebase** for bystander positions matching the same pattern (grep / LSP / Glob); build `BYSTANDER_FILES = STREAK_FILE_SET ∪ matches`.
-   - **D — Apply one systematic fix** at the contract / abstraction layer, not per-call-site patches.
+   - **D — Apply one systematic fix** at the contract / abstraction layer, not per-call-site patches. **If the systematic fix would change user-visible interaction logic (per step 5a's definitions — gestures, dialog/menu types, keyboard shortcuts, accessibility actions, navigation flow, default actions), pause and run the 5a guard before proceeding to phase E.** A widening sweep's blast radius is wider than a single-finding fix — a sweep that flips a gesture across many call sites is exactly the kind of change a user MUST consent to explicitly. The guard blocks on the user's reply; phases E–I do not start until the user has chosen an option.
    - **E — Add a pattern-level regression test** (parameterized or invariant-style); flag any skip in the commit.
    - **F — Run the affected test target(s)**; if red, debug before committing.
    - **G — Commit** as `fix(<scope>): widening sweep <K> — <root-cause headline>` with the structured body in the rule file.
@@ -139,7 +154,37 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 
    The reviewer round that follows gates the sweep's quality — a wrong sweep gets flagged and the regular loop catches it. The `MAX_WIDENING_SWEEPS` cap (default 2) bounds unattended retry: after that many failed sweeps, the loop stops with `widening-sweeps-exhausted` and hands off.
 
-5. **Fix each finding in order (highest severity first: P0 > P1 > P2 > P3):**
+5. **Fix each finding in order (highest severity first: P0 > P1 > P2 > P3).** Each finding goes through **5a (interaction-logic guard)** first, then **5b (apply the fix)**.
+
+   **5a. Interaction-logic guard — confirm before any user-visible change lands.** Some findings — even high-severity ones — implicate **user-visible interaction logic**: the contract between a user action (gesture, key, click, focus) and the system's visible response (which dialog/menu/sheet opens, which navigation occurs, which UI element is the hit target, what the default action is). Changing that contract retrains the user, so it MUST be a deliberate user decision — never a side effect of the agent applying the "natural" fix. Examples that trip this guard:
+
+   - **Gesture / event-handler changes**: which gesture (tap, long-press, double-tap, swipe, right-click, drag, hover) triggers which response, or *which UI element* receives the gesture (e.g., "long-press the whole row → edit dialog" becoming "long-press only the title text → dropdown menu").
+   - **Modal / dialog / menu type changes**: edit dialog → dropdown / context menu / inline editor / navigation push; adding or removing a confirmation step; replacing an alert with a banner.
+   - **Keyboard shortcut / accessibility action changes**: rebinding, removing, or repurposing a shortcut; changing VoiceOver / accessibility actions / focus order.
+   - **Navigation / flow changes**: push → sheet, sheet → full-screen cover, step inserted / removed in a multi-step flow.
+   - **Default-action changes**: what happens on Return, on primary-button click, on outside-tap, on cancel.
+
+   For each finding, classify first:
+   - **Pure correctness inside an event handler** (the long-press still opens the edit dialog, but a stale-state bug *inside* the handler is fixed): **not** an interaction change — proceed to 5b normally.
+   - **Visible contract would shift** (any of the bullets above): guard fires — do NOT apply the change yet, do NOT include this finding in the step 6 commit. Hand control to the user:
+
+     1. Compose a prompt with:
+        - **Current behavior** — one short sentence describing what the user does today.
+        - **Codex's proposed change** — verbatim or one-sentence paraphrase of the finding.
+        - **2–3 alternative options** that address the underlying finding while preserving / minimally changing the current UX. Each option labeled with its trade-off (e.g., "Option B: keep long-press on the whole row; narrow the hit target inside the handler so empty rows don't accept the gesture — addresses Codex's complaint without retraining the user.").
+        - An explicit "skip / leave as-is" option.
+     2. **Preferred surface**: when the `form-base` MCP is available (yoyo's `form-base` plugin, exposes `mcp__plugin_form-base_form-base__create_form` / `mcp__plugin_form-base_form-base__read_answers`), emit the prompt as one radio question via `create_form`. Fallback when form-base is not loaded: ask inline as plain text with the same A/B/C/skip labels.
+     3. **Block on the user's reply.** No further fixes, no commit, no next review round, no widening sweep, no push, no PR. "No response" is not consent — do not invent a default and proceed. On the form-base path, poll via `read_answers`; otherwise wait for the user's next message.
+     4. Apply only the option the user chose. If the user supplies a free-text variant in the "Other" slot, treat that as the canonical fix and implement it. Record the decision in step 6's commit body under a dedicated trailer:
+        ```
+        Interaction decision: <one-line summary of user's choice>
+        Original Codex finding: <Pn> <headline> — <file>:<line>
+        ```
+     5. If the user picks "skip / leave as-is": do NOT include the finding in step 6's commit. Record it in the commit body as `User-deferred interaction finding: <Pn> <headline> — <file>:<line>`. Codex will re-surface it on the next round; **within this `/cr-loop-pr` invocation, do not re-prompt** — the user already decided. If the user wants the finding ignored across future invocations, that's a `CLAUDE.md` / project-rule entry for them to add, not the loop's job.
+
+   The guard is mandatory and unconditional. It applies regardless of finding severity (a P0 that proposes an interaction change is still blocked until the user confirms), regardless of who proposed the change (Codex finding, your own root-cause analysis, the widening sweep at step 4d), and regardless of how "obvious" the change seems. Interaction contracts belong to the user.
+
+   **5b. Apply the fix** (only for findings that cleared 5a as pure correctness, plus the user-approved variant for findings that went through 5a):
    - Read the cited file + line range first; do not act on the headline alone.
    - Apply the minimal fix addressing the root cause (not a symptom patch).
    - Add a regression test that would have caught the bug. Skip only for doc-only / pure-cosmetic findings.
@@ -257,6 +302,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 
 ## Guardrails
 
+- **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. The push + `gh pr create` is also blocked while the guard is pending — interaction changes never reach the remote (or a human reviewer's queue) without explicit consent. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
 - **Only push the feature branch.** Never `git push origin main` (or whatever `${CR_PR_BASE:-main}` resolves to). Merging the PR is the user's call (or a codeowner's, on a multi-dev project) — this command's contract ends at "PR open + reviewer-approved commits on the head branch".
 - **Never `--force` / `--force-with-lease` push.** A non-fast-forward rejection means someone else pushed; rebase / merge is the user's call. Force-pushing silently overwrites their work.
 - **Never skip hooks** (`--no-verify`). Fix the hook failure instead.
