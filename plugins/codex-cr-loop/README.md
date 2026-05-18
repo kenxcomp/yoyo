@@ -70,6 +70,16 @@ When any fix — Codex finding or agent-inferred, single-finding or part of a wi
 
 The guard is **always on** and has no env override — interaction contracts belong to the user, not the reviewer or the agent. Pure correctness fixes inside an event handler (the long-press still opens the same dialog, but a stale-state bug inside the handler is fixed) proceed normally; only changes that shift the visible contract trigger the guard. See each command file's **step 5a** for the full classification rules and **step 4d phase D** for how the guard composes with the automatic widening sweep.
 
+## Business-impact summary (v1.4.0+)
+
+The final report from each of the three commands **always** ends with a Chinese **Business-impact summary** module — designed for product / business stakeholders who don't read the diff but need to know whether the round shipped any user-visible change.
+
+- **有业务可观测改动**(新增/调整功能、修复用户能察觉的 bug、调整默认值或配置语义、UI 交互变化、对外 API/事件契约、文案/状态机/异常返回): 输出 3–8 行中文。首行总览("本轮共改动 X 项业务能力"),后续按 commit 顺序逐条列出"动作 + 旧行为 → 新行为"。
+- **全部为代码层重构**(rename / 抽函数 / 注释 / 补测试 / 内部解耦 / 行为等价的性能优化 / 实现替换但接口语义不变): 仅输出一行固定字面值 `无业务逻辑影响`。这一字符串是稳定锚点 —— 下游工具(发版机器人、回归测试调度、PR 模板填充)可据此识别"本轮无需业务回归"。
+- **判断模糊时按"有业务改动"处理**: 漏报对产品方的代价 > 多写几行的代价。Codex 找到的 bug 修复要按"用户旧体验 → 新体验"的视角描述,不要复述代码层的 finding 文本。
+
+`/cr-loop-pr` 把这套总结嵌入 PR 描述,人工 reviewer 可直接读;`/cr-loop-merge` 在本地 merge 之后输出,便于用户 push 前给出发版说明;`/cr-loop` 也始终输出,便于交给下一步工作流(PR、changelog、回归脚本)。
+
 ## Safety guarantees
 
 - `--no-verify`, `--force`, `--force-with-lease` are forbidden in all three commands.

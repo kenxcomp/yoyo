@@ -234,6 +234,11 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
      - To merge into a local integration branch instead: `/cr-loop-merge`.
    - Handoff path (when applicable): `.cr-loop-handoff-round-<N>.md`.
    - Confirmation: _last two rounds were both clean_ (only when stop reason is `converged`).
+   - **Business-impact summary** (中文;本节始终输出,不可省略):
+     - **判定**:扫描 `$START..HEAD` 全部 commit,看是否引入了用户或下游消费者**可观测的行为变化** —— 新增/调整功能、修复用户能察觉的 bug、调整默认值或配置语义、UI 交互变化(已被 5a 拦截并由用户确认)、对外 API/事件契约、文案/状态机/异常返回。
+     - **有业务可观测改动 → 输出 3–8 行中文**。首行总览("本轮共改动 X 项业务能力");后续按 commit 顺序逐条列出可观测差异(用户动作 / 入口 + 旧行为 → 新行为 + 用户能直接感知到什么)。Codex 找到的 bug 修复要按"用户旧体验 → 新体验"的视角描述,不要只复述代码层的 finding 文本。**不要把代码层重构混入这一节**。
+     - **全部为代码层重构 → 仅输出一行** `无业务逻辑影响`(rename、抽函数、注释、补测试、内部解耦、行为等价的性能优化、实现替换但接口语义不变;重构信息已在 "Issues fixed per round" / "Commit range" 中体现)。这一行是固定字面值,不要替换成"无改动"/"none"/英文等其他写法 —— 用户和下游工具据此字符串识别"本轮无需回归"。
+     - **判断模糊时按"有业务改动"处理**(漏报对产品/业务方的代价高于多写几行)。
 
 ## Guardrails
 

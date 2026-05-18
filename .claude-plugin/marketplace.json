@@ -51,8 +51,8 @@
     },
     {
       "name": "codex-cr-loop",
-      "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR). Always-on interaction-logic guard blocks user-visible UX changes (gestures, dialog/menu types, shortcuts, navigation) until the user explicitly confirms.",
-      "version": "1.3.0",
+      "description": "Codex review loop commands: iterate /codex:review until two consecutive clean rounds, with three completion modes (review-only stop, local merge, push + open PR). Always-on interaction-logic guard blocks user-visible UX changes (gestures, dialog/menu types, shortcuts, navigation) until the user explicitly confirms. Final report always ends with a Chinese business-impact summary module: a 3–8 line summary when commits change user-observable behavior, or a single literal line `无业务逻辑影响` for pure refactors.",
+      "version": "1.4.0",
       "source": "./plugins/codex-cr-loop",
       "category": "productivity",
       "tags": ["codex", "review", "loop", "commands", "ci", "ux-guard"]
