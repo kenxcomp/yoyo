@@ -87,7 +87,7 @@ PLAN UNDER REVIEW
 
 ### 3b. Invoke Codex
 
-Run **foreground**, blocking until Codex returns:
+Run **foreground**, blocking until Codex returns. The redirection `< /dev/null` is **mandatory** — see the first note below:
 
 ```bash
 codex exec \
@@ -95,13 +95,15 @@ codex exec \
   --skip-git-repo-check \
   --cd "$(pwd)" \
   --output-last-message ./.plan-review/codex-rounds/round-${N}-output.md \
-  -- "$(cat ./.plan-review/codex-rounds/round-${N}-prompt.md)"
+  -- "$(cat ./.plan-review/codex-rounds/round-${N}-prompt.md)" \
+  < /dev/null
 ```
 
 Notes:
 
+- **`< /dev/null` is mandatory.** Per `codex exec --help`: if stdin is a pipe (non-TTY), Codex appends a `<stdin>` block to the prompt — and in agent contexts like Claude Code's Bash tool, stdin is always a pipe, so Codex blocks indefinitely waiting for input that will never come. Symptoms: the call appears to hang for many minutes, `round-<N>-output.md` never gets created, and the run's stdout contains `Reading additional input from stdin...`. Explicitly closing stdin with `< /dev/null` makes the prompt-arg the only input. **Do not omit this redirect** under any circumstance.
 - **`--sandbox read-only`** is non-negotiable. Codex is reviewing text, not modifying code. If Codex tries to write, that's a bug; do not relax the sandbox.
-- **No timeout wrapper.** Plan review duration legitimately scales with plan length and Codex's reasoning depth. Block on the foreground process. If you genuinely believe Codex is hung (multiple minutes of zero output to the output file), tell the user and let them decide whether to interrupt — do NOT auto-kill.
+- **No timeout wrapper.** Plan review duration legitimately scales with plan length and Codex's reasoning depth. Block on the foreground process. If you genuinely believe Codex is hung (multiple minutes of zero output to the output file AND the stdout does NOT contain `Reading additional input from stdin...` — that one is a missing `< /dev/null` bug, not a hang), tell the user and let them decide whether to interrupt — do NOT auto-kill.
 - If `codex exec` exits non-zero, write the error to `round-<N>-output.md`, print a brief summary, and **terminate the loop without writing the sentinel** so the user can fix the upstream problem (auth, quota, model availability) and re-run.
 
 ### 3c. Classify the output
