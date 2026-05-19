@@ -1,5 +1,5 @@
 {
-  "description": "Plan review workflow hooks: SessionStart injection, EnterPlanMode cleaner",
+  "description": "Plan review workflow hooks: SessionStart injection, EnterPlanMode cleaner, ExitPlanMode codex-review gate",
   "hooks": {
     "SessionStart": [
       {
@@ -21,6 +21,16 @@
             "type": "command",
             "command": "if [ -f ./.plan-review/review-status.md ]; then > ./.plan-review/review-status.md; fi",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/codex-plan-review-trigger.sh",
+            "timeout": 10
           }
         ]
       }
