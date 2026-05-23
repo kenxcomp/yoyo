@@ -1,6 +1,6 @@
 ---
 description: Loop /codex:review in --wait mode, fix returned issues, re-run until two consecutive clean rounds, then merge into local main (no push, worktree preserved)
-argument-hint: '[<base-ref> (default: main)]'
+argument-hint: '[<base-ref> (default: <auto-detected local default branch>)]'
 ---
 
 # Codex Review Loop (merge into local main)
@@ -18,8 +18,9 @@ The current worktree is preserved so the user can keep iterating from it (run
 remote — this command leaves remote untouched, the user pushes manually if/when
 they want to.
 
-Base ref: `$ARGUMENTS` — default `main` (the **local** integration branch, NOT
-`origin/main`). Reviewing against the local target keeps the diff scoped to
+Base ref: `$ARGUMENTS` — default the **local** integration branch, auto-detected
+into `CR_MERGE_TARGET` so `main` / `master` / any default works (see step 1),
+NOT `origin/<anything>`. Reviewing against the local target keeps the diff scoped to
 exactly what's about to be merged; using `origin/main` would let any commits the
 user pulled into local main but hasn't pushed yet leak into the review range
 and produce noisy findings about code that isn't part of this branch's work.
@@ -59,7 +60,8 @@ Read these once during preflight; defaults shown:
 - `CR_LOOP_AUTO_WIDEN=1` — when `1` (default), triggering the widening guard does NOT stop the loop. Instead the agent enters a single **widening sweep round** (step 4d) that reads the full file family, articulates one root-cause hypothesis, sweeps the codebase for matching positions, fixes them in one commit, and adds a pattern-level regression test, then resumes the normal loop. Set to `0` to restore the original "stop and hand off to user" behavior — useful when the user wants to inspect every escalation manually.
 - `CR_LOOP_MAX_WIDENING_SWEEPS=2` — cap on automatic widening sweeps per `/cr-loop-merge` invocation. After this many sweeps, the next widening trigger writes a `widening-sweeps-exhausted` handoff and stops. Prevents the agent from indefinitely rewriting larger and larger swaths of code without human judgment when sweeps aren't converging.
 - `CR_LOOP_SKIP_P3=1` — when `1` (default), rounds whose findings are exclusively P3 are treated as clean (P3 ≈ defensive / style / nit; doesn't block convergence). Set to `0` for strict mode where P3s also block convergence and must be fixed.
-- `CR_MERGE_TARGET=main` — local branch to merge into. Override if your project's integration branch is named differently (e.g., `develop`, `trunk`).
+- `CR_LOOP_REQUIRE_REBASED=1` — when `1` (default), preflight **hard-stops** if the feature branch isn't built on top of the local `BASE` (`${CR_MERGE_TARGET:-main}`; `BASE` is not an ancestor of `HEAD`). The loop won't review against a stale base: it confirms with the user (rebase onto local `BASE` first / abort) and stops without entering a round — no remote interaction. Set to `0` to skip the gate.
+- `CR_MERGE_TARGET=` — local branch to merge into. **Unset by default → auto-detected** to the repo's default local branch (`main` / `master` / any; see step 1 — local ref read, no network). Set it if your project's integration branch is named differently (e.g., `develop`, `trunk`).
 - `CR_MERGE_FF=auto` — merge style. `auto` (default) lets git choose: fast-forward when possible, otherwise a true merge commit. `ff-only` defers to the user when fast-forward isn't possible. `no-ff` always creates a merge commit even when fast-forward would work (preserves branch topology).
 
 No per-round timeout — Codex review duration scales with diff size and reviewer model output, and a large refactor's review can legitimately take 15+ minutes. The loop blocks on the foreground reviewer until it returns or the user manually cancels (`/codex:cancel`).
@@ -69,13 +71,31 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Procedure
 
 1. **Preflight.**
-   - Resolve `BASE` from `$ARGUMENTS`. Default to the **local** merge target: `BASE="${ARGUMENTS:-${CR_MERGE_TARGET:-main}}"`. **Do not default to `origin/main`** — see the "Base ref" note above for why.
+   - **Resolve `CR_MERGE_TARGET` + `BASE` (auto-detect the local default branch; local-only, no network).** When `CR_MERGE_TARGET` is unset, default it to the repo's detected default *local* branch so `main` / `master` / any default works, instead of a hardcoded `main`:
+     ```bash
+     if [ -z "$CR_MERGE_TARGET" ]; then
+       CR_MERGE_TARGET=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+       # accept the advertised name only if it exists as a LOCAL branch; otherwise probe local heads
+       if [ -z "$CR_MERGE_TARGET" ] || ! git rev-parse --verify --quiet "refs/heads/$CR_MERGE_TARGET" >/dev/null; then
+         if   git rev-parse --verify --quiet refs/heads/main   >/dev/null; then CR_MERGE_TARGET=main
+         elif git rev-parse --verify --quiet refs/heads/master >/dev/null; then CR_MERGE_TARGET=master
+         else CR_MERGE_TARGET=main
+         fi
+       fi
+     fi
+     BASE="${ARGUMENTS:-$CR_MERGE_TARGET}"
+     ```
+     Reading `refs/remotes/origin/HEAD` is a **local ref read (no fetch)** — this command's "no remote interaction" contract holds — and is used only to *name* the branch; the target is then confirmed to exist as a local head (the "Verify the merge target exists locally" check below is the hard gate). **From here on `CR_MERGE_TARGET` holds this resolved value**, so every later `${CR_MERGE_TARGET:-main}` evaluates to it. **Still never default `BASE` to `origin/<anything>`** (a remote ref) — the merge target is always local. Set `CR_MERGE_TARGET` (or pass `$ARGUMENTS`) explicitly to override (e.g. `develop`).
    - `git status --short` — working tree must be clean. If dirty, commit or stash before starting; otherwise the diff will include unrelated noise and reviewer findings won't map to commits cleanly.
    - Record the starting commit: `START=$(git rev-parse HEAD)`.
    - Capture the feature branch: `FEATURE_BRANCH=$(git branch --show-current)`. Abort if empty (detached HEAD — there's no branch to merge from).
    - Verify the merge target exists locally: `git rev-parse --verify "refs/heads/${CR_MERGE_TARGET:-main}"`. If missing, abort and tell the user to create it (`git branch main origin/main` or similar).
    - Verify `FEATURE_BRANCH != ${CR_MERGE_TARGET:-main}`. Merging main into itself is meaningless — abort with a clear error.
    - **Verify `BASE` resolves to a local ref reachable from the merge target's history.** Run `git rev-parse --verify "$BASE"` (must succeed) AND `git merge-base --is-ancestor "$BASE" "${CR_MERGE_TARGET:-main}"` (base must be an ancestor of, or equal to, the merge target). If `BASE` resolves but isn't an ancestor of the target — typical case: user explicitly passed `origin/main` and the local `main` lags behind — abort with `BASE ($BASE) is not an ancestor of ${CR_MERGE_TARGET:-main}; pick a base reachable from the merge target, or update ${CR_MERGE_TARGET:-main} first`. This catches the same noise-leak that defaulting to local main avoids.
+   - **Base-currency gate** (hard block; honors `CR_LOOP_REQUIRE_REBASED`, default `1` — set `0` to skip, e.g. when deliberately reviewing against an older base). Confirm the branch is built on top of the **local** `BASE` (`${CR_MERGE_TARGET:-main}` by default): `git merge-base --is-ancestor "$BASE" HEAD`. **Exit 0** (`BASE` ⊆ `HEAD` history — branch current or ahead): proceed. **Exit 1** (`BASE` has commits `HEAD` lacks — branch is **stale** relative to local `BASE`): do NOT start a review round; the review (and the eventual merge) would be measured against a local base the branch never caught up to. Confirm with the user via the step-5a surface (`form-base` `create_form` radio when the MCP is loaded, inline **A/B** otherwise) offering exactly two options (intentionally no "review anyway"):
+     - **(A) Rebase first** — print the remedy `git rebase "$BASE"` (local, run in this worktree — no remote interaction) plus the re-invocation `/cr-loop-merge $ARGUMENTS`, then stop. The loop never rebases for you — a history rewrite that may conflict is the user's call.
+     - **(B) Abort** — stop immediately, no further action.
+     Block on the reply (`read_answers` on the form-base path; otherwise the user's next message). "No response" is not consent — never fall through into the loop. Either choice ends this invocation; the user re-runs `/cr-loop-merge` after rebasing.
    - Initialize `CLEAN_STREAK=0` — tracks consecutive clean rounds; loop ends when it reaches 2.
    - Initialize `DIRTY_STREAK=0` and `STREAK_FILE_SET=∅` — see step 4b for widening guard semantics.
    - Initialize `WIDENING_SWEEPS_DONE=0` and `WIDENING_SWEEP_HISTORY=[]` — counter + per-sweep root-cause record (used by step 4d and the handoff in step 9a).
@@ -259,6 +279,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Guardrails
 
 - **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. The merge into `${CR_MERGE_TARGET:-main}` is also blocked while the guard is pending — interaction changes never reach a shared branch without explicit consent. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
+- **Base-currency gate (preflight, hard by default).** The loop refuses to start when the feature branch isn't built on top of the local `BASE` (`BASE` is not an ancestor of `HEAD`) — it confirms with the user and stops (rebase onto local `BASE` first / abort), never auto-rebasing, never reviewing against a stale base, and never touching the remote. Disable with `CR_LOOP_REQUIRE_REBASED=0`. See **step 1**.
 - **Never `git push`.** This command is the local-merge variant; remote interaction is the user's call. If you find yourself reaching for `git push`, you're in the wrong command — use `/cr-loop` instead.
 - **Never skip hooks** (`--no-verify`). Fix the hook failure instead.
 - **Never `--force` the merge.** `--ff-only` is allowed (it just refuses non-FF merges); `--force`/`--force-with-lease`/`-X theirs`/`-X ours` are forbidden.
@@ -278,7 +299,7 @@ The loop is sequential by design — each round's diff depends on the previous r
 
 This command is a fork of `/cr-loop` with two behavioral changes:
 
-1. **Default base is local `main`, not `origin/main`.** Reviewing against the local merge target keeps the diff scoped to exactly what's about to be merged.
+1. **Default base is the local default branch, not a remote ref.** The local merge target is auto-detected (`main` / `master` / any; see step 1). Reviewing against it keeps the diff scoped to exactly what's about to be merged.
 2. **After convergence, merge into local `${CR_MERGE_TARGET:-main}` instead of pushing to the remote.** No `git fetch origin`, no `git push`, no remote interaction at all. The current worktree is preserved after merge so the user can keep iterating from the same feature branch — manual `git worktree remove` is the user's call.
 
 Everything else — the review loop semantics, P3 skip filter, file-family widening guard, **auto-widening sweep** with `CR_LOOP_MAX_WIDENING_SWEEPS` budget, round cap, head-drift detection, handoff file format — is identical across all three commands.

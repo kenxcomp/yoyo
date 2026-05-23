@@ -1,9 +1,9 @@
 ---
-description: Loop /codex:review in --wait mode, fix returned issues, re-run until two consecutive clean rounds, then push branch and open PR against origin/main (worktree preserved)
-argument-hint: '[<base-ref> (default: origin/main)]'
+description: Loop /codex:review in --wait mode, fix returned issues, re-run until two consecutive clean rounds, then push branch and open PR against origin's default branch (worktree preserved)
+argument-hint: '[<base-ref> (default: origin/<auto-detected default branch>)]'
 ---
 
-# Codex Review Loop (open PR against origin/main)
+# Codex Review Loop (open PR against origin's default branch)
 
 Run `/codex:review --base <ref> --wait` in the foreground, fix every P0/P1/P2/P3
 finding it returns, commit, and re-run. Stop when **two consecutive rounds**
@@ -20,8 +20,10 @@ The current worktree is preserved so the user can keep iterating from it (run
 `main`** — only the feature branch is pushed; merging the PR is the user's
 call (or codeowner's, on a multi-dev project).
 
-Base ref: `$ARGUMENTS` — default `origin/main`. The review base SHOULD match
-the PR target (the PR's diff *is* `<merge-base(origin/main, HEAD)>..HEAD`),
+Base ref: `$ARGUMENTS` — default `origin/<repo default branch>`, auto-detected
+into `CR_PR_BASE` so `main` / `master` / any default works (see step 1). The
+review base SHOULD match the PR target (the PR's diff *is*
+`<merge-base(origin/<base>, HEAD)>..HEAD`),
 otherwise reviewer findings won't map cleanly to what reviewers will see in
 the PR. Override only when you genuinely want to review against a different
 ref (e.g., a release branch).
@@ -61,7 +63,8 @@ Read these once during preflight; defaults shown:
 - `CR_LOOP_AUTO_WIDEN=1` — when `1` (default), triggering the widening guard does NOT stop the loop. Instead the agent enters a single **widening sweep round** (step 4d) that reads the full file family, articulates one root-cause hypothesis, sweeps the codebase for matching positions, fixes them in one commit, and adds a pattern-level regression test, then resumes the normal loop. Set to `0` to restore the original "stop and hand off to user" behavior — useful when the user wants to inspect every escalation manually.
 - `CR_LOOP_MAX_WIDENING_SWEEPS=2` — cap on automatic widening sweeps per `/cr-loop-pr` invocation. After this many sweeps, the next widening trigger writes a `widening-sweeps-exhausted` handoff and stops. Prevents the agent from indefinitely rewriting larger and larger swaths of code without human judgment when sweeps aren't converging.
 - `CR_LOOP_SKIP_P3=1` — when `1` (default), rounds whose findings are exclusively P3 are treated as clean (P3 ≈ defensive / style / nit; doesn't block convergence). Set to `0` for strict mode where P3s also block convergence and must be fixed.
-- `CR_PR_BASE=main` — the remote branch the PR targets (`origin/<base>`). Override for projects whose integration branch is named differently (e.g., `develop`, `trunk`).
+- `CR_LOOP_REQUIRE_REBASED=1` — when `1` (default), preflight **hard-stops** if the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD` — the branch forked before the current `BASE`). The loop won't review/push against a stale base: it confirms with the user (rebase first / abort) and stops without entering a round. Set to `0` to skip the gate — for deliberately reviewing against an older base, or a repo where this comparison doesn't apply.
+- `CR_PR_BASE=` — the remote branch the PR targets (`origin/<base>`). **Unset by default → auto-detected** to the repo's default branch (`main` / `master` / any; see step 1 — local ref read, no network). Set it to target a differently-named integration branch (e.g., `develop`, `trunk`).
 - `CR_PR_REMOTE=origin` — the git remote the feature branch is pushed to and the PR is opened against. Override for forks (`upstream`) or self-hosted setups.
 - `CR_PR_DRAFT=0` — when `1`, the PR is opened with `--draft`. Useful for staging a review without inviting merge yet.
 - `CR_PR_TITLE=` — when non-empty, used verbatim as the PR title (skips auto-derivation from the most recent commit subject). Truncated to 70 chars.
@@ -73,7 +76,21 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Procedure
 
 1. **Preflight.**
-   - Resolve `BASE` from `$ARGUMENTS`. Default to the **remote** review target: `BASE="${ARGUMENTS:-${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}}"`.
+   - **Resolve `CR_PR_BASE` + `BASE` (auto-detect the default branch; local-only, no network).** When `CR_PR_BASE` is unset, default it to the repo's detected default branch so `main` / `master` / any default works, instead of a hardcoded `main`:
+     ```bash
+     REMOTE="${CR_PR_REMOTE:-origin}"
+     if [ -z "$CR_PR_BASE" ]; then
+       CR_PR_BASE=$(git symbolic-ref --quiet --short "refs/remotes/$REMOTE/HEAD" 2>/dev/null | sed "s#^$REMOTE/##")
+       if [ -z "$CR_PR_BASE" ]; then
+         if   git rev-parse --verify --quiet "refs/remotes/$REMOTE/main"   >/dev/null; then CR_PR_BASE=main
+         elif git rev-parse --verify --quiet "refs/remotes/$REMOTE/master" >/dev/null; then CR_PR_BASE=master
+         else CR_PR_BASE=main
+         fi
+       fi
+     fi
+     BASE="${ARGUMENTS:-$REMOTE/$CR_PR_BASE}"
+     ```
+     `git symbolic-ref refs/remotes/$REMOTE/HEAD` reads the remote's advertised default from the local ref set at clone time — **no fetch**; if unset, fall back to probing `$REMOTE/main` then `$REMOTE/master`, then last-resort `main`. **From here on `CR_PR_BASE` holds this resolved value**, so every later `${CR_PR_BASE:-main}` in this command (the fetch, step 8(d)/(e), `gh pr list/create --base`) evaluates to it — the literal `main` fallback is never reached once `CR_PR_BASE` is set. Set `CR_PR_BASE` (or pass `$ARGUMENTS`) explicitly to target a non-default integration branch (e.g. `develop`).
    - Verify the `gh` CLI is installed (`command -v gh`) and authenticated (`gh auth status`). If missing, abort with `gh CLI not installed — install via brew install gh and re-authenticate via gh auth login`. If unauthenticated, abort with `gh CLI not authenticated — run gh auth login`.
    - Refresh the review base: `git fetch "${CR_PR_REMOTE:-origin}" "${CR_PR_BASE:-main}" --quiet`. Without this, a stale `origin/main` ref produces noisy "fixed in main, you missed it" findings. Abort if fetch fails (offline / unreachable remote / wrong remote name) — the review base would be stale and `gh pr create` would fail downstream anyway.
    - `git status --short` — working tree must be clean. If dirty, commit or stash before starting; otherwise the diff will include unrelated noise and reviewer findings won't map to commits cleanly.
@@ -82,6 +99,10 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
    - Verify `FEATURE_BRANCH != ${CR_PR_BASE:-main}`. Opening a PR from main into main is meaningless — abort with a clear error.
    - **Verify `BASE` resolves and is reachable.** Run `git rev-parse --verify "$BASE"` (must succeed). If it fails, abort with `BASE ($BASE) does not resolve — check the ref name and that ${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main} was fetched`.
    - **Verify the PR target exists on the remote.** `git rev-parse --verify "refs/remotes/${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}"`. If missing, abort and tell the user to push the integration branch to the remote first or override `CR_PR_BASE` / `CR_PR_REMOTE`.
+   - **Base-currency gate** (hard block; honors `CR_LOOP_REQUIRE_REBASED`, default `1` — set `0` to skip, e.g. when deliberately reviewing against an older base). Confirm the branch is built on top of the freshly-fetched `BASE`: `git merge-base --is-ancestor "$BASE" HEAD`. **Exit 0** (`BASE` ⊆ `HEAD` history — branch current or ahead): proceed. **Exit 1** (`BASE` has commits `HEAD` lacks — branch is **stale** relative to `BASE`): do NOT start a review round; a stale base means the review diff — and the PR diff reviewers will eventually see (`<merge-base(BASE, HEAD)>..HEAD`) — is measured against a base the branch never caught up to, inviting conflicts and a noisy diff. Confirm with the user via the step-5a surface (`form-base` `create_form` radio when the MCP is loaded, inline **A/B** otherwise) offering exactly two options (intentionally no "review anyway"):
+     - **(A) Rebase first** — print the remedy `git rebase "$BASE"` (run in this worktree) plus the re-invocation `/cr-loop-pr $ARGUMENTS`, then stop. The loop never rebases for you — a history rewrite that may conflict is the user's call.
+     - **(B) Abort** — stop immediately, no further action.
+     Block on the reply (`read_answers` on the form-base path; otherwise the user's next message). "No response" is not consent — never fall through into the loop. Either choice ends this invocation; the user re-runs `/cr-loop-pr` after rebasing. (This gate catches a branch that *starts* stale; step 8(e) separately catches `${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}` moving *during* the loop.)
    - Initialize `CLEAN_STREAK=0` — tracks consecutive clean rounds; loop ends when it reaches 2.
    - Initialize `DIRTY_STREAK=0` and `STREAK_FILE_SET=∅` — see step 4b for widening guard semantics.
    - Initialize `WIDENING_SWEEPS_DONE=0` and `WIDENING_SWEEP_HISTORY=[]` — counter + per-sweep root-cause record (used by step 4d and the handoff in step 9a).
@@ -308,6 +329,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Guardrails
 
 - **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. The push + `gh pr create` is also blocked while the guard is pending — interaction changes never reach the remote (or a human reviewer's queue) without explicit consent. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
+- **Base-currency gate (preflight, hard by default).** The loop refuses to start when the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD`) — it confirms with the user and stops (rebase first / abort), never auto-rebasing, never reviewing/pushing against a stale base. This catches a branch that *starts* stale; step 8(e) separately catches `${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}` moving *during* the loop. Disable with `CR_LOOP_REQUIRE_REBASED=0`. See **step 1**.
 - **Only push the feature branch.** Never `git push origin main` (or whatever `${CR_PR_BASE:-main}` resolves to). Merging the PR is the user's call (or a codeowner's, on a multi-dev project) — this command's contract ends at "PR open + reviewer-approved commits on the head branch".
 - **Never `--force` / `--force-with-lease` push.** A non-fast-forward rejection means someone else pushed; rebase / merge is the user's call. Force-pushing silently overwrites their work.
 - **Never skip hooks** (`--no-verify`). Fix the hook failure instead.
@@ -327,7 +349,7 @@ The loop is sequential by design — each round's diff depends on the previous r
 
 This command is a fork of `/cr-loop-merge` with two behavioral changes:
 
-1. **Default base is `origin/main` (matching `/cr-loop`), not local `main`.** The PR's diff is what reviewers will see (`origin/main..HEAD`); reviewing against the same base keeps Codex findings aligned with reviewer expectations.
+1. **Default base is `origin/<default branch>` (matching `/cr-loop`), not local `main`.** The base is auto-detected (`main` / `master` / any; see step 1). The PR's diff is what reviewers will see (`origin/<base>..HEAD`); reviewing against the same base keeps Codex findings aligned with reviewer expectations.
 2. **After convergence, push the feature branch and open a PR against `origin/${CR_PR_BASE:-main}` instead of merging into local `${CR_MERGE_TARGET:-main}`.** No local branch checkout, no merge commit, no remote integration-branch push. If a PR already exists for this head branch, the push appends commits to it and the existing PR's URL is reported (no duplicate PR is created). The current worktree is preserved after PR creation so the user can keep iterating — manual `git worktree remove` is the user's call after the PR is merged on the remote.
 
 Everything else — the review loop semantics, P3 skip filter, file-family widening guard, **auto-widening sweep** with `CR_LOOP_MAX_WIDENING_SWEEPS` budget, round cap, head-drift detection, handoff file format — is identical.

@@ -1,6 +1,6 @@
 ---
 description: Loop /codex:review in --wait mode, fix returned issues, re-run until two consecutive clean rounds, then stop (no push, no PR, no merge — local convergence only)
-argument-hint: '[<base-ref> (default: origin/main)]'
+argument-hint: '[<base-ref> (default: origin/<auto-detected default branch>)]'
 ---
 
 # Codex Review Loop (review only — no remote interaction)
@@ -20,9 +20,10 @@ command when you want Codex to gate the work but the integration step is
 manual or handled by a different workflow (sibling commands `/cr-loop-merge`
 and `/cr-loop-pr` cover those automated paths).
 
-Base ref: `$ARGUMENTS` — default `origin/main`. Reviewing against the remote
-target keeps Codex findings aligned with whatever a human reviewer or the
-sibling `/cr-loop-pr` would see. Override only when you genuinely want a
+Base ref: `$ARGUMENTS` — default `origin/<repo default branch>`, auto-detected
+so `main`, `master`, or any default name works (see step 1). Reviewing against
+the remote target keeps Codex findings aligned with whatever a human reviewer
+or the sibling `/cr-loop-pr` would see. Override only when you genuinely want a
 different review base (e.g., a release branch, an integration branch named
 `develop`).
 
@@ -61,6 +62,7 @@ Read these once during preflight; defaults shown:
 - `CR_LOOP_AUTO_WIDEN=1` — when `1` (default), triggering the widening guard does NOT stop the loop. Instead the agent enters a single **widening sweep round** (step 4d) that reads the full file family, articulates one root-cause hypothesis, sweeps the codebase for matching positions, fixes them in one commit, and adds a pattern-level regression test, then resumes the normal loop. Set to `0` to restore the original "stop and hand off to user" behavior — useful when the user wants to inspect every escalation manually.
 - `CR_LOOP_MAX_WIDENING_SWEEPS=2` — cap on automatic widening sweeps per `/cr-loop` invocation. After this many sweeps, the next widening trigger writes a `widening-sweeps-exhausted` handoff and stops. Prevents the agent from indefinitely rewriting larger and larger swaths of code without human judgment when sweeps aren't converging.
 - `CR_LOOP_SKIP_P3=1` — when `1` (default), rounds whose findings are exclusively P3 are treated as clean (P3 ≈ defensive / style / nit; doesn't block convergence). Set to `0` for strict mode where P3s also block convergence and must be fixed.
+- `CR_LOOP_REQUIRE_REBASED=1` — when `1` (default), preflight **hard-stops** if the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD` — the branch forked before the current `BASE`). The loop won't review against a stale base: it confirms with the user (rebase first / abort) and stops without entering a round. Set to `0` to skip the gate — for deliberately reviewing against an older base, or a repo where this comparison doesn't apply.
 
 No per-round timeout — Codex review duration scales with diff size and reviewer model output, and a large refactor's review can legitimately take 15+ minutes. The loop blocks on the foreground reviewer until it returns or the user manually cancels (`/codex:cancel`).
 
@@ -69,12 +71,27 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Procedure
 
 1. **Preflight.**
-   - Resolve `BASE` from `$ARGUMENTS`. Default: `BASE="${ARGUMENTS:-origin/main}"`.
+   - **Resolve `BASE` (auto-detect the default branch; local-only, no network).** When `$ARGUMENTS` is empty, default to `origin/<detected default branch>` so the command works on `main`, `master`, or any default name:
+     ```bash
+     DEFAULT_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+     if [ -z "$DEFAULT_BRANCH" ]; then
+       if   git rev-parse --verify --quiet refs/remotes/origin/main   >/dev/null; then DEFAULT_BRANCH=main
+       elif git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null; then DEFAULT_BRANCH=master
+       else DEFAULT_BRANCH=main
+       fi
+     fi
+     BASE="${ARGUMENTS:-origin/$DEFAULT_BRANCH}"
+     ```
+     `git symbolic-ref refs/remotes/origin/HEAD` reads the remote's advertised default from the local ref set at clone time — **no fetch**. If it's unset, fall back to probing `origin/main` then `origin/master`, then a last-resort `main` (the fetch + verify steps below catch a genuinely wrong guess). An explicit `$ARGUMENTS` always wins — pass e.g. `develop` or `release/2026.05` to override.
    - Refresh the review base when it points at a remote ref: if `BASE` is `origin/<branch>` (or any `<remote>/<branch>` form), run `git fetch <remote> <branch> --quiet` so the review diff isn't measured against a stale ref. Skip the fetch when `BASE` resolves to a local ref (no remote interaction at all in that case). Abort if a needed fetch fails (offline / unreachable remote / wrong remote name).
    - `git status --short` — working tree must be clean. If dirty, commit or stash before starting; otherwise the diff will include unrelated noise and reviewer findings won't map to commits cleanly.
    - Record the starting commit: `START=$(git rev-parse HEAD)`.
    - Capture the feature branch: `FEATURE_BRANCH=$(git branch --show-current)`. Abort if empty (detached HEAD — there's nothing for the loop to anchor to; create or check out a branch first).
    - **Verify `BASE` resolves.** Run `git rev-parse --verify "$BASE"` (must succeed). If it fails, abort with `BASE ($BASE) does not resolve — check the ref name, and that the relevant remote was fetched if BASE points at one`.
+   - **Base-currency gate** (hard block; honors `CR_LOOP_REQUIRE_REBASED`, default `1` — set `0` to skip, e.g. when deliberately reviewing against an older base). Confirm the branch is built on top of the freshly-fetched `BASE`: `git merge-base --is-ancestor "$BASE" HEAD`. **Exit 0** (`BASE` ⊆ `HEAD` history — branch current or ahead): proceed. **Exit 1** (`BASE` has commits `HEAD` lacks — branch is **stale** relative to `BASE`): do NOT start a review round; a stale base means the review diff is measured against a base the branch never caught up to. Confirm with the user via the step-5a surface (`form-base` `create_form` radio when the MCP is loaded, inline **A/B** otherwise) offering exactly two options (intentionally no "review anyway"):
+     - **(A) Rebase first** — print the remedy `git rebase "$BASE"` (run in this worktree) plus the re-invocation `/cr-loop $ARGUMENTS`, then stop. The loop never rebases for you — a history rewrite that may conflict is the user's call.
+     - **(B) Abort** — stop immediately, no further action.
+     Block on the reply (`read_answers` on the form-base path; otherwise the user's next message). "No response" is not consent — never fall through into the loop. Either choice ends this invocation; the user re-runs `/cr-loop` after rebasing.
    - Initialize `CLEAN_STREAK=0` — tracks consecutive clean rounds; loop ends when it reaches 2.
    - Initialize `DIRTY_STREAK=0` and `STREAK_FILE_SET=∅` — see step 4b for widening guard semantics.
    - Initialize `WIDENING_SWEEPS_DONE=0` and `WIDENING_SWEEP_HISTORY=[]` — counter + per-sweep root-cause record (used by step 4d and the handoff in step 9a).
@@ -243,6 +260,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 ## Guardrails
 
 - **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
+- **Base-currency gate (preflight, hard by default).** The loop refuses to start when the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD`) — it confirms with the user and stops (rebase first / abort), never auto-rebasing, never reviewing against a stale base. Disable with `CR_LOOP_REQUIRE_REBASED=0`. See **step 1**.
 - **No remote interaction.** `git push`, `git push --force`, `git push --force-with-lease`, `gh pr create`, `gh pr edit` — none of these run in this command. If you find yourself reaching for any of them, you're in the wrong command — use `/cr-loop-pr` (push + PR) or `/cr-loop-merge` (local merge) instead.
 - **No checkout / merge.** This command never switches branches and never creates a merge commit. The feature branch the user started on is the branch the user ends on.
 - **Never skip hooks** (`--no-verify`). Fix the hook failure instead.
