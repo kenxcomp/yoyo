@@ -37,8 +37,13 @@ Store the resolved path as `$PLAN`. All edits in this command MUST operate on th
 ## Step 2 — Initialize the round directory
 
 ```bash
-mkdir -p ./.plan-review/codex-rounds
+${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh init
 ```
+
+(This is just `mkdir -p ./.plan-review/codex-rounds`, routed through the plugin's
+pre-approvable helper so it doesn't trigger a permission prompt while you're
+still in plan mode — once the user has run `/plan-guardian:setup`. A bare
+`mkdir -p ./.plan-review/codex-rounds` works too; it will simply prompt.)
 
 Each round writes:
 
@@ -145,13 +150,13 @@ After triaging, increment `N` and check:
 
 ## Step 4 — Convergence
 
-Codex returned `NO_CONCERNS`. The plan is approved by Codex. Write the sentinel using the **exact same normalization the hook uses** — read the file contents, strip trailing newlines (bash command-substitution behavior), hash:
+Codex returned `NO_CONCERNS`. The plan is approved by Codex. Write the sentinel via the plugin's helper, which applies the **exact same normalization the hook uses** (read the file, strip trailing newlines via command substitution, hash):
 
 ```bash
-printf '%s' "$(cat "$PLAN")" | shasum -a 256 | awk '{print $1}' > ./.plan-review/.codex-review-done
+${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh sentinel "$PLAN"
 ```
 
-This matches the hook's hash computation (`printf '%s' "$(jq -r .tool_input.plan ...)" | shasum -a 256`), because both sides strip trailing newlines before hashing.
+The helper runs `printf '%s' "$(cat "$PLAN")" | shasum -a 256 > ./.plan-review/.codex-review-done` internally (with a `sha256sum` fallback). This matches the hook's hash computation (`printf '%s' "$(jq -r .tool_input.plan ...)" | shasum -a 256`) because both sides strip trailing newlines before hashing. Routing it through the helper means `/plan-guardian:setup` can pre-approve the sentinel write with one stable `Bash()` rule instead of trying to allow a fragile multi-stage pipe in plan mode.
 
 The hook will read this sentinel and compare it against the hash of the `plan` field passed to the next `ExitPlanMode` call. So when you re-call `ExitPlanMode`, **pass the contents of `$PLAN` exactly as-is** — Claude Code's tool input plumbing preserves the bytes, and trailing-newline differences are normalized away by both sides.
 
@@ -187,7 +192,13 @@ Do **not** call `ExitPlanMode` yourself from this command. The user (or the call
 
 ## Manual reset
 
-If a user wants to bypass the loop for a one-off case (e.g., codex is down, plan is trivial), they can manually write the sentinel **using the same normalization the hook uses**:
+If a user wants to bypass the loop for a one-off case (e.g., codex is down, plan is trivial), they can manually write the sentinel **using the same normalization the hook uses**, either via the helper:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh sentinel ./.plan-review/yoplan-pending.md
+```
+
+or the equivalent raw pipe:
 
 ```bash
 printf '%s' "$(cat ./.plan-review/yoplan-pending.md)" | shasum -a 256 | awk '{print $1}' > ./.plan-review/.codex-review-done
