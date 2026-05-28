@@ -21,10 +21,11 @@ The fix is permission **allow rules**, which layer on top of any mode (plan incl
 | `Edit(.plan-review/**)` | plan revisions to `yoplan-pending.md` |
 | `Write(.plan-review/**)` | `round-<N>-prompt.md`, `round-<N>-decisions.md`, `review-status.md` |
 | `Bash(codex exec *)` | the per-round `codex exec` review call |
-| `Bash(<abs>/scripts/plan-review-helper.sh *)` | `init` (mkdir) + `sentinel` write — resolved absolute path |
-| `Bash(${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh *)` | same, literal-variable form (belt-and-suspenders: matches whether or not the permission matcher expands the variable) |
+| `Bash(<install-dir>/plan-guardian/*/scripts/plan-review-helper.sh *)` | `init` (mkdir) + `sentinel` write |
 
 `.plan-review/**` is anchored to the **current working directory** (gitignore-style relative pattern), so a single rule set in your global `~/.claude/settings.json` works in *every* project. Reads are omitted on purpose — reads inside the cwd never prompt.
+
+**Why the helper rule wildcards a path segment:** Claude Code expands `${CLAUDE_PLUGIN_ROOT}` in command bodies *before* the model sees them, and for an installed plugin that resolves to a **version-stamped** directory (e.g. `…/cache/<marketplace>/plan-guardian/1.4.0`). A rule pinned to that exact path would stop matching the moment the plugin updates. So the version segment is replaced with `*` (`…/plan-guardian/*/scripts/plan-review-helper.sh`), which survives updates. This is also why there is no separate literal-`${CLAUDE_PLUGIN_ROOT}` rule — that form never reaches the permission matcher.
 
 ## Step 0 — Guard
 
@@ -42,14 +43,19 @@ Default target is the **user** settings file (applies across all projects). If t
 
 ```bash
 SETTINGS="$HOME/.claude/settings.json"
-HELPER_ABS="${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh"
 
-DESIRED="$(jq -nc --arg h "$HELPER_ABS" '[
+# Claude Code expands ${CLAUDE_PLUGIN_ROOT} in this command body before you see it,
+# resolving to the (version-stamped) install dir, e.g.
+#   .../plugins/cache/<marketplace>/plan-guardian/1.4.0
+# Wildcard the version segment so the allow rule survives plugin updates.
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
+HELPER_GLOB="$(dirname "$PLUGIN_ROOT")/*/scripts/plan-review-helper.sh"
+
+DESIRED="$(jq -nc --arg hg "$HELPER_GLOB" '[
   "Edit(.plan-review/**)",
   "Write(.plan-review/**)",
   "Bash(codex exec *)",
-  "Bash(\($h) *)",
-  "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh *)"
+  "Bash(\($hg) *)"
 ]')"
 
 if [ -f "$SETTINGS" ]; then

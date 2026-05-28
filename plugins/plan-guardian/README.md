@@ -71,10 +71,9 @@ Run **`/plan-guardian:setup`** once to add these scoped allow-rules to your `~/.
 | `Edit(.plan-review/**)` | plan revisions to `yoplan-pending.md` |
 | `Write(.plan-review/**)` | `round-<N>-prompt.md`, `round-<N>-decisions.md`, `review-status.md` |
 | `Bash(codex exec *)` | the per-round `codex exec` review call |
-| `Bash(<abs>/scripts/plan-review-helper.sh *)` | `init` (mkdir) + `sentinel` write (resolved absolute path) |
-| `Bash(${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh *)` | same, literal-variable form (matches whether or not the matcher expands the variable) |
+| `Bash(<install-dir>/plan-guardian/*/scripts/plan-review-helper.sh *)` | `init` (mkdir) + `sentinel` write |
 
-`.plan-review/**` is anchored to the current working directory, so one rule set in global user settings works in every project. The loop's `mkdir` and the sha256 sentinel write (a fragile-to-allow `printf | shasum > file` pipe) are consolidated into `scripts/plan-review-helper.sh` so a single stable `Bash()` rule covers both.
+`.plan-review/**` is anchored to the current working directory, so one rule set in global user settings works in every project. The loop's `mkdir` and the sha256 sentinel write (a fragile-to-allow `printf | shasum > file` pipe) are consolidated into `scripts/plan-review-helper.sh` so a single stable `Bash()` rule covers both. The version segment of the helper path is wildcarded (`…/plan-guardian/*/scripts/…`) because Claude Code expands `${CLAUDE_PLUGIN_ROOT}` to a version-stamped install dir before the command runs — a pinned path would break on the next plugin update.
 
 **Caveat:** there are open upstream reports where the allow-list intermittently fails to suppress Write/Edit prompts under mode toggles. If prompts persist after setup, that is the upstream bug, not a mis-config — check `/permissions` to confirm the rules loaded. Alternatively, disable the whole gate with `CODEX_PLAN_REVIEW=0`.
 
@@ -131,4 +130,4 @@ plan-guardian/
 - The `.plan-review/` directory is created in the project working directory. Consider adding it to `.gitignore`.
 - The plan-reviewer agent uses `memory: user` for persistent learning across sessions.
 - The codex gate's sha256 normalization strips trailing newlines on both sides (hook and `plan-review-helper.sh sentinel`) so byte-level equivalence is robust against editor-added trailing whitespace.
-- Version: 1.4.0
+- Version: 1.4.1
