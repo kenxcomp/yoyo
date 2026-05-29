@@ -1,2 +1,5 @@
 # Local worktrees created by EnterWorktree / git worktree add.
 .claude/
+
+# plan-guardian runtime state (hook fallback copy; never tracked)
+.plan-review/
