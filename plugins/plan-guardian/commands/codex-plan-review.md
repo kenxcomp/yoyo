@@ -4,62 +4,46 @@ description: Loop `codex exec` plan review against the current plan, revise base
 
 # /plan-guardian:codex-plan-review
 
-Drive an external review loop where **Codex** (`codex exec`) critiques the plan and you (Claude) revise it. Repeat until Codex returns no concerns (or the optional round cap is hit). On convergence, write a `sha256` sentinel so the `PreToolUse:ExitPlanMode` hook stops blocking and the original `ExitPlanMode` proposal goes through.
+Drive an external review loop where **Codex** (`codex exec`) critiques the plan and you (Claude) revise it. Repeat until Codex returns no concerns (or the optional round cap is hit). On convergence, append an **inline review marker** to the plan so the `PreToolUse:ExitPlanMode` hook recognizes it and lets the `ExitPlanMode` call through.
+
+**v1.5.0 — inline marker, no state files (read this first):** the entire loop runs while the session is **still in plan mode**, where `Write`/`Edit` prompt like default mode *and* the allow-list intermittently fails to suppress those prompts on some Claude Code versions. So this command writes **nothing** to disk during the loop. The plan body, every round's prompt, every round's Codex output, and your per-finding decisions all live in **conversation context**. The only persisted artifact is a marker line you append to the plan text itself — which rides to the hook through `tool_input.plan`, not the filesystem. The only two Bash calls in the whole loop are `codex exec` and `plan-review-helper.sh digest` (both covered by stable `Bash()` allow-rules from `/plan-guardian:setup`).
 
 This command can be invoked two ways:
 
-1. **Auto-triggered**: The `PreToolUse:ExitPlanMode` hook (`codex-plan-review-trigger.sh`) detected an unreviewed plan, saved it to `./.plan-review/yoplan-pending.md`, blocked the `ExitPlanMode` call, and instructed Claude to run this command. This is the normal flow.
+1. **Auto-triggered**: The `PreToolUse:ExitPlanMode` hook (`codex-plan-review-trigger.sh`) found no valid marker on the plan, denied the `ExitPlanMode` call, and instructed you to run this command. The plan is in your context (the one you just tried to submit); the hook also stashed a copy at `./.plan-review/yoplan-pending.md` as a fallback reference. This is the normal flow.
 2. **Manual**: User typed `/plan-guardian:codex-plan-review` directly. Locate the plan from any of the standard sources (see Step 1).
 
 ## Preflight — verify Codex is available
 
-Run `command -v codex >/dev/null 2>&1` (or `which codex`). If Codex CLI is **not** installed:
+Run `command -v codex >/dev/null 2>&1`. If Codex CLI is **not** installed:
 
 - Print: `Codex CLI not found. Install via the openai-codex plugin or upstream instructions, then re-run /plan-guardian:codex-plan-review.`
-- **Do not** write the sentinel file. **Do not** fail silently. Terminate.
+- **Do not** append a marker. **Do not** fail silently. Terminate.
 
-If `CODEX_PLAN_REVIEW=0` is set in the environment, the user has opted out of this command — print `codex plan-review disabled via CODEX_PLAN_REVIEW=0` and terminate without writing the sentinel.
+If `CODEX_PLAN_REVIEW=0` is set in the environment, the user has opted out — print `codex plan-review disabled via CODEX_PLAN_REVIEW=0` and terminate without appending a marker.
 
 ## Step 1 — Locate the plan
 
-Check sources in this order and stop at the first hit:
+The plan body is whatever you are about to submit to `ExitPlanMode`. Resolve it in this order and stop at the first hit:
 
-1. `./.plan-review/yoplan-pending.md` (written by the `ExitPlanMode` hook — **canonical location for auto-trigger**)
-2. The most recently mentioned plan file in conversation context (e.g., something the user passed as a path)
-3. `./.plan-review/yoplan.md`
-4. `~/.claude/plans/*.md` — the most recently modified entry
-5. Conversation context — if Claude just wrote the plan inline and there's no file yet, **dump it** to `./.plan-review/yoplan-pending.md` first so the loop has a stable file to mutate
+1. The plan in **conversation context** — the one whose `ExitPlanMode` the hook just denied. This is the canonical source for the auto-trigger flow.
+2. `./.plan-review/yoplan-pending.md` (fallback copy written by the hook).
+3. The most recently mentioned plan file in conversation context (a path the user passed).
+4. `~/.claude/plans/*.md` — the most recently modified entry.
 
 If nothing is found, print `No plan to review.` and terminate.
 
-Store the resolved path as `$PLAN`. All edits in this command MUST operate on this single file. Never inline-edit the conversation copy — there's no point, only the file is the source of truth for the sentinel hash.
+Hold the resolved text as `PLAN_BODY` **in context**. All revisions happen to this in-context copy. Do **not** write it to a file — there is no on-disk source of truth in v1.5.0; the plan body you finally pass to `ExitPlanMode` is authoritative, and the hook validates the marker against exactly that text.
 
-## Step 2 — Initialize the round directory
+> If `PLAN_BODY` already ends with a `<!-- codex-reviewed:... -->` line (e.g. you re-ran the command), strip that trailing marker line before reviewing — you review and re-mint over the body only, never over a body that still carries an old marker.
 
-```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh init
-```
+## Step 2 — The loop
 
-(This is just `mkdir -p ./.plan-review/codex-rounds`, routed through the plugin's
-pre-approvable helper so it doesn't trigger a permission prompt while you're
-still in plan mode — once the user has run `/plan-guardian:setup`. A bare
-`mkdir -p ./.plan-review/codex-rounds` works too; it will simply prompt.)
+Set `N = 1`. Set `MAX = ${CODEX_PLAN_REVIEW_MAX_ROUNDS:-0}` (0 = no cap, default). Keep all round artifacts in context (label them "round N prompt / output / decisions" in your reasoning). Loop:
 
-Each round writes:
+### 2a. Build the Codex prompt (in context)
 
-- `./.plan-review/codex-rounds/round-<N>-prompt.md` — the prompt sent to Codex
-- `./.plan-review/codex-rounds/round-<N>-output.md` — Codex's raw response
-- `./.plan-review/codex-rounds/round-<N>-decisions.md` — your per-finding decision (accept / partial / reject + rationale)
-
-The directory is intentionally per-project and **not** auto-cleaned — it's the audit trail of how the plan converged. The user can delete it whenever they want.
-
-## Step 3 — The loop
-
-Set `N=1`. Set `MAX = ${CODEX_PLAN_REVIEW_MAX_ROUNDS:-0}` (0 = no cap, default). Loop:
-
-### 3a. Build the Codex prompt
-
-Read the current contents of `$PLAN`. Write to `round-<N>-prompt.md`:
+Compose this prompt with the current `PLAN_BODY` interpolated at the bottom:
 
 ```
 You are reviewing a software-engineering plan written by another agent. Your job
@@ -87,121 +71,130 @@ If the plan has zero material issues, emit (A). Otherwise emit (B). Never both.
 PLAN UNDER REVIEW
 ---
 
-<insert the full contents of $PLAN here>
+<insert the full current PLAN_BODY here>
 ```
 
-### 3b. Invoke Codex
+### 2b. Invoke Codex
 
-Run **foreground**, blocking until Codex returns. The redirection `< /dev/null` is **mandatory** — see the first note below:
+Run **foreground**, blocking until Codex returns, passing the whole prompt as the positional arg. Capture **stdout** directly — do **not** use `--output-last-message` (that would write a file and prompt). The redirection `< /dev/null` is **mandatory** — see the first note:
 
 ```bash
 codex exec \
   --sandbox read-only \
   --skip-git-repo-check \
   --cd "$(pwd)" \
-  --output-last-message ./.plan-review/codex-rounds/round-${N}-output.md \
-  -- "$(cat ./.plan-review/codex-rounds/round-${N}-prompt.md)" \
+  -- "$(cat <<'PROMPT'
+<paste the round prompt from 2a here>
+PROMPT
+)" \
   < /dev/null
 ```
 
+(Heredoc-as-arg keeps the multi-line prompt intact without a temp file. If your prompt contains a line that is literally `PROMPT`, pick another delimiter.)
+
+Read Codex's review from the command's **stdout** in the tool result.
+
 Notes:
 
-- **`< /dev/null` is mandatory.** Per `codex exec --help`: if stdin is a pipe (non-TTY), Codex appends a `<stdin>` block to the prompt — and in agent contexts like Claude Code's Bash tool, stdin is always a pipe, so Codex blocks indefinitely waiting for input that will never come. Symptoms: the call appears to hang for many minutes, `round-<N>-output.md` never gets created, and the run's stdout contains `Reading additional input from stdin...`. Explicitly closing stdin with `< /dev/null` makes the prompt-arg the only input. **Do not omit this redirect** under any circumstance.
+- **`< /dev/null` is mandatory.** Per `codex exec --help`: if stdin is a pipe (non-TTY), Codex appends a `<stdin>` block to the prompt — and in agent contexts like Claude Code's Bash tool, stdin is always a pipe, so Codex blocks indefinitely waiting for input that never comes. Symptoms: the call appears to hang for many minutes and stdout contains `Reading additional input from stdin...`. Closing stdin with `< /dev/null` makes the prompt-arg the only input. **Do not omit this redirect.**
 - **`--sandbox read-only`** is non-negotiable. Codex is reviewing text, not modifying code. If Codex tries to write, that's a bug; do not relax the sandbox.
-- **No timeout wrapper.** Plan review duration legitimately scales with plan length and Codex's reasoning depth. Block on the foreground process. If you genuinely believe Codex is hung (multiple minutes of zero output to the output file AND the stdout does NOT contain `Reading additional input from stdin...` — that one is a missing `< /dev/null` bug, not a hang), tell the user and let them decide whether to interrupt — do NOT auto-kill.
-- If `codex exec` exits non-zero, write the error to `round-<N>-output.md`, print a brief summary, and **terminate the loop without writing the sentinel** so the user can fix the upstream problem (auth, quota, model availability) and re-run.
+- **No timeout wrapper.** Review duration legitimately scales with plan length and Codex's reasoning depth. Block on the foreground process. If you genuinely believe Codex is hung (many minutes of zero output AND stdout does NOT contain `Reading additional input from stdin...` — that one is a missing `< /dev/null` bug, not a hang), tell the user and let them decide; do NOT auto-kill.
+- If `codex exec` exits non-zero, print a brief summary of the error and **terminate the loop without appending a marker** so the user can fix the upstream problem (auth, quota, model availability) and re-run.
 
-### 3c. Classify the output
+### 2c. Classify the output
 
-Read `round-<N>-output.md`. Determine: is the **first non-empty line** exactly `NO_CONCERNS` (case-sensitive, allowing leading/trailing whitespace on that line)?
+From Codex's stdout, determine: is the **first non-empty line** exactly `NO_CONCERNS` (case-sensitive, leading/trailing whitespace on that line allowed)?
 
-- **Yes → loop terminates, jump to Step 4.** Append the optional reason line to `round-<N>-decisions.md` as `Codex final note: <reason>`.
-- **No → treat as a concerns list and proceed to 3d.**
+- **Yes → loop terminates, jump to Step 3.**
+- **No → treat as a concerns list and proceed to 2d.**
 
-### 3d. Triage each concern
+### 2d. Triage each concern (in context)
 
-For each numbered concern in the Codex output, write to `round-<N>-decisions.md` one of:
+For each numbered concern, decide and record (in your reasoning, as "round N decisions") one of:
 
 | Decision | When | Action |
 |----------|------|--------|
-| `accept` | The concern is real and the suggested fix (or your adapted version) materially improves the plan. | Edit `$PLAN` to incorporate the fix. Use `Edit` with a narrow `old_string` / `new_string` — do not rewrite unaffected sections. |
-| `partial` | The underlying concern is valid but the suggested fix isn't quite right. | Apply your own corrective change to `$PLAN`. Record in `round-<N>-decisions.md` what you changed and why your version is better. |
-| `reject` | The concern is a nitpick, contradicts the user's stated intent, demands scope the user did not request, or is factually wrong about the codebase. | Do not modify `$PLAN`. Record the rejection rationale in 1–2 sentences. |
+| `accept` | The concern is real and the suggested fix (or your adapted version) materially improves the plan. | Revise `PLAN_BODY` in context to incorporate the fix. Change only the affected part. |
+| `partial` | The underlying concern is valid but the suggested fix isn't quite right. | Apply your own corrective change to `PLAN_BODY`. Note what you changed and why your version is better. |
+| `reject` | The concern is a nitpick, contradicts the user's stated intent, demands scope the user did not request, or is factually wrong about the codebase. | Do not change `PLAN_BODY`. Record the rejection rationale in 1–2 sentences. |
 
 Critical guardrails:
 
 - **Never let Codex push the plan outside the user's stated scope.** A correct fix that adds features the user didn't ask for is `reject`, not `accept` — even if Codex's reasoning is technically sound. The original user intent is the north star.
-- **Never edit the plan to weaken safety or correctness** just to placate a `reject`-class concern. If Codex demands removing a verification step you correctly added, reject.
-- **One `accept` may invalidate a later concern.** After each accept, re-check the remaining concerns in the same list against the current plan state — if a later concern was about something you just changed, mark it `superseded` instead of running it.
+- **Never weaken safety or correctness** to placate a `reject`-class concern. If Codex demands removing a verification step you correctly added, reject.
+- **One `accept` may invalidate a later concern.** After each accept, re-check the remaining concerns against the current `PLAN_BODY` — if a later concern is about something you just changed, mark it `superseded` instead of acting on it.
 
-### 3e. Loop guard
+### 2e. Loop guard
 
 After triaging, increment `N` and check:
 
-- If `MAX > 0` and `N > MAX`: terminate **without** writing the sentinel. Print:
+- If `MAX > 0` and `N > MAX`: terminate **without** appending a marker. Print:
   ```
-  Hit CODEX_PLAN_REVIEW_MAX_ROUNDS=<MAX> without convergence. Last round's
-  concerns are in ./.plan-review/codex-rounds/round-<MAX>-output.md. Either:
-    (a) raise the cap and re-run /plan-guardian:codex-plan-review, or
-    (b) review the remaining concerns manually and decide whether to proceed.
+  Hit CODEX_PLAN_REVIEW_MAX_ROUNDS=<MAX> without convergence. Either raise the cap
+  and re-run /plan-guardian:codex-plan-review, or review the remaining concerns
+  manually and decide whether to proceed.
   ```
-- **Anti-thrash check**: compare the current `$PLAN` content hash with the previous round's *post-edit* content hash. If **two consecutive rounds produced zero edits** (every concern was `reject` or `superseded`) AND Codex still didn't emit `NO_CONCERNS`, you've hit a stable disagreement. Terminate **without** writing the sentinel, print the disagreement summary, and let the user decide.
-- Otherwise: go back to 3a with the updated `$PLAN`.
+- **Anti-thrash check**: if **two consecutive rounds produced zero edits** (every concern was `reject` or `superseded`) AND Codex still didn't emit `NO_CONCERNS`, you've hit a stable disagreement. Terminate **without** appending a marker, print the disagreement summary, and let the user decide.
+- Otherwise: go back to 2a with the updated `PLAN_BODY`.
 
-## Step 4 — Convergence
+## Step 3 — Convergence: mint the marker
 
-Codex returned `NO_CONCERNS`. The plan is approved by Codex. Write the sentinel via the plugin's helper, which applies the **exact same normalization the hook uses** (read the file, strip trailing newlines via command substitution, hash):
+Codex returned `NO_CONCERNS`. Mint the review marker for the final `PLAN_BODY` via the plugin's shared helper, which uses the **exact digest the hook verifies with** (so mint and verify can never drift). Pipe the body in on stdin:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh sentinel "$PLAN"
+TOKEN="$(printf '%s' "<final PLAN_BODY, no trailing marker>" \
+  | ${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh digest)"
+echo "$TOKEN"
 ```
 
-The helper runs `printf '%s' "$(cat "$PLAN")" | shasum -a 256 > ./.plan-review/.codex-review-done` internally (with a `sha256sum` fallback). This matches the hook's hash computation (`printf '%s' "$(jq -r .tool_input.plan ...)" | shasum -a 256`) because both sides strip trailing newlines before hashing. Routing it through the helper means `/plan-guardian:setup` can pre-approve the sentinel write with one stable `Bash()` rule instead of trying to allow a fragile multi-stage pipe in plan mode.
+`TOKEN` is `h1:<sha256 hex>` when `CODEX_REVIEW_SECRET` is set (content-bound), or `l1:none` when it isn't (literal fallback — still works, just spoofable). Both the command and the hook read the same env var, so they agree.
 
-The hook will read this sentinel and compare it against the hash of the `plan` field passed to the next `ExitPlanMode` call. So when you re-call `ExitPlanMode`, **pass the contents of `$PLAN` exactly as-is** — Claude Code's tool input plumbing preserves the bytes, and trailing-newline differences are normalized away by both sides.
+Then build the final plan text by appending the marker as the **last line**:
 
-Then print to the user, in Chinese (because this project communicates in Chinese):
+```
+<final PLAN_BODY>
+<!-- codex-reviewed:<TOKEN> -->
+```
+
+(Exactly one newline between the body and the marker line. The hook strips the marker line and re-hashes the body; trailing-newline differences are normalized away on both sides by the shared helper.)
+
+Print to the user, in Chinese:
 
 ```
 ✅ Codex plan review 已收敛(共 <N> 轮)。
-   - 修订后的计划:$PLAN
-   - 审计轨迹:./.plan-review/codex-rounds/
-   - 现在可以重新调用 ExitPlanMode,hook 将放行。
+   - 已在计划末尾追加审查标记:<!-- codex-reviewed:<TOKEN> -->
+   - 现在重新调用 ExitPlanMode,传入“带标记的完整计划文本”,hook 会重算并放行。
+   - 注意:标记绑定计划内容;一旦再修改计划正文,标记失效,ExitPlanMode 会被重新拦截。
 ```
 
-If the user manually invoked this command (not via the hook), append:
+If `CODEX_REVIEW_SECRET` is unset, also note:
 
 ```
-   - 提示:hook sentinel 已写入 ./.plan-review/.codex-review-done。
-     该 sentinel 仅对当前 $PLAN 的字节内容有效;一旦 $PLAN 再被修改,
-     下次 ExitPlanMode 仍会被 hook 拦截重新走 review 循环。
+   - 提示:当前未设置 CODEX_REVIEW_SECRET,标记为固定字面值(可被伪造,但单用户场景足够)。
+     若需内容绑定,设置该环境变量后重跑本命令。
 ```
 
-## Step 5 — Hand control back
+## Step 4 — Hand control back
 
-Do **not** call `ExitPlanMode` yourself from this command. The user (or the calling agent) decides when to exit plan mode. Your job ends at writing the sentinel and reporting.
+Do **not** call `ExitPlanMode` yourself from this command. The caller decides when to exit plan mode — and when they do, they must pass the **marked** plan text (body + marker line) produced in Step 3, verbatim. The hook recomputes the token over the body, sees it match, and allows the call. Your job ends at minting the marker and reporting.
 
 ## Guardrails
 
-- **Never write the sentinel unless Codex emitted `NO_CONCERNS` in the most recent round.** Hitting the round cap, stable disagreement, codex-exec failure, sandbox violation — none of these justify writing the sentinel. The sentinel is a *positive* signal from Codex, not a fallback.
-- **Never modify any file outside `$PLAN` and `./.plan-review/`.** This command does not refactor code, does not edit READMEs, does not touch git state.
+- **Never append a marker unless Codex emitted `NO_CONCERNS` in the most recent round.** Round cap, stable disagreement, codex-exec failure, sandbox violation — none of these justify a marker. The marker is a *positive* signal from Codex, not a fallback.
+- **Never modify any file.** v1.5.0 writes nothing during the loop. No round files, no sentinel, no plan file. Everything is in context until the marked plan goes back to `ExitPlanMode`.
 - **Never run `codex exec` with `--sandbox workspace-write` or `danger-full-access`.** Read-only is correct because the loop is text-on-text.
-- **Never paraphrase `NO_CONCERNS`.** If Codex says "looks good to me" or "approved" or "好的没问题", that is **NOT** `NO_CONCERNS` — re-prompt Codex with the strict-format reminder, or escalate to the user. Downstream tools depend on the exact literal.
+- **Never paraphrase `NO_CONCERNS`.** "looks good", "approved", "好的没问题" are NOT `NO_CONCERNS` — re-prompt Codex with the strict-format reminder, or escalate to the user. The marker mint depends on the exact literal.
 - **Never silently accept Codex concerns that contradict the user's original request.** Reject and document. The user is the final authority on scope.
-- **Honor the env opt-out.** `CODEX_PLAN_REVIEW=0` disables this command entirely; the hook should also respect it (it does, see the trigger script).
+- **Honor the env opt-out.** `CODEX_PLAN_REVIEW=0` disables this command entirely; the hook respects it too.
 
-## Manual reset
+## Manual bypass
 
-If a user wants to bypass the loop for a one-off case (e.g., codex is down, plan is trivial), they can manually write the sentinel **using the same normalization the hook uses**, either via the helper:
-
-```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh sentinel ./.plan-review/yoplan-pending.md
-```
-
-or the equivalent raw pipe:
+To skip the loop for a one-off (codex down, trivial plan), the user can mint a marker by hand using the same helper, then exit plan mode with the marked plan:
 
 ```bash
-printf '%s' "$(cat ./.plan-review/yoplan-pending.md)" | shasum -a 256 | awk '{print $1}' > ./.plan-review/.codex-review-done
+TOKEN="$(printf '%s' "$(cat ./.plan-review/yoplan-pending.md)" \
+  | ${CLAUDE_PLUGIN_ROOT}/scripts/plan-review-helper.sh digest)"
+# then append  <!-- codex-reviewed:$TOKEN -->  as the last line of the plan you submit
 ```
 
-Document this in your response if they ask how to skip — do not do it for them silently.
+Document this if they ask how to skip — do not do it for them silently. (Whole-gate opt-out: `CODEX_PLAN_REVIEW=0`.)

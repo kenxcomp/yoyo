@@ -1,31 +1,34 @@
 ---
-description: Add permission allow-rules so plan-guardian's state writes stop prompting inside plan mode
+description: Add permission allow-rules so plan-guardian's two plan-mode Bash calls (codex exec + digest helper) stop prompting
 ---
 
 # /plan-guardian:setup
 
-Silence the permission prompts plan-guardian triggers **while the session is in plan mode**.
+Silence the permission prompts plan-guardian's codex review gate triggers **while the session is in plan mode**.
 
-## Why prompts happen (and why moving the directory does NOT help)
+## Why prompts happen (v1.5.0)
 
-plan-guardian's codex review gate (`/plan-guardian:codex-plan-review`) runs *while you are still in plan mode* — the `ExitPlanMode` hook denies the exit and hands control to the loop before the mode changes. In plan mode, **Write / Edit / Bash are gated exactly like `default` mode: they prompt** (official docs: plan mode is "reads only", "permission prompts still apply the same as default mode"). The loop does several such writes per round (round prompt/decision files, plan edits, `codex exec`, the sentinel), so you get asked to allow each one.
+plan-guardian's codex review gate (`/plan-guardian:codex-plan-review`) runs *while you are still in plan mode* — the `ExitPlanMode` hook denies the exit and hands control to the loop before the mode changes. In plan mode, **Write / Edit / Bash are gated exactly like `default` mode: they prompt** (official docs: plan mode is "reads only", "permission prompts still apply the same as default mode").
 
-This is **not** caused by the *location* `./.plan-review/`. The path is irrelevant to the prompt — every non-read write prompts in plan mode regardless of where it lands. In fact, moving state into `.claude/` would be **worse**: `.claude` is a Claude Code **protected path** whose writes are *never* auto-approved in any mode except `bypassPermissions` — not even an allow rule overrides it. `./.plan-review/` is a normal, non-protected project directory, which is exactly why allow rules *can* pre-approve it.
+**v1.5.0 removed all Write/Edit from the loop.** The "reviewed" proof is now an inline marker carried inside the plan text (`<!-- codex-reviewed:<token> -->`), which travels to the hook through `tool_input.plan` — no files are written during plan mode. That deliberately sidesteps the open Claude Code bug where the allow-list *intermittently fails to suppress Write/Edit prompts* under mode toggles: there are no Write/Edit calls left to mis-prompt.
 
-The fix is permission **allow rules**, which layer on top of any mode (plan included) to pre-approve specific tools on specific paths.
+What remains in plan mode is exactly **two Bash calls** per loop:
+
+1. `codex exec …` — the per-round review.
+2. `plan-review-helper.sh digest` — minting the marker token on convergence.
+
+Both prompt without an allow-rule. This command pre-approves those two, and nothing else. (Bash allow-rules are far more reliable than Write/Edit under mode toggles, which is the other reason v1.5.0 moved the proof out of a written file.)
 
 ## Rules this command adds
 
 | Rule | Covers |
 |------|--------|
-| `Edit(.plan-review/**)` | plan revisions to `yoplan-pending.md` |
-| `Write(.plan-review/**)` | `round-<N>-prompt.md`, `round-<N>-decisions.md`, `review-status.md` |
 | `Bash(codex exec *)` | the per-round `codex exec` review call |
-| `Bash(<install-dir>/plan-guardian/*/scripts/plan-review-helper.sh *)` | `init` (mkdir) + `sentinel` write |
+| `Bash(<install-dir>/plan-guardian/*/scripts/plan-review-helper.sh *)` | the `digest` marker mint |
 
-`.plan-review/**` is anchored to the **current working directory** (gitignore-style relative pattern), so a single rule set in your global `~/.claude/settings.json` works in *every* project. Reads are omitted on purpose — reads inside the cwd never prompt.
+No `Edit`/`Write` rules are needed anymore — the loop writes nothing in plan mode. (If you ran an older setup, the leftover `Edit(.plan-review/**)` / `Write(.plan-review/**)` rules are now unused and harmless; you may delete them.)
 
-**Why the helper rule wildcards a path segment:** Claude Code expands `${CLAUDE_PLUGIN_ROOT}` in command bodies *before* the model sees them, and for an installed plugin that resolves to a **version-stamped** directory (e.g. `…/cache/<marketplace>/plan-guardian/1.4.0`). A rule pinned to that exact path would stop matching the moment the plugin updates. So the version segment is replaced with `*` (`…/plan-guardian/*/scripts/plan-review-helper.sh`), which survives updates. This is also why there is no separate literal-`${CLAUDE_PLUGIN_ROOT}` rule — that form never reaches the permission matcher.
+**Why the helper rule wildcards a path segment:** Claude Code expands `${CLAUDE_PLUGIN_ROOT}` in command bodies *before* the model sees them, and for an installed plugin that resolves to a **version-stamped** directory (e.g. `…/cache/<marketplace>/plan-guardian/1.5.0`). A rule pinned to that exact path would stop matching the moment the plugin updates. So the version segment is replaced with `*` (`…/plan-guardian/*/scripts/plan-review-helper.sh`), which survives updates. This is also why there is no separate literal-`${CLAUDE_PLUGIN_ROOT}` rule — that form never reaches the permission matcher.
 
 ## Step 0 — Guard
 
@@ -46,14 +49,12 @@ SETTINGS="$HOME/.claude/settings.json"
 
 # Claude Code expands ${CLAUDE_PLUGIN_ROOT} in this command body before you see it,
 # resolving to the (version-stamped) install dir, e.g.
-#   .../plugins/cache/<marketplace>/plan-guardian/1.4.0
+#   .../plugins/cache/<marketplace>/plan-guardian/1.5.0
 # Wildcard the version segment so the allow rule survives plugin updates.
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
 HELPER_GLOB="$(dirname "$PLUGIN_ROOT")/*/scripts/plan-review-helper.sh"
 
 DESIRED="$(jq -nc --arg hg "$HELPER_GLOB" '[
-  "Edit(.plan-review/**)",
-  "Write(.plan-review/**)",
   "Bash(codex exec *)",
   "Bash(\($hg) *)"
 ]')"
@@ -100,13 +101,24 @@ Only the **missing** rules are appended, preserving the existing order — no re
 
 Print the `MISSING` array and tell them to add the entries to `permissions.allow` in `~/.claude/settings.json` (or via the `/permissions` UI). They take effect on the next session, or immediately after `/permissions` reload.
 
-## Step 4 — Verify
+## Step 4 — (Optional) content-binding secret
 
-Tell the user to enter plan mode and trigger an `ExitPlanMode`; the codex loop's `.plan-review/` writes and `codex exec` should now run without prompts.
+The marker is content-bound only when `CODEX_REVIEW_SECRET` is set — then revising the plan invalidates the marker and re-arms the gate. Without it, the marker is a fixed literal (`l1:none`): the gate still works, but a plan ending in that literal marker would pass without review (spoofable). For a single-user setup that's usually fine.
+
+To enable content-binding, the user sets the env var so **both** the hook and the slash command see it (same shell environment Claude Code launches in). Two options — do **not** write either without explicit confirmation:
+
+- Shell profile (applies to every Claude Code session): add `export CODEX_REVIEW_SECRET="<random string>"` to `~/.config/fish/config.fish` (fish: `set -gx CODEX_REVIEW_SECRET "<random>"`) or `~/.zshrc` / `~/.bashrc`.
+- Claude Code settings env (project or user): add `"env": { "CODEX_REVIEW_SECRET": "<random>" }` to `settings.json`.
+
+Mention this as optional; the gate is fully functional without it.
+
+## Step 5 — Verify
+
+Tell the user to enter plan mode and trigger an `ExitPlanMode`. It will be denied (no marker yet); running `/plan-guardian:codex-plan-review` should now run `codex exec` and the digest mint **without prompts**, and the subsequent `ExitPlanMode` (with the marked plan) should be allowed.
 
 ## Notes & caveats
 
-- **Honest caveat:** there are open Claude Code reports where the allow-list intermittently fails to suppress Write/Edit prompts under mode toggles. If prompts persist on your version after setup, that is the upstream bug, not a mis-config — `/permissions` shows whether the rules are loaded.
+- v1.5.0 no longer depends on Write/Edit allow-rules, so the upstream flaky-allow-list bug no longer affects the gate's core. Only the two Bash rules matter; `/permissions` shows whether they are loaded.
 - The `codex exec` rule allows any `codex exec` invocation (the plugin always runs it `--sandbox read-only`). If you want it scoped tighter, replace it with an exact-match rule for the full command — but that is fragile across plan lengths.
-- Reverting: `mv ~/.claude/settings.json.bak.<TS> ~/.claude/settings.json`, or delete the five rules from `permissions.allow`.
+- Reverting: `mv ~/.claude/settings.json.bak.<TS> ~/.claude/settings.json`, or delete the two rules from `permissions.allow`.
 - Opt-out of the whole gate instead: set `CODEX_PLAN_REVIEW=0` (then these rules are unused and can be removed).

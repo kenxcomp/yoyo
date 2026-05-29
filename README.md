@@ -105,6 +105,7 @@ The `plan-guardian` plugin enforces rigorous plan review before execution. Key f
 - **EnterPlanMode Hook**: Clears previous review state when entering a new planning session
 - **Plan-Reviewer Agent**: Evaluates plans against 8 quality criteria (edge cases, abnormal scenarios, style consistency, logical consistency, verification steps, unclear intentions, semantic ambiguity, user intent)
 - **/plan-review Skill**: Manually trigger a plan review at any time
+- **Codex Review Gate** (v1.5.0, opt-out): a `PreToolUse:ExitPlanMode` hook blocks plan-mode exit until `/plan-guardian:codex-plan-review` loops `codex exec` to `NO_CONCERNS`; approval is recorded as an inline marker in the plan text (no state files written during plan mode). Set `CODEX_PLAN_REVIEW=0` to disable. See the [plugin README](./plugins/plan-guardian/README.md) for details.
 
 **Review Workflow:**
 1. Enter plan mode → previous review state is cleared

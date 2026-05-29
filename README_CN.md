@@ -111,6 +111,7 @@ plugin-name/
 - **EnterPlanMode 钩子**：进入新的规划会话时清除之前的审查状态
 - **Plan-Reviewer 代理**：根据 8 项质量标准评估计划（边界情况、异常场景、风格一致性、逻辑一致性、验证步骤、不明确意图、语义歧义、用户意图）
 - **/plan-review 技能**：随时手动触发计划审查
+- **Codex 审查门禁**（v1.5.0,可选退出):`PreToolUse:ExitPlanMode` 钩子拦截退出计划模式,直到 `/plan-guardian:codex-plan-review` 循环调用 `codex exec` 直至 `NO_CONCERNS`;审查通过以**内联标记**记录在计划文本中(计划模式期间不写任何状态文件)。设 `CODEX_PLAN_REVIEW=0` 可禁用。详见[插件 README](./plugins/plan-guardian/README.md)。
 
 **审查工作流程：**
 1. 进入计划模式 → 清除之前的审查状态

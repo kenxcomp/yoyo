@@ -1,21 +1,37 @@
 #!/bin/bash
 # codex-plan-review-trigger.sh
 #
-# PreToolUse:ExitPlanMode hook. Captures the plan being submitted, compares its
-# sha256 against the .codex-review-done sentinel, and either:
-#   - allows the ExitPlanMode call (sentinel matches, meaning /plan-guardian:codex-plan-review
-#     already drove the codex loop to NO_CONCERNS on this exact plan), OR
-#   - denies the call and instructs Claude to run /plan-guardian:codex-plan-review first.
+# PreToolUse:ExitPlanMode hook (v1.5.0, inline marker gate). Reads the plan being
+# submitted and decides whether codex review already approved THIS exact plan by
+# validating an inline marker on the plan's last line — NO state file involved.
 #
-# Opt-out: set CODEX_PLAN_REVIEW=0 in env to disable. Hook becomes a no-op (allow).
+#   - The plan's last line is  <!-- codex-reviewed:<token> -->  and <token>
+#     matches the keyed digest of the plan body (everything above the marker) →
+#     ALLOW the ExitPlanMode call.
+#   - No marker, malformed marker, or token mismatch (plan revised after review,
+#     or never reviewed) → DENY and instruct Claude to run
+#     /plan-guardian:codex-plan-review first.
 #
-# Input on stdin (JSON, schema from Claude Code PreToolUse):
+# Why inline instead of a sentinel file: the review loop runs while the session
+# is STILL in plan mode, where Write/Edit prompt like default mode AND the
+# allow-list intermittently fails to suppress those prompts on some Claude Code
+# versions. Carrying the "reviewed" proof inside tool_input.plan (the in-memory
+# channel) means the loop writes nothing during plan mode, so there is nothing
+# for a flaky allow-list to miss. The digest is content-bound, so revising the
+# plan invalidates the marker and re-arms the gate automatically.
+#
+# Marker token (computed by the SHARED plan-review-helper.sh digest subcommand,
+# so mint-side and verify-side can never drift):
+#   - CODEX_REVIEW_SECRET set   → h1:<sha256(secret"\n"body)>   (content-bound)
+#   - CODEX_REVIEW_SECRET unset → l1:none                       (literal fallback)
+#
+# Opt-out: CODEX_PLAN_REVIEW=0 in env → hook is a no-op (silent allow).
+#
+# Input on stdin (JSON, Claude Code PreToolUse schema):
 #   { "tool_name": "ExitPlanMode", "tool_input": { "plan": "<plan markdown>" }, ... }
-#
 # Output on stdout (JSON):
 #   { "hookSpecificOutput": { "hookEventName": "PreToolUse",
-#       "permissionDecision": "allow" | "deny",
-#       "permissionDecisionReason": "..." } }
+#       "permissionDecision": "allow" | "deny", "permissionDecisionReason": "..." } }
 
 set -euo pipefail
 
@@ -29,21 +45,17 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 0
 fi
 
-# Pick a sha256 binary that exists on both macOS and Linux.
-sha256() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$@" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$@" | awk '{print $1}'
-  else
-    echo "no-sha256-available"
-  fi
-}
-
 # jq required to parse the hook payload. If missing, allow silently rather than
 # blocking the user's normal flow.
 if ! command -v jq >/dev/null 2>&1; then
   exit 0
+fi
+
+# Shared digest implementation lives next to this script. Mint (slash command)
+# and verify (here) MUST use the same one.
+HELPER="$(cd "$(dirname "$0")" && pwd)/plan-review-helper.sh"
+if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
+  exit 0   # helper missing → don't block the user
 fi
 
 # Read stdin, extract plan. If extraction fails, allow silently.
@@ -54,55 +66,61 @@ if [ -z "$PLAN" ]; then
   exit 0
 fi
 
-# Compute hash of the current plan (over the raw bytes).
-PLAN_HASH="$(printf '%s' "$PLAN" | sha256 -)"
-[ -z "$PLAN_HASH" ] && exit 0   # hash failure → allow
+# Marker is strictly the LAST line of the plan: <!-- codex-reviewed:<token> -->
+LAST_LINE="$(printf '%s' "$PLAN" | tail -n1)"
+SUBMITTED_TOKEN="$(printf '%s' "$LAST_LINE" \
+  | sed -n 's/^[[:space:]]*<!-- codex-reviewed:\(.*\) -->[[:space:]]*$/\1/p')"
 
-mkdir -p ./.plan-review
-
-SENTINEL=./.plan-review/.codex-review-done
-PENDING=./.plan-review/yoplan-pending.md
-
-# Sentinel exists and matches → codex review for THIS plan already passed.
-# Allow the ExitPlanMode call and clear the sentinel (one-shot; re-arms for the
-# next plan).
-if [ -f "$SENTINEL" ]; then
-  SENTINEL_HASH="$(tr -d '[:space:]' < "$SENTINEL")"
-  if [ "$SENTINEL_HASH" = "$PLAN_HASH" ]; then
-    rm -f "$SENTINEL"
-    jq -n --arg reason "Codex plan review previously converged for this exact plan (hash matched). Sentinel cleared." \
+if [ -n "$SUBMITTED_TOKEN" ]; then
+  # Reconstruct the body (everything except the marker line) and recompute the
+  # expected token. sed '$d' drops the last line; the shared helper strips
+  # trailing newlines on its side, mirroring how the marker was minted.
+  EXPECTED_TOKEN="$(printf '%s' "$PLAN" | sed '$d' | bash "$HELPER" digest 2>/dev/null || true)"
+  if [ -n "$EXPECTED_TOKEN" ] && [ "$EXPECTED_TOKEN" = "$SUBMITTED_TOKEN" ]; then
+    jq -n --arg reason "Codex plan review marker valid for this exact plan body — allowing ExitPlanMode." \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",permissionDecisionReason:$reason}}'
     exit 0
   fi
 fi
 
-# Otherwise: stash the plan for the slash command and block ExitPlanMode.
+# No valid marker → stash the plan for the slash command (a plain hook-process
+# write — NOT gated by plan mode) and block ExitPlanMode.
+mkdir -p ./.plan-review
+PENDING=./.plan-review/yoplan-pending.md
 printf '%s' "$PLAN" > "$PENDING"
 
-REASON="$(cat <<EOF
+# Feed the heredoc straight into jq (jq -Rs reads raw stdin as one string `.`).
+# This avoids a heredoc nested inside $(...) command substitution, which macOS's
+# stock bash 3.2 misparses (executes the body as commands at runtime — bash -n
+# does not catch it).
+jq -Rs \
+  '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:.}}' \
+<<'EOF'
 ExitPlanMode is blocked by plan-guardian's codex review gate.
 
-This plan has not yet been reviewed by Codex (or the plan was revised after the
-last review). Before exiting plan mode, run the slash command:
+This plan carries no valid Codex-review marker (it was never reviewed, or it was
+revised after the last review — the marker is bound to the plan's content). Before
+exiting plan mode, run the slash command:
 
     /plan-guardian:codex-plan-review
 
 It will:
-  1. Read the plan from ./.plan-review/yoplan-pending.md (just written by this hook).
+  1. Take the plan from context (also stashed at ./.plan-review/yoplan-pending.md).
   2. Loop "codex exec" review against the plan until Codex emits NO_CONCERNS.
-  3. Revise the plan in-place based on each round's findings.
-  4. Write ./.plan-review/.codex-review-done with the sha256 of the converged plan.
+  3. Revise the plan in context based on each round's findings.
+  4. Append an inline marker line to the converged plan:
+         <!-- codex-reviewed:<token> -->
+     (No files are written during plan mode — the proof rides inside the plan.)
 
-After convergence, re-call ExitPlanMode with the (possibly revised) plan from
-./.plan-review/yoplan-pending.md — this hook will see the matching sentinel and
-allow the call to go through.
+After convergence, re-call ExitPlanMode with the marked plan exactly as the
+command produced it — this hook will recompute the token, see it match, and
+allow the call through.
 
-Opt-out: set environment variable CODEX_PLAN_REVIEW=0 to bypass this gate entirely
-(the slash command will also self-skip). Codex CLI missing → hook is a silent no-op.
+Content-binding: set CODEX_REVIEW_SECRET in your environment to make the marker a
+keyed digest of the plan body (revising the plan then re-arms the gate). Without
+it, the gate still works but the marker is a fixed literal (spoofable) — fine for
+a single-user setup.
 
-Plan hash (for debugging): ${PLAN_HASH}
+Opt-out: set CODEX_PLAN_REVIEW=0 to bypass this gate entirely (the slash command
+self-skips too). Codex CLI / jq missing → hook is a silent no-op.
 EOF
-)"
-
-jq -n --arg reason "$REASON" \
-  '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'

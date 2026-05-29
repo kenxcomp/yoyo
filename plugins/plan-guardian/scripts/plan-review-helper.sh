@@ -1,32 +1,40 @@
 #!/bin/bash
-# plan-review-helper.sh — pre-approvable filesystem touchpoints for the codex
-# plan-review loop.
+# plan-review-helper.sh — single source of truth for the codex plan-review
+# "reviewed" marker digest.
 #
-# Why this exists: the loop runs while the session is STILL in plan mode, where
-# Write/Edit/Bash are gated exactly like default mode (they prompt). Most writes
-# are plain Edit/Write into ./.plan-review/** (silenced by a single Edit/Write
-# allow rule). The two awkward ones are a `mkdir` and the sentinel write, which
-# is a `printf | shasum | awk > file` pipe — and piped Bash rules are fragile to
-# allow precisely. Consolidating both into this one absolute-path script lets
-# /plan-guardian:setup pre-approve them with a single, stable Bash() rule, the
-# same pattern already used for inject-skill.sh.
+# Why this exists (v1.5.0, marker gate): the codex review loop runs while the
+# session is STILL in plan mode, where Write/Edit/Bash are gated exactly like
+# default mode (they prompt) — and on some Claude Code versions the allow-list
+# intermittently fails to suppress Write/Edit prompts under mode toggles. So the
+# v1.5.0 gate writes NO state files during plan mode. The "this plan was
+# reviewed" signal lives INLINE in the plan text (an HTML-comment marker on the
+# last line), which travels to the ExitPlanMode hook through tool_input.plan —
+# the in-memory channel, not the filesystem.
 #
-# Subcommands:
-#   init              mkdir -p ./.plan-review/codex-rounds
-#   sentinel <file>   write ./.plan-review/.codex-review-done = sha256 of <file>,
-#                     using the EXACT normalization codex-plan-review-trigger.sh
-#                     uses (printf '%s' "$(cat <file>)" — trailing newlines
-#                     stripped by command substitution), so the hook's hash
-#                     comparison matches byte-for-byte.
+# The marker is a keyed digest of the plan body so it is content-bound: revise
+# the plan and the marker no longer validates, re-arming the gate automatically.
+# (This is a secret-keyed SHA-256, not RFC-2104 HMAC — sufficient for this
+# threat model: a single local user, preventing accidental stale-plan reuse and
+# casual forgery, not defeating a cryptographic adversary.)
 #
-# All paths are relative to the current working directory (the project root),
-# matching codex-plan-review-trigger.sh.
+# Both the slash command (to MINT a marker on convergence) and the hook (to
+# VERIFY one on ExitPlanMode) call this one subcommand, so the algorithm can
+# never drift between mint and verify.
+#
+# Subcommand:
+#   digest    Read the plan BODY (no marker line) from stdin, print the marker
+#             token to stdout (no trailing newline). With CODEX_REVIEW_SECRET
+#             set:        h1:<sha256 hex>      (content-bound)
+#             Without it:  l1:none             (literal fallback — works, but
+#                                               spoofable / not content-bound).
+#
+# The body is read via body="$(cat)", which strips trailing newlines exactly the
+# way the hook's reconstruction does, so mint-side and verify-side normalization
+# cancel and the comparison is byte-for-byte.
 
 set -euo pipefail
 
-# Same hash function shape as the hook. Reads stdin; macOS/Linux portable. The
-# digest value is independent of which binary computes it, so the shasum vs
-# sha256sum fallback never breaks the hook<->sentinel match.
+# macOS/Linux portable sha256 over stdin -> bare hex.
 sha256() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 | awk '{print $1}'
@@ -40,20 +48,18 @@ sha256() {
 cmd="${1:-}"
 
 case "$cmd" in
-  init)
-    mkdir -p ./.plan-review/codex-rounds
-    ;;
-  sentinel)
-    plan_file="${2:-}"
-    if [ -z "$plan_file" ] || [ ! -f "$plan_file" ]; then
-      echo "plan-review-helper: 'sentinel' requires an existing plan file path" >&2
-      exit 1
+  digest)
+    body="$(cat)"                       # trailing newlines stripped here
+    secret="${CODEX_REVIEW_SECRET:-}"
+    if [ -n "$secret" ]; then
+      hex="$(printf '%s\n%s' "$secret" "$body" | sha256)"
+      printf 'h1:%s' "$hex"
+    else
+      printf 'l1:none'
     fi
-    mkdir -p ./.plan-review
-    printf '%s' "$(cat "$plan_file")" | sha256 > ./.plan-review/.codex-review-done
     ;;
   *)
-    echo "plan-review-helper: unknown subcommand '${cmd}' (expected: init | sentinel <file>)" >&2
+    echo "plan-review-helper: unknown subcommand '${cmd}' (expected: digest)" >&2
     exit 1
     ;;
 esac
