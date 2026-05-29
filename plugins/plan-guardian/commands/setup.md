@@ -101,16 +101,16 @@ Only the **missing** rules are appended, preserving the existing order — no re
 
 Print the `MISSING` array and tell them to add the entries to `permissions.allow` in `~/.claude/settings.json` (or via the `/permissions` UI). They take effect on the next session, or immediately after `/permissions` reload.
 
-## Step 4 — (Optional) content-binding secret
+## Step 4 — (Optional) signing key for the marker
 
-The marker is content-bound only when `CODEX_REVIEW_SECRET` is set — then revising the plan invalidates the marker and re-arms the gate. Without it, the marker is a fixed literal (`l1:none`): the gate still works, but a plan ending in that literal marker would pass without review (spoofable). For a single-user setup that's usually fine.
+**You usually don't need to do anything here (v1.5.1).** The marker is content-bound **by default**: the helper auto-generates a per-machine key at `~/.claude/plan-guardian/secret` (mode 600) on first use, so revising a reviewed plan invalidates its marker and re-arms the gate — no setup. The literal fallback (`l1:none`, spoofable) only appears if no key can be established at all (unwritable `HOME` and no random source).
 
-To enable content-binding, the user sets the env var so **both** the hook and the slash command see it (same shell environment Claude Code launches in). Two options — do **not** write either without explicit confirmation:
+Set `CODEX_REVIEW_SECRET` only if you want to **override** that auto key — e.g. share one key across machines, scope it per-project, or keep the key out of `~/.claude/`. It must be visible to **both** the hook and the slash command (same shell environment Claude Code launches in). Do **not** write either without explicit confirmation:
 
-- Shell profile (applies to every Claude Code session): add `export CODEX_REVIEW_SECRET="<random string>"` to `~/.config/fish/config.fish` (fish: `set -gx CODEX_REVIEW_SECRET "<random>"`) or `~/.zshrc` / `~/.bashrc`.
-- Claude Code settings env (project or user): add `"env": { "CODEX_REVIEW_SECRET": "<random>" }` to `settings.json`.
+- Shell profile (every Claude Code session): fish → `set -gx CODEX_REVIEW_SECRET "<random>"` in `~/.config/fish/config.fish` (or `set -Ux ...` once); bash/zsh → `export CODEX_REVIEW_SECRET="<random>"`.
+- Claude Code settings env: add `"env": { "CODEX_REVIEW_SECRET": "<random>" }` to `settings.json`.
 
-Mention this as optional; the gate is fully functional without it.
+(`CODEX_REVIEW_SECRET_FILE` can also point the auto key file elsewhere.) Mention this as optional; content-binding already works out of the box.
 
 ## Step 5 — Verify
 

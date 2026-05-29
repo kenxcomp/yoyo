@@ -147,7 +147,7 @@ TOKEN="$(printf '%s' "<final PLAN_BODY, no trailing marker>" \
 echo "$TOKEN"
 ```
 
-`TOKEN` is `h1:<sha256 hex>` when `CODEX_REVIEW_SECRET` is set (content-bound), or `l1:none` when it isn't (literal fallback — still works, just spoofable). Both the command and the hook read the same env var, so they agree.
+`TOKEN` is `h1:<sha256 hex>` whenever a signing key is in effect (content-bound). The helper resolves the key in priority order (v1.5.1): `$CODEX_REVIEW_SECRET` if set, else a per-machine auto key file at `~/.claude/plan-guardian/secret` (generated on first use) — so the marker is content-bound **by default, no setup**. Only if no key can be established (unwritable HOME and no random source) does it return the literal `l1:none` (spoofable). The command and the hook both run this same helper, so they resolve the same key and agree.
 
 Then build the final plan text by appending the marker as the **last line**:
 
@@ -167,11 +167,11 @@ Print to the user, in Chinese:
    - 注意:标记绑定计划内容;一旦再修改计划正文,标记失效,ExitPlanMode 会被重新拦截。
 ```
 
-If `CODEX_REVIEW_SECRET` is unset, also note:
+Only in the rare literal-fallback case (token is `l1:none` — no key could be established), also note:
 
 ```
-   - 提示:当前未设置 CODEX_REVIEW_SECRET,标记为固定字面值(可被伪造,但单用户场景足够)。
-     若需内容绑定,设置该环境变量后重跑本命令。
+   - 提示:未能建立签名密钥(HOME 不可写且无随机源),标记退化为固定字面值(可被伪造)。
+     设置 CODEX_REVIEW_SECRET,或修复 ~/.claude 可写性以启用自动密钥文件,即可内容绑定。
 ```
 
 ## Step 4 — Hand control back

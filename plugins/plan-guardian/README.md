@@ -41,12 +41,15 @@ A Claude Code plugin that provides rigorous plan review capabilities. Claude aut
 
 ### The marker token
 
-The token is computed by one shared subcommand (`plan-review-helper.sh digest`) so the mint side (command) and verify side (hook) can never drift:
+The token is computed by one shared subcommand (`plan-review-helper.sh digest`) so the mint side (command) and verify side (hook) can never drift. The signing key is resolved in priority order (v1.5.1):
 
-- **`CODEX_REVIEW_SECRET` set** → `h1:<sha256(secret"\n"body)>` — **content-bound**. Revising the plan changes the body, invalidating the marker and re-arming the gate automatically. (A secret-keyed SHA-256, not RFC-2104 HMAC — sufficient for a single local user, not a cryptographic adversary.)
-- **`CODEX_REVIEW_SECRET` unset** → `l1:none` — a fixed literal. The gate still works, but any plan ending in that literal marker would pass without review (spoofable). Fine for single-user setups; set the secret if you want content-binding.
+1. **`$CODEX_REVIEW_SECRET`** if set — explicit per-user/per-project key.
+2. **Per-machine auto key file** `~/.claude/plan-guardian/secret` (overridable via `$CODEX_REVIEW_SECRET_FILE`) — generated `mode 600` on first use. This makes the marker **content-bound by default, no setup required** — every user gets the strong mode.
+3. **Literal fallback** `l1:none` — only when no key can be established (unwritable `HOME` and no random source). Spoofable; not content-bound.
 
-Both the hook and the command read the same env var, so they always agree.
+With a key in effect (cases 1–2), the token is `h1:<sha256(key"\n"body)>` — **content-bound**: revising the plan changes the body, invalidating the marker and re-arming the gate automatically. (A keyed SHA-256, not RFC-2104 HMAC — sufficient for a single local user, not a cryptographic adversary.)
+
+Both the hook and the command run this same helper, so they resolve the same key and always agree.
 
 ### Opt-out
 
@@ -130,6 +133,6 @@ The codex gate no longer uses a sentinel file or a `codex-rounds/` directory —
 - The `.plan-review/` directory is created in the project working directory (by the hook, for the fallback plan copy). Consider adding it to `.gitignore`.
 - The plan-reviewer agent uses `memory: user` for persistent learning across sessions.
 - The marker digest normalizes trailing newlines on both sides (mint and verify call the same `plan-review-helper.sh digest`), so byte-level equivalence is robust against editor-added trailing whitespace.
-- Set `CODEX_REVIEW_SECRET` to make the marker content-bound; without it the marker is a fixed literal (works, but spoofable).
+- The marker is content-bound by default (v1.5.1): the helper auto-generates a per-machine key at `~/.claude/plan-guardian/secret` on first use. Set `CODEX_REVIEW_SECRET` to override it; the literal fallback only appears if no key can be established.
 - Implementation note: the hook's deny-path heredoc is fed straight into `jq -Rs` rather than `$(cat <<'EOF')` — macOS's stock bash 3.2.57 misparses a quoted heredoc nested in `$(...)` at runtime (`bash -n` does not catch it).
-- Version: 1.5.0
+- Version: 1.5.1

@@ -21,9 +21,11 @@
 # plan invalidates the marker and re-arms the gate automatically.
 #
 # Marker token (computed by the SHARED plan-review-helper.sh digest subcommand,
-# so mint-side and verify-side can never drift):
-#   - CODEX_REVIEW_SECRET set   → h1:<sha256(secret"\n"body)>   (content-bound)
-#   - CODEX_REVIEW_SECRET unset → l1:none                       (literal fallback)
+# so mint-side and verify-side can never drift). The signing key is resolved by
+# the helper in priority order (v1.5.1): $CODEX_REVIEW_SECRET, else a per-machine
+# auto key file (~/.claude/plan-guardian/secret, created on first use), else none:
+#   - key in effect (env or file) → h1:<sha256(key"\n"body)>   (content-bound)
+#   - no key obtainable           → l1:none                    (literal fallback)
 #
 # Opt-out: CODEX_PLAN_REVIEW=0 in env → hook is a no-op (silent allow).
 #
@@ -116,10 +118,12 @@ After convergence, re-call ExitPlanMode with the marked plan exactly as the
 command produced it — this hook will recompute the token, see it match, and
 allow the call through.
 
-Content-binding: set CODEX_REVIEW_SECRET in your environment to make the marker a
-keyed digest of the plan body (revising the plan then re-arms the gate). Without
-it, the gate still works but the marker is a fixed literal (spoofable) — fine for
-a single-user setup.
+Content-binding (v1.5.1): the marker is a keyed digest of the plan body by
+default — the helper auto-generates a per-machine key at
+~/.claude/plan-guardian/secret on first use, so revising the plan re-arms the
+gate with no setup. Set CODEX_REVIEW_SECRET to override that key explicitly. Only
+if no key can be established (unwritable HOME and no random source) does the
+marker fall back to a fixed literal (spoofable).
 
 Opt-out: set CODEX_PLAN_REVIEW=0 to bypass this gate entirely (the slash command
 self-skips too). Codex CLI / jq missing → hook is a silent no-op.
