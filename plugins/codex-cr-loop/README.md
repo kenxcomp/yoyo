@@ -7,7 +7,7 @@ The three commands share the entire review-loop body — P3 skip filter, file-fa
 | Command | After convergence |
 |---|---|
 | `/cr-loop` | **Stops.** No push, no PR, no merge. The user takes whatever next action they want. |
-| `/cr-loop-pr` | **Pushes** the feature branch to `${CR_PR_REMOTE:-origin}` and **opens a PR** against `${CR_PR_BASE:-main}` (or appends commits to an existing PR). Prefers the Codex GitHub connector for PR operations; `gh` is only a fallback. |
+| `/cr-loop-pr` | **Pushes** the feature branch to `${CR_PR_REMOTE:-origin}` and **opens a PR** against `${CR_PR_BASE:-main}` (or appends commits to an existing PR). Requires `gh` CLI authenticated. |
 | `/cr-loop-merge` | **Merges** the feature branch into the local `${CR_MERGE_TARGET:-main}`. No push. Worktree-aware (handles target locked in another worktree by fast-forwarding via local refspec push when possible). |
 
 ## Requirements
@@ -15,7 +15,7 @@ The three commands share the entire review-loop body — P3 skip filter, file-fa
 - The [`openai-codex`](https://claude.com/claude-code/plugins) plugin must be installed (provides `/codex:review` and the `codex-companion.mjs` script the loop drives).
 - `git` available; clean working tree before invocation (the loop will abort if dirty).
 - The feature branch must be built on top of its base (rebased), or the loop stops at preflight and asks you to rebase first — see [Base-currency gate](#base-currency-gate-v150).
-- For `/cr-loop-pr`: the Codex GitHub connector (`@github`) should be available for PR discovery/creation. `gh` CLI authentication is useful as a fallback, but is not required when the connector can create the PR.
+- For `/cr-loop-pr`: `gh` CLI installed and authenticated (`gh auth status`).
 
 ## Usage
 
@@ -58,7 +58,7 @@ See each command file for the full procedure, guardrails, and handoff-file seman
 
 ## Why three commands instead of one with flags
 
-Each command's contract is unambiguous: `/cr-loop-merge` will *never* push to remote; `/cr-loop-pr` will *always* end with a PR URL or a deferred handoff explaining why one wasn't created; `/cr-loop` will *never* touch any branch other than the one you started on. A single command with `--push` / `--pr` / `--merge` flags was rejected because the failure modes (push deferred, PR target moved, target locked in another worktree, PR tooling unavailable) compound nontrivially and a flag-driven variant of one command would obscure which post-convergence step is actually authoritative.
+Each command's contract is unambiguous: `/cr-loop-merge` will *never* push to remote; `/cr-loop-pr` will *always* end with a PR URL or a deferred handoff explaining why one wasn't created; `/cr-loop` will *never* touch any branch other than the one you started on. A single command with `--push` / `--pr` / `--merge` flags was rejected because the failure modes (push deferred, PR target moved, target locked in another worktree, gh unauthenticated) compound nontrivially and a flag-driven variant of one command would obscure which post-convergence step is actually authoritative.
 
 ## Base-currency gate (v1.5.0)
 

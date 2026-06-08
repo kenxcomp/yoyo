@@ -66,7 +66,7 @@ Read these once during preflight; defaults shown:
 - `CR_LOOP_REQUIRE_REBASED=1` — when `1` (default), preflight **hard-stops** if the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD` — the branch forked before the current `BASE`). The loop won't review/push against a stale base: it confirms with the user (rebase first / abort) and stops without entering a round. Set to `0` to skip the gate — for deliberately reviewing against an older base, or a repo where this comparison doesn't apply.
 - `CR_PR_BASE=` — the remote branch the PR targets (`origin/<base>`). **Unset by default → auto-detected** to the repo's default branch (`main` / `master` / any; see step 1 — local ref read, no network). Set it to target a differently-named integration branch (e.g., `develop`, `trunk`).
 - `CR_PR_REMOTE=origin` — the git remote the feature branch is pushed to and the PR is opened against. Override for forks (`upstream`) or self-hosted setups.
-- `CR_PR_DRAFT=0` — when `1`, the PR is opened as a draft. Useful for staging a review without inviting merge yet.
+- `CR_PR_DRAFT=0` — when `1`, the PR is opened with `--draft`. Useful for staging a review without inviting merge yet.
 - `CR_PR_TITLE=` — when non-empty, used verbatim as the PR title (skips auto-derivation from the most recent commit subject). Truncated to 70 chars.
 
 No per-round timeout — Codex review duration scales with diff size and reviewer model output, and a large refactor's review can legitimately take 15+ minutes. The loop blocks on the foreground reviewer until it returns or the user manually cancels (`/codex:cancel`).
@@ -90,9 +90,9 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
      fi
      BASE="${ARGUMENTS:-$REMOTE/$CR_PR_BASE}"
      ```
-     `git symbolic-ref refs/remotes/$REMOTE/HEAD` reads the remote's advertised default from the local ref set at clone time — **no fetch**; if unset, fall back to probing `$REMOTE/main` then `$REMOTE/master`, then last-resort `main`. **From here on `CR_PR_BASE` holds this resolved value**, so every later `${CR_PR_BASE:-main}` in this command (the fetch, step 8(d)/(e), connector PR creation, or `gh` fallback) evaluates to it — the literal `main` fallback is never reached once `CR_PR_BASE` is set. Set `CR_PR_BASE` (or pass `$ARGUMENTS`) explicitly to target a non-default integration branch (e.g. `develop`).
-   - **Resolve PR creation capability.** Prefer the Codex GitHub connector (`@github`) for PR discovery and creation. If connector tools are available, record `PR_TOOL=github-connector` and do **not** require `gh` authentication. If the connector is unavailable, fall back to `gh`: verify `command -v gh` and `gh auth status`, then record `PR_TOOL=gh`. If neither connector access nor authenticated `gh` is available, abort with `PR tooling unavailable — connect @github or run gh auth login`.
-   - Refresh the review base: `git fetch "${CR_PR_REMOTE:-origin}" "${CR_PR_BASE:-main}" --quiet`. Without this, a stale `origin/main` ref produces noisy "fixed in main, you missed it" findings. Abort if fetch fails (offline / unreachable remote / wrong remote name) — the review base would be stale and PR creation would fail downstream anyway.
+     `git symbolic-ref refs/remotes/$REMOTE/HEAD` reads the remote's advertised default from the local ref set at clone time — **no fetch**; if unset, fall back to probing `$REMOTE/main` then `$REMOTE/master`, then last-resort `main`. **From here on `CR_PR_BASE` holds this resolved value**, so every later `${CR_PR_BASE:-main}` in this command (the fetch, step 8(d)/(e), `gh pr list/create --base`) evaluates to it — the literal `main` fallback is never reached once `CR_PR_BASE` is set. Set `CR_PR_BASE` (or pass `$ARGUMENTS`) explicitly to target a non-default integration branch (e.g. `develop`).
+   - Verify the `gh` CLI is installed (`command -v gh`) and authenticated (`gh auth status`). If missing, abort with `gh CLI not installed — install via brew install gh and re-authenticate via gh auth login`. If unauthenticated, abort with `gh CLI not authenticated — run gh auth login`.
+   - Refresh the review base: `git fetch "${CR_PR_REMOTE:-origin}" "${CR_PR_BASE:-main}" --quiet`. Without this, a stale `origin/main` ref produces noisy "fixed in main, you missed it" findings. Abort if fetch fails (offline / unreachable remote / wrong remote name) — the review base would be stale and `gh pr create` would fail downstream anyway.
    - `git status --short` — working tree must be clean. If dirty, commit or stash before starting; otherwise the diff will include unrelated noise and reviewer findings won't map to commits cleanly.
    - Record the starting commit: `START=$(git rev-parse HEAD)`.
    - Capture the feature branch: `FEATURE_BRANCH=$(git branch --show-current)`. Abort if empty (detached HEAD — there's no branch to push or PR).
@@ -240,9 +240,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
      - **Pre-push hook failure**: defer. Surface the hook output. Do NOT bypass with `--no-verify`.
      - **Push rejected (non-fast-forward)**: defer with `PR status: deferred — non-fast-forward push (someone else pushed to ${CR_PR_REMOTE:-origin}/$FEATURE_BRANCH)`. Diagnostic: `git log --oneline "$UPSTREAM"..HEAD` (local) + `git log --oneline HEAD.."$UPSTREAM"` (remote). The user pulls / rebases manually + re-runs. **Never `--force` / `--force-with-lease`** — the user explicitly opted into a careful local-first flow by choosing this command.
 
-   - **Resolve GitHub repository identity.** Normalize `git remote get-url "${CR_PR_REMOTE:-origin}"` into `repository_full_name` (`owner/name`). Handle both `git@github.com:owner/name.git` and `https://github.com/owner/name.git`. If the remote cannot be mapped to GitHub and `PR_TOOL=github-connector`, defer with `PR status: deferred — GitHub connector cannot infer repository from remote`. If this is a fork or cross-repository PR where the head repository differs from the pushed remote, prefer the `gh` fallback because the connector path may not express the `owner:branch` head cleanly.
-
-   - **Detect existing PR.** After a successful push, prefer the GitHub connector when it exposes a list/search PR operation for the head branch and base branch. If the connector cannot list PRs in the current runtime, use authenticated `gh` as a fallback:
+   - **Detect existing PR.** After a successful push, query the remote for an open PR with this head branch:
      ```bash
      EXISTING_PR_URL=$(gh pr list \
          --head "$FEATURE_BRANCH" \
@@ -251,51 +249,36 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
          --json url \
          --jq '.[0].url' 2>/dev/null)
      ```
-     If an open PR is found: **do not create a duplicate**. The push has already updated the existing PR's commits — report the URL in step 9 and proceed to cleanup. If neither the connector nor authenticated `gh` can list PRs, continue to connector-based creation; if GitHub reports that a PR already exists, treat that as an existing-PR path when the response includes a URL, otherwise defer with the duplicate diagnostic.
+     If non-empty: a PR already exists. **Do NOT call `gh pr create`** (it would fail with `a pull request for branch "<branch>" into branch "<base>" already exists`). The push has already updated the existing PR's commits — report the URL in step 9 and proceed to cleanup.
 
-   - **Create PR (only when no existing PR was found).** Build title + body:
+   - **Create PR (only when no existing PR).** Build title + body:
      - **Title.** When `CR_PR_TITLE` is non-empty, use that verbatim (truncated to 70 chars). Otherwise derive from the feature branch's commits since `BASE`:
        - 1 commit → use that commit's subject (`git log -1 --format=%s "$BASE"..HEAD`).
        - >1 commits → use the most recent commit's subject (`git log -1 --format=%s HEAD`); the user can refine via `gh pr edit --title` after creation.
        - Truncate to 70 chars (drop trailing partial word, append `…` if cut).
-     - **Body**. Include the review-loop contract evidence, the exact tests run, and the Chinese business-impact summary. When using `gh`, write this to a temp file or heredoc — never inline `--body "$(echo ...)"`, embedded backticks / quotes will mis-parse:
+     - **Body** (HEREDOC — NEVER inline `--body "$(echo ...)"`, embedded backticks / quotes will mis-parse):
        ```bash
        PR_BODY=$(cat <<EOF
        ## Summary
 
        $(git log --reverse --format='- %s (%h)' "$BASE"..HEAD)
 
-       ## Tests run
+       ## Test plan
 
-       - <commands actually run during the loop>
+       - [ ] macOS build green: \`xcodebuild build -project Kenotex/Kenotex.xcodeproj -scheme Kenotex-macOS -destination 'platform=macOS,arch=arm64'\`
+       - [ ] iOS build green: \`xcodebuild build -project Kenotex/Kenotex.xcodeproj -scheme Kenotex-iOS -destination 'generic/platform=iOS'\`
+       - [ ] Test suite green: \`xcodebuild test -project Kenotex/Kenotex.xcodeproj -scheme Kenotex-macOS -destination 'platform=macOS,arch=arm64'\`
+       - [ ] swiftlint clean: \`swiftlint lint --config .swiftlint.yml\`
 
-       ## Commit range
+       ## Codex review
 
-       - Base: \`$BASE\`
-       - Head: \`$(git rev-parse HEAD)\`
-       - Range: \`$BASE..HEAD\`
+       Converged after $ROUND_NUM round(s) via \`/cr-loop-pr\`. Last two rounds returned no actionable findings.
 
-       ## Review-loop evidence
-
-       - Converged after $ROUND_NUM round(s) via \`/cr-loop-pr\`.
-       - Last two clean rounds reviewed the same HEAD: \`$LAST_REVIEWED_HEAD\`.
-       - No actionable P0/P1/P2/P3 findings remained after convergence.
-
-       ## Business impact
-
-       <Chinese business-impact summary from step 9b>
+       🤖 Generated with [Claude Code](https://claude.com/claude-code)
        EOF
        )
        ```
-     - **Open the PR via the GitHub connector when `PR_TOOL=github-connector`.** Call the connector's create-pull-request operation with:
-       - `repository_full_name` from the remote,
-       - `base_branch="${CR_PR_BASE:-main}"`,
-       - `head_branch="$FEATURE_BRANCH"`,
-       - `title="$PR_TITLE"`,
-       - `body="$PR_BODY"`,
-       - `draft=true` only when `CR_PR_DRAFT=1`.
-       Record the returned URL as `PR_URL`. If the connector returns an existing-PR / duplicate-head error with a URL, treat it as `updated existing <URL>`. If the connector fails for auth, permission, rate limit, or duplicate without URL, defer with the connector error.
-     - **Fallback to `gh pr create` only when the connector is unavailable or cannot express the repository/head combination.** Add `--draft` when `CR_PR_DRAFT=1`:
+     - Open the PR. Add `--draft` when `CR_PR_DRAFT=1`:
        ```bash
        PR_URL=$(gh pr create \
            --base "${CR_PR_BASE:-main}" \
@@ -304,7 +287,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
            --title "$PR_TITLE" \
            --body "$PR_BODY")
        ```
-     - **PR creation failure** (connector auth, network, missing repo permissions, API rate limit, duplicate without URL, etc.): defer with `PR status: deferred — PR creation failed: <stderr or connector error>`. The push already happened, so the next `/cr-loop-pr` invocation (after the user resolves the underlying issue) will detect the existing branch on the remote and either hit the existing-PR path or retry create cleanly.
+     - **`gh pr create` failure** (network, missing repo permissions, API rate limit, etc.): defer with `PR status: deferred — gh pr create failed: <stderr>`. The push already happened, so the next `/cr-loop-pr` invocation (after the user resolves the underlying issue) will detect the existing branch on the remote and either hit the existing-PR path or retry create cleanly.
 
    - **Cleanup after successful push + PR-open / PR-update**: delete any `.cr-loop-handoff-round-*.md` files at repo root via `rm -f` and include a one-line "Cleaned up N stale handoff file(s)" note in the report. The handoffs were recovery artifacts written by prior bail-outs; once the loop has converged + PR is up, they're obsolete and shouldn't litter the repo. If the PR step fails / is deferred, **do NOT delete** — the handoff still describes work-in-progress that the user needs.
 
@@ -320,8 +303,8 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
    - For round-cap: the per-round finding histogram (P0/P1/P2/P3 counts), commit list, advice on whether to raise the cap or restructure.
    - For head-drift: `git log --oneline "$REVIEWED_HEAD"..HEAD` + `git status -sb`.
    - For push-deferred: which precondition failed + its diagnostic + the exact manual command the user should run (e.g., `git pull --rebase ${CR_PR_REMOTE:-origin} $FEATURE_BRANCH` to resolve non-fast-forward).
-   - For pr-create-failed: the connector error or `gh pr create` stderr + a copy-pasteable retry. Prefer reconnecting `@github` and re-running `/cr-loop-pr`; if using CLI fallback, include `gh pr create --base main --head $FEATURE_BRANCH --title "..." --body-file -`.
-   - **Resume instructions** at the end: exact `/cr-loop-pr` re-invocation, plus any one-shot cleanup the user should do first (rebase / squash / widen scope / raise cap / reconnect `@github` / re-authenticate `gh`).
+   - For pr-create-failed: the `gh pr create` stderr + a copy-pasteable retry (`gh pr create --base main --head $FEATURE_BRANCH --title "..." --body-file -`).
+   - **Resume instructions** at the end: exact `/cr-loop-pr` re-invocation, plus any one-shot cleanup the user should do first (rebase / squash / widen scope / raise cap / re-authenticate gh).
    - The handoff is auto-deleted by step 8 after the next successful push + PR, so no manual cleanup line is needed.
 
    The handoff is a load-bearing signal: it survives session boundaries and lets a fresh agent (or the user days later) pick up exactly where the loop bailed. Never silently exit on a non-converged stop reason — always write the handoff first. **On a successful converge + push + PR, no handoff is written for THIS run, AND any pre-existing handoff files at repo root are deleted by step 8.**
@@ -345,7 +328,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 
 ## Guardrails
 
-- **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. Push and PR creation are also blocked while the guard is pending — interaction changes never reach the remote (or a human reviewer's queue) without explicit consent. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
+- **Interaction-logic guard (top priority, cannot be silenced).** Any fix that would change user-visible interaction behavior — gestures, dialog/menu/sheet types, keyboard shortcuts, accessibility actions, navigation flow, default actions on Return / primary-button / outside-tap — MUST be confirmed with the user before the commit lands (step 5a). The loop blocks on the user's reply; "no response" is not consent. This rule fires regardless of finding severity (a P0 that proposes an interaction change is still blocked), regardless of who proposed the change (Codex finding, your own analysis, widening sweep at step 4d), and there is no env override. The push + `gh pr create` is also blocked while the guard is pending — interaction changes never reach the remote (or a human reviewer's queue) without explicit consent. Pure correctness fixes inside an event handler that preserve the visible action→response contract proceed normally.
 - **Base-currency gate (preflight, hard by default).** The loop refuses to start when the feature branch isn't built on top of `BASE` (`BASE` is not an ancestor of `HEAD`) — it confirms with the user and stops (rebase first / abort), never auto-rebasing, never reviewing/pushing against a stale base. This catches a branch that *starts* stale; step 8(e) separately catches `${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}` moving *during* the loop. Disable with `CR_LOOP_REQUIRE_REBASED=0`. See **step 1**.
 - **Only push the feature branch.** Never `git push origin main` (or whatever `${CR_PR_BASE:-main}` resolves to). Merging the PR is the user's call (or a codeowner's, on a multi-dev project) — this command's contract ends at "PR open + reviewer-approved commits on the head branch".
 - **Never `--force` / `--force-with-lease` push.** A non-fast-forward rejection means someone else pushed; rebase / merge is the user's call. Force-pushing silently overwrites their work.
@@ -356,7 +339,7 @@ These are advisory escape valves, not silencers. Each one writes a handoff and s
 - **Round budget is uncapped by default** (`CR_LOOP_ROUND_CAP` is opt-in, unset by default). The loop stops on convergence, the file-family widening guard, head-drift, widening-sweeps-exhausted, or manual cancel — not on a default round count. If you're past ~15 rounds and still dirty, the widening guard (`CR_LOOP_WIDEN_AFTER`, default 5) should already have fired (either auto-sweeping or handing off); if it hasn't (genuinely shifting bug surface), token spend grows linearly with rounds, so consider squash + reorganize or splitting the work into multiple PRs. Set `CR_LOOP_ROUND_CAP=N` when you want an explicit ceiling for the run.
 - **Keep the user informed between rounds** with one-line status. Always include both streaks: "Round N: M findings (Pn×a, Pn×b), DIRTY_STREAK=k/<CR_LOOP_WIDEN_AFTER>, applying fixes." On a clean round, include the clean streak: "Round N: clean (CLEAN_STREAK=1/2, running confirmation round)" or "Round N: clean (CLEAN_STREAK=2/2, pushing + opening PR against ${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main})".
 - **Don't `ScheduleWakeup` while waiting for a round.** Use `Monitor` against the codex companion PID (or block on the foreground bash). Wakeup-stacking creates redundant `/cr-loop-pr` re-entries that confuse state and waste tokens.
-- **GitHub connector is preferred for PR creation.** After the branch is pushed, use `@github` / the Codex GitHub connector to create or find the PR so `gh` token drift does not block the flow. Use authenticated `gh` only as a fallback when the connector is unavailable or cannot express the repository/head combination. Never fall back to just printing the browser "new pull request" URL — the title/body/draft state would be inconsistent with this command's contract.
+- **`gh` is required.** Don't fall back to opening the PR via `git push` + browser URL — the title/body/draft state would be inconsistent with what this command's contract says it produces. If `gh` is missing, abort at preflight.
 
 ## Why --wait (foreground) not --background
 
@@ -367,7 +350,7 @@ The loop is sequential by design — each round's diff depends on the previous r
 This command is a fork of `/cr-loop-merge` with two behavioral changes:
 
 1. **Default base is `origin/<default branch>` (matching `/cr-loop`), not local `main`.** The base is auto-detected (`main` / `master` / any; see step 1). The PR's diff is what reviewers will see (`origin/<base>..HEAD`); reviewing against the same base keeps Codex findings aligned with reviewer expectations.
-2. **After convergence, push the feature branch and open a PR against `origin/${CR_PR_BASE:-main}` instead of merging into local `${CR_MERGE_TARGET:-main}`.** No local branch checkout, no merge commit, no remote integration-branch push. PR creation prefers the Codex GitHub connector and uses `gh` only as a fallback. If a PR already exists for this head branch, the push appends commits to it and the existing PR's URL is reported (no duplicate PR is created). The current worktree is preserved after PR creation so the user can keep iterating — manual `git worktree remove` is the user's call after the PR is merged on the remote.
+2. **After convergence, push the feature branch and open a PR against `origin/${CR_PR_BASE:-main}` instead of merging into local `${CR_MERGE_TARGET:-main}`.** No local branch checkout, no merge commit, no remote integration-branch push. If a PR already exists for this head branch, the push appends commits to it and the existing PR's URL is reported (no duplicate PR is created). The current worktree is preserved after PR creation so the user can keep iterating — manual `git worktree remove` is the user's call after the PR is merged on the remote.
 
 Everything else — the review loop semantics, P3 skip filter, file-family widening guard, **auto-widening sweep** with `CR_LOOP_MAX_WIDENING_SWEEPS` budget, round cap, head-drift detection, handoff file format — is identical.
 

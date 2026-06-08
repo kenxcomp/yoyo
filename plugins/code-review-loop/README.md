@@ -5,7 +5,7 @@ Codex-native review-loop skills modeled after yoyo's Claude Code `codex-cr-loop`
 The plugin provides three entry points:
 
 - `code-review-loop`: review, fix, test, commit, and stop after two consecutive clean rounds.
-- `code-review-loop-pr`: same convergence loop, then push the current feature branch and create or update a pull request.
+- `code-review-loop-pr`: same convergence loop, then push the current feature branch and create or update a pull request. PR creation prefers the Codex GitHub connector (`@github`); authenticated `gh` is only a fallback.
 - `code-review-loop-merge`: same convergence loop, then merge the reviewed feature branch into a local target branch without pushing.
 
 Each skill uses the local `code-reviewer` skill as its review rubric when available at `/Users/kennethx/.codex/skills/code-reviewer/SKILL.md`. A round is clean only when no Critical, High, Medium, or Low findings remain. Nit-only findings are treated as clean unless the user asks for strict mode.

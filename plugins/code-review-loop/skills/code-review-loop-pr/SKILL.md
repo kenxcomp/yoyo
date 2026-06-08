@@ -36,7 +36,7 @@ After convergence, all of these must hold before pushing:
 - current branch is not the PR target,
 - push range is contained in the reviewed range,
 - remote PR target has not moved beyond the reviewed base during the loop,
-- `gh` is installed and authenticated.
+- PR creation tooling is available: prefer the Codex GitHub connector (`@github`) for PR discovery/creation; use authenticated `gh` only as a fallback when the connector is unavailable or cannot express the repository/head combination.
 
 If any precondition fails, do not push. Write a handoff with `PR status: deferred - <reason>` and include exact manual recovery steps.
 
@@ -52,6 +52,8 @@ If any precondition fails, do not push. Write a handoff with `PR status: deferre
 ## Pull Request Rules
 
 - After a successful push, first check whether an open PR already exists for the head branch and target base.
+- Prefer the GitHub connector for PR discovery and creation. Derive `repository_full_name` from the pushed remote URL (`git@github.com:owner/repo.git` or `https://github.com/owner/repo.git`), then call the connector's pull-request creation tool with `repository_full_name`, `base_branch`, `head_branch`, `title`, `body`, and `draft`.
+- Use `gh pr list` / `gh pr create` only as a fallback when the connector is unavailable, cannot list existing PRs, or cannot express the repository/head combination.
 - If an open PR exists, report its URL and do not create a duplicate.
 - If no PR exists, create one with a concise title and a body containing:
   - summary,
@@ -59,6 +61,7 @@ If any precondition fails, do not push. Write a handoff with `PR status: deferre
   - commit range,
   - review-loop evidence,
   - Chinese business-impact summary.
+- If connector creation reports an existing/duplicate PR with a URL, treat it as the existing-PR path. If it reports a duplicate without a URL, defer with the exact diagnostic instead of creating another PR.
 - Respect draft mode.
 
 ## Final Report
