@@ -1,0 +1,36 @@
+{
+  "name": "code-review-loop",
+  "version": "0.1.0",
+  "description": "Codex-native two-clean-round code review loops with optional PR or local merge follow-up.",
+  "author": {
+    "name": "Kenneth Xu",
+    "url": "https://github.com/kenxcomp"
+  },
+  "repository": "https://github.com/kenxcomp/yoyo",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "code-review",
+    "review-loop",
+    "pull-request",
+    "merge"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Code Review Loop",
+    "shortDescription": "Review, fix, test, and require two clean rounds before integration.",
+    "longDescription": "Codex-native review loop skills that use the local code-reviewer rubric to inspect a branch, fix actionable findings, verify changes, commit fixes, and require two consecutive clean review rounds before stopping, opening a pull request, or merging locally.",
+    "developerName": "Kenneth Xu",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Review",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run code-review-loop against origin/main.",
+      "Run code-review-loop-pr and open a PR.",
+      "Run code-review-loop-merge into local main."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

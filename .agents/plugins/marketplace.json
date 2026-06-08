@@ -1,0 +1,20 @@
+{
+  "name": "yoyo",
+  "interface": {
+    "displayName": "Yoyo"
+  },
+  "plugins": [
+    {
+      "name": "code-review-loop",
+      "source": {
+        "source": "local",
+        "path": "./plugins/code-review-loop"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
