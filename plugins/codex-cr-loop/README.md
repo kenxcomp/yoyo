@@ -7,7 +7,7 @@ The three commands share the entire review-loop body — P3 skip filter, file-fa
 | Command | After convergence |
 |---|---|
 | `/cr-loop` | **Stops.** No push, no PR, no merge. The user takes whatever next action they want. |
-| `/cr-loop-pr` | **Pushes** the feature branch to `${CR_PR_REMOTE:-origin}` and **opens a PR** against `${CR_PR_BASE:-main}` (or appends commits to an existing PR). Requires `gh` CLI authenticated. |
+| `/cr-loop-pr` | **Auto-rebases** onto the latest `${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}` (default ON) and re-confirms with one review round, then **pushes** the feature branch and **opens a PR** against `${CR_PR_BASE:-main}` (or appends commits to an existing PR). Requires `gh` CLI authenticated. |
 | `/cr-loop-merge` | **Merges** the feature branch into the local `${CR_MERGE_TARGET:-main}`. No push. Worktree-aware (handles target locked in another worktree by fast-forwarding via local refspec push when possible). |
 
 ## Requirements
@@ -53,6 +53,7 @@ All three commands honor:
 
 - `CR_PR_BASE=` (unset → auto-detected default branch), `CR_PR_REMOTE=origin` — PR target.
 - `CR_PR_DRAFT=0`, `CR_PR_TITLE=` — PR open options.
+- `CR_PR_AUTO_REBASE=1` — auto fetch + rebase onto the PR base after convergence and before opening the PR (default ON; `0` = defer instead). See [Auto-rebase before PR](#auto-rebase-before-pr-v160).
 
 See each command file for the full procedure, guardrails, and handoff-file semantics.
 
@@ -81,9 +82,21 @@ The gate is **intentionally hard**: there is no "review anyway" option, and "no 
 | `/cr-loop-pr` | `${CR_PR_REMOTE:-origin}/$CR_PR_BASE` (auto-detected, freshly fetched) | `git rebase "$BASE"` | fetch only |
 | `/cr-loop-merge` | local `$CR_MERGE_TARGET` (auto-detected) | `git rebase "$BASE"` | **none** |
 
-For `/cr-loop-pr` this is distinct from step 8(e), which catches the remote base moving *during* the loop; the preflight gate catches a branch that *starts* stale.
+For `/cr-loop-pr` this is distinct from step 8.0 (auto-rebase, default ON) and step 8(e), which handle the remote base moving *during* the loop; the preflight gate catches a branch that *starts* stale and never auto-rebases.
 
 Set `CR_LOOP_REQUIRE_REBASED=0` to skip the gate entirely — for deliberately reviewing against an older base, or a repo where the comparison doesn't apply.
+
+## Auto-rebase before PR (v1.6.0)
+
+`/cr-loop-pr` only. The loop converges against the PR base as it stood at preflight, but `origin/<base>` can advance while a multi-round review runs (minutes to 15+ each). Opening the PR anyway means its diff (`origin/<base>..HEAD`) sits on a stale base — conflicts, or commits a reviewer never saw. So **after convergence and before the push** (step 8.0), `/cr-loop-pr`:
+
+1. Re-fetches `${CR_PR_REMOTE:-origin}/${CR_PR_BASE:-main}` — this is the fetch that makes the staleness check real (the preflight fetch is stale by now).
+2. If the base **didn't move**, proceeds straight to push + PR — the common case costs only the fetch.
+3. If the base **advanced**, rebases the feature branch onto the fresh tip, then runs **one confirmation review round** against it. Clean → push + PR. Dirty → the new base exposed a real issue: fix it and drop back into the full loop until it re-converges.
+
+Conflicts during the rebase are **never auto-resolved** — the loop `git rebase --abort`s and hands off with the conflicting-file list + manual remedy. When a PR **already exists** (the branch was pushed before), the rebase rewrites history, so the update needs `--force-with-lease`; the loop **blocks for explicit user confirmation** before that push (via the [`form-base`](../form-base/) radio when loaded, inline A/B otherwise) and never uses a bare `--force`. "No response" is never consent.
+
+Set `CR_PR_AUTO_REBASE=0` to restore the v1.5.0 behavior: step 8's precondition (e) **defers** (handoff + manual-rebase instructions) when the base moved, instead of rebasing for you. The preflight [Base-currency gate](#base-currency-gate-v150) (which catches a branch that *starts* stale) is unchanged and still never auto-rebases — `CR_PR_AUTO_REBASE` governs only the post-convergence, pre-PR point.
 
 ## Interaction-logic guard (v1.3.0+)
 
@@ -111,7 +124,7 @@ The final report from each of the three commands **always** ends with a Chinese 
 
 ## Safety guarantees
 
-- `--no-verify`, `--force`, `--force-with-lease` are forbidden in all three commands.
+- `--no-verify` and bare `--force` are forbidden in all three commands. The only history-rewriting push is `/cr-loop-pr`'s step 8.0 path: after an auto-rebase, updating an *existing* PR uses `--force-with-lease` (concurrent-push-safe) and only after explicit user confirmation. `/cr-loop` and `/cr-loop-merge` never force-push at all.
 - Pre-commit / pre-push hook failures defer to the user with the hook output surfaced; the loop never bypasses them.
 - The post-review HEAD-drift check refuses to classify any round whose HEAD moved during review (catches concurrent agents / auto-commit hooks).
 - The **interaction-logic guard** (see section above) blocks any commit that would change user-visible interaction behavior until the user has explicitly chosen an option. No severity level can override it.
