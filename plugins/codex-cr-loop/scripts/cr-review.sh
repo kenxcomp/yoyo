@@ -20,6 +20,8 @@
 #   cancel [ROUND_DIR]           stop a running round (only its own PIDs)
 #   reset                        archive this branch's state + ledger (fresh start)
 #   paths                        print STATE_DIR / LEDGER / STATE
+#   tree-clean                   exit 0 iff the working tree is clean, ignoring only untracked
+#                                repo-root .cr-loop-handoff-round-<N>.md files (preflight + completion)
 #
 # State lives outside the working tree:
 #   $(git rev-parse --git-common-dir)/cr-loop/<branch-key>/{state,ledger.md,rounds/}
@@ -52,9 +54,14 @@ resolve_paths() {
   BRANCH=$(git branch --show-current 2>/dev/null)
   [ -n "$BRANCH" ] || die "detached HEAD — check out a branch first"
   ROOT=$(git rev-parse --show-toplevel)
-  common=$(git rev-parse --git-common-dir)
-  case "$common" in /*) ;; *) common="$ROOT/$common" ;; esac
-  # In a linked worktree --git-common-dir is already absolute; normalize either way.
+  # --git-common-dir is relative to the *current directory* (not the top level)
+  # when git prints it relative; ask for an absolute path (git >= 2.31) and fall
+  # back to resolving against $PWD for older git.
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+  case "$common" in
+    /*) ;;
+    *) common=$(git rev-parse --git-common-dir); case "$common" in /*) ;; *) common="$(pwd -P)/$common" ;; esac ;;
+  esac
   common=$(cd "$common" && pwd -P) || die "cannot resolve git common dir"
   KEY=$(printf '%s' "$BRANCH" | sed 's#/#__#g; s#[^A-Za-z0-9._-]#-#g')
   STATE_DIR="$common/cr-loop/$KEY"
@@ -232,7 +239,7 @@ cmd_next() {
   resolve_paths; resolve_knobs; ensure_state
   cs=0
   while [ $# -gt 0 ]; do
-    case "$1" in --clean-streak) cs="${2:-0}"; shift 2 ;; *) die "next: unknown arg $1" ;; esac
+    case "$1" in --clean-streak) cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;; *) die "next: unknown arg $1" ;; esac
   done
   is_uint "$cs" || die "--clean-streak must be an integer"
   dsb=$(snum dirty_since_step_back); sbd=$(snum step_backs_done)
@@ -273,9 +280,9 @@ cmd_start() {
   mode=""; base=""; since=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --mode) mode="${2:-}"; shift 2 ;;
-      --base) base="${2:-}"; shift 2 ;;
-      --since) since="${2:-}"; shift 2 ;;
+      --mode) mode="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      --base) base="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      --since) since="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
       *) die "start: unknown arg $1" ;;
     esac
   done
@@ -330,23 +337,23 @@ cmd__run() {
   printf '%s\n' "$rc" > "$d/exit"
 }
 
-cmd_status() { resolve_paths; d=$(round_dir_arg "${1:-}"); print_status "$d"; }
+cmd_status() { resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2; print_status "$d"; }
 
 cmd_wait() {
   resolve_paths
   d=""; t=540
   while [ $# -gt 0 ]; do
-    case "$1" in --timeout) t="${2:-540}"; shift 2 ;; *) d="$1"; shift ;; esac
+    case "$1" in --timeout) t="${2:-540}"; shift; [ $# -gt 0 ] && shift ;; *) d="$1"; shift ;; esac
   done
   is_uint "$t" || die "--timeout must be seconds"
-  d=$(round_dir_arg "$d")
+  d=$(round_dir_arg "$d") || exit 2
   end=$(( $(date +%s) + t ))
   while [ "$(round_state "$d")" = "running" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 10; done
   print_status "$d"
 }
 
 cmd_cancel() {
-  resolve_paths; d=$(round_dir_arg "${1:-}")
+  resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2
   [ "$(round_state "$d")" = "running" ] || { print_status "$d"; return 0; }
   rp=$(cat "$d/pid" 2>/dev/null)
   pg=$(ps -o pgid= -p "$rp" 2>/dev/null | tr -d ' ')
@@ -405,7 +412,7 @@ parse_findings() {
 
 cmd_finish() {
   resolve_paths; resolve_knobs; ensure_state
-  d=$(round_dir_arg "${1:-}")
+  d=$(round_dir_arg "${1:-}") || exit 2
   st=$(round_state "$d")
   [ "$st" = "running" ] && { printf 'VERDICT=running\n'; print_status "$d"; exit 4; }
   [ -f "$d/finished" ] && die "round already finished: $d (see $d/verdict)"
@@ -422,16 +429,22 @@ cmd_finish() {
     tail -n 20 "$d/log" 2>/dev/null | sed 's/^/LOG| /'
     exit 5
   fi
-  c0=$(grep -cE '^- \[P0\]' "$res"); c1=$(grep -cE '^- \[P1\]' "$res")
-  c2=$(grep -cE '^- \[P2\]' "$res"); c3=$(grep -cE '^- \[P3\]' "$res")
+  # Validate the whole response before classifying (never let a malformed or
+  # unfinished review reach the convergence path):
+  #  - every line that looks like a severity-tagged finding must be a column-0 "- [Pn]" bullet;
+  #  - a response without findings is clean only with the explicit clean sentence.
+  bad=$(grep -nE '^[[:space:]]*([-*+]|[0-9]+[.)])?[[:space:]]*\[P[0-3]\]' "$res" | grep -vE '^[0-9]+:- \[P[0-3]\] ')
+  if [ -n "$bad" ]; then
+    printf 'VERDICT=error\nREASON=malformed finding line(s) — every finding must start with "- [Pn] " at column 0; read %s manually\n' "$res"
+    printf '%s\n' "$bad" | head -n 5 | sed 's/^/BAD| /'
+    exit 5
+  fi
+  c0=$(grep -cE '^- \[P0\] ' "$res"); c1=$(grep -cE '^- \[P1\] ' "$res")
+  c2=$(grep -cE '^- \[P2\] ' "$res"); c3=$(grep -cE '^- \[P3\] ' "$res")
   total=$(( c0 + c1 + c2 + c3 ))
   if [ "$total" -eq 0 ]; then
-    if grep -qE '\[P[0-3]\]' "$res"; then
-      printf 'VERDICT=error\nREASON=severity tags present but no "- [Pn]" bullets at column 0 (format violation) — read %s manually\n' "$res"
-      exit 5
-    fi
-    if ! grep -qiF "$CLEAN_SENTENCE" "$res" && ! grep -q '^# Codex Review' "$res"; then
-      printf 'VERDICT=error\nREASON=no findings and no clean sentence / "# Codex Review" heading — unparseable, read %s manually\n' "$res"
+    if ! grep -qiF "$CLEAN_SENTENCE" "$res"; then
+      printf 'VERDICT=error\nREASON=no findings and no explicit clean sentence ("%s") — incomplete or unparseable review, read %s manually\n' "$CLEAN_SENTENCE" "$res"
       exit 5
     fi
     verdict=clean
@@ -512,6 +525,21 @@ cmd_reset() {
   printf 'ARCHIVED=%s\n' "$dest"
 }
 
+# Single source of truth for "working tree is clean" (preflight AND completion):
+# everything must be clean except untracked repo-root .cr-loop-handoff-round-<N>.md files.
+cmd_tree_clean() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
+  all=$(git status --porcelain --untracked-files=all)
+  rest=$(printf '%s\n' "$all" | grep -vE '^\?\? \.cr-loop-handoff-round-[0-9]+\.md$' | grep -v '^$')
+  ignored=$(printf '%s\n' "$all" | grep -cE '^\?\? \.cr-loop-handoff-round-[0-9]+\.md$')
+  if [ -n "$rest" ]; then
+    printf 'TREE=dirty\nIGNORED_HANDOFFS=%s\n' "$ignored"
+    printf '%s\n' "$rest" | sed 's/^/DIRTY| /'
+    exit 1
+  fi
+  printf 'TREE=clean\nIGNORED_HANDOFFS=%s\n' "$ignored"
+}
+
 cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
 
 sub="${1:-}"; [ $# -gt 0 ] && shift
@@ -529,6 +557,7 @@ case "$sub" in
   cancel) cmd_cancel "$@" ;;
   reset) cmd_reset "$@" ;;
   paths) cmd_paths "$@" ;;
-  ''|-h|--help|help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' ;;
+  tree-clean) cmd_tree_clean "$@" ;;
+  ''|-h|--help|help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
 esac

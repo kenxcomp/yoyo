@@ -99,9 +99,10 @@ This command adds:
      instruction.
    - **Refresh the base:** `git fetch "${CR_PR_REMOTE:-origin}" "${CR_PR_BASE:-main}" --quiet`.
      Abort on failure.
-   - **Check the working tree:** `git status --short` must be clean. Untracked
-     `.cr-loop-handoff-round-*.md` files from an earlier stop are ignored. Commit or stash
-     anything else first.
+   - **Check the working tree with `bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean`.** This is the single clean-tree check shared by
+     preflight and completion. It must print `TREE=clean`; it ignores only untracked repo-root
+     `.cr-loop-handoff-round-<N>.md` files left by an earlier stop. On `TREE=dirty`, show its
+     `DIRTY|` lines and ask the user to commit or stash them first.
    - **Record the start:** `START=$(git rev-parse HEAD)`.
    - **Record the branch:** `FEATURE_BRANCH=$(git branch --show-current)`. Abort if it is
      empty (detached HEAD).
@@ -175,7 +176,9 @@ This command adds:
 
    **Preconditions:**
 
-   - **(a) The working tree is clean.** Diagnostic: `git status -sb`.
+   - **(a) The working tree is clean.** `bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean` must print `TREE=clean`. This is the same check
+     as the preflight, so a leftover handoff never blocks completion; any other change does.
+     Diagnostic: its `DIRTY|` lines.
    - **(b) HEAD has not moved since the last review:**
      `[ "$(git rev-parse HEAD)" = "$LAST_REVIEWED_HEAD" ]`. Diagnostic:
      `git log --oneline "$LAST_REVIEWED_HEAD"..HEAD`.

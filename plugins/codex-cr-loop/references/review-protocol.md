@@ -532,10 +532,12 @@ Round N (full, confirmation): clean — CLEAN_STREAK 2/2 — converged.
 Write a handoff whenever the loop stops without completing. Never stop silently on a
 non-converged path.
 
-**File:** `.cr-loop-handoff-round-<N>.md` at the repository root. The step 1 preflight
-ignores untracked `.cr-loop-handoff-round-*.md` files in its working-tree check, so a
-resume is not blocked by its own handoff. Handoffs are deleted only by a successful
-completion in step 8.
+**File:** `.cr-loop-handoff-round-<N>.md` at the repository root. Both clean-tree checks,
+the step 1 preflight and step 8(a), use the same predicate, `cr-review.sh tree-clean`. It
+ignores only untracked repo-root handoff files, so neither the resumed loop nor its
+completion is blocked by the loop's own handoff. Any other change still blocks both.
+Handoffs are deleted only by a successful completion in step 8. Never re-implement the
+clean-tree check inline with `git status --short`.
 
 **Shared stop reasons:**
 

@@ -153,7 +153,10 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
 | `status` / `wait [--timeout 540]` | Report whether a round is running or done, with elapsed time, log size, and log age. |
 | `finish` | Check for head drift (exit 3) and for errors or bad output format (exit 5). Then classify the round as `clean`, `p3-only`, or `dirty`, assign class ids, append to the ledger, and update the counters. |
 | `note TEXT` / `add Pn TITLE [DETAIL]` | Append an author note, or register an external finding (prints a new class id). |
+| `tree-clean` | The one clean-tree check, shared by the preflight and the completion step. It ignores only untracked repo-root `.cr-loop-handoff-round-<N>.md` files. |
 | `mark-converged` / `cancel` / `reset` / `paths` | Housekeeping. |
+
+`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers verdict classification, malformed output, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
 
 Your permission settings may prompt on every script call. To stop that, add an allow rule
 that wildcards the version segment of the install path, for example

@@ -86,9 +86,10 @@ knobs removed in v1.7.0 and how they are mapped. `/cr-loop` has no knobs of its 
    - **Refresh a remote base.** If `BASE` is a `<remote>/<branch>` ref, run
      `git fetch <remote> <branch> --quiet`. Skip the fetch when `BASE` is a local ref; then
      there is no remote interaction at all. Abort if a needed fetch fails.
-   - **Check the working tree with `git status --short`.** It must be clean, except for
-     untracked `.cr-loop-handoff-round-*.md` files left by an earlier stop. If anything else
-     shows up, commit or stash it first.
+   - **Check the working tree with `bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean`.** This is the single clean-tree check shared by
+     preflight and completion. It must print `TREE=clean`; it ignores only untracked repo-root
+     `.cr-loop-handoff-round-<N>.md` files left by an earlier stop. On `TREE=dirty`, show its
+     `DIRTY|` lines and ask the user to commit or stash them first.
    - **Record the start:** `START=$(git rev-parse HEAD)`.
    - **Capture the branch:** `FEATURE_BRANCH=$(git branch --show-current)`. If it is empty
      (detached HEAD), abort.
@@ -122,8 +123,9 @@ knobs removed in v1.7.0 and how they are mapped. `/cr-loop` has no knobs of its 
    the report. It does not push, open a PR or merge. It checks two preconditions only so
    the report accurately reflects what is on disk. A failure does not block the stop, but
    it does appear in step 9b.
-   - **(a) The working tree is clean.** `git status --short` must be empty. If it isn't,
-     surface `git status -sb`; those changes never went through a review round.
+   - **(a) The working tree is clean.** `bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean` must print `TREE=clean`. This is the same check
+     as the preflight, so a leftover handoff never blocks completion; any other change does. If it is
+     dirty, show the `DIRTY|` lines: those changes never went through a review round.
    - **(b) HEAD did not move since the last review.** Check
      `[ "$(git rev-parse HEAD)" = "$LAST_REVIEWED_HEAD" ]`. If it moved, surface
      `git log --oneline "$LAST_REVIEWED_HEAD"..HEAD`.
