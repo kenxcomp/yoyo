@@ -104,36 +104,31 @@ ensure_state() {
 }
 
 # ---------------------------------------------------------------- lock ----
-# One branch-level lock serializes every state transaction (init / next / start /
-# finish / note / add / mark-converged / cancel / reset): check-then-update of the
-# state file, round-number and class-id allocation, ledger appends. It is a
-# directory (mkdir is atomic; macOS has no flock(1)) placed NEXT TO the state dir,
-# so `reset` can archive the state dir while holding it. A lock whose holder PID is
-# gone is broken; a live holder is waited for up to 30 s.
+# Every state transaction (init / next / start / finish / note / add /
+# mark-converged / cancel / reset) runs under ONE branch-level kernel advisory
+# lock: the dispatcher at the bottom re-execs the subcommand through perl, which
+# takes flock(LOCK_EX) on <state-dir>.lock and hands the locked descriptor to the
+# script as fd 9. The kernel releases it when the process exits (crash included),
+# so there is no ownership file and no stale-lock recovery. The detached reviewer
+# is launched with fd 9 closed, so it never holds the lock.
 
-lock_acquire() {
-  LOCK="$STATE_DIR.lock"
-  mkdir -p "$(dirname "$LOCK")" || die "cannot create $(dirname "$LOCK")"
-  tries=0
-  while ! mkdir "$LOCK" 2>/dev/null; do
-    holder=$(cat "$LOCK/pid" 2>/dev/null)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      # Stale: rename atomically so only one waiter breaks it, then retry.
-      mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null && rm -rf "$LOCK.stale.$$"
-      continue
-    fi
-    tries=$(( tries + 1 ))
-    [ "$tries" -ge 300 ] && { LOCK=""; die "state lock busy: $STATE_DIR.lock (held by pid ${holder:-?})"; }
-    sleep 0.1
-  done
-  printf '%s\n' "$$" > "$LOCK/pid"
-  trap 'lock_release' EXIT
-  trap 'lock_release; exit 130' INT TERM
-}
-
-lock_release() {
-  if [ -n "${LOCK:-}" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK"; fi
-  LOCK=""
+with_branch_lock() {
+  resolve_paths
+  lockfile="$STATE_DIR.lock"
+  mkdir -p "$(dirname "$lockfile")" || die "cannot create $(dirname "$lockfile")"
+  command -v perl >/dev/null 2>&1 || die "perl is required (state lock + JSON parsing)"
+  exec perl -MFcntl=:flock -MPOSIX -e '
+    my $f = shift @ARGV;
+    open(my $l, ">>", $f) or do { print STDERR "cr-review: cannot open lock $f: $!\n"; exit 2 };
+    my $deadline = time + 30;
+    until (flock($l, LOCK_EX | LOCK_NB)) {
+      if (time > $deadline) { print STDERR "cr-review: state lock busy for 30s: $f\n"; exit 2 }
+      select(undef, undef, undef, 0.1);
+    }
+    POSIX::dup2(fileno($l), 9) or do { print STDERR "cr-review: dup2: $!\n"; exit 2 };
+    $ENV{CR_REVIEW_LOCK_HELD} = 1;
+    exec @ARGV or do { print STDERR "cr-review: exec: $!\n"; exit 2 };
+  ' "$lockfile" bash "$(self_path)" "$@"
 }
 
 # ---------------------------------------------------------------- knobs ----
@@ -255,7 +250,7 @@ write_prompt() {
 }
 
 cmd_init() {
-  resolve_paths; resolve_knobs; lock_acquire; ensure_state
+  resolve_paths; resolve_knobs; ensure_state
   printf 'CR_REVIEW_VERSION=%s\nBRANCH=%s\nSTATE_DIR=%s\nLEDGER=%s\n' "$SELF_VERSION" "$BRANCH" "$STATE_DIR" "$LEDGER"
   printf 'ROUND_CAP=%s\nMAX_STEP_BACKS=%s\nSKIP_P3=%s\nREVIEW_EFFORT=%s\nREVIEW_MODEL=%s\n' \
     "$ROUND_CAP" "$MAX_STEP_BACKS" "$SKIP_P3" "$EFFORT" "${MODEL:-<codex default>}"
@@ -271,7 +266,7 @@ cmd_init() {
 }
 
 cmd_next() {
-  resolve_paths; resolve_knobs; lock_acquire; ensure_state
+  resolve_paths; resolve_knobs; ensure_state
   cs=0
   while [ $# -gt 0 ]; do
     case "$1" in --clean-streak) cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;; *) die "next: unknown arg $1" ;; esac
@@ -299,11 +294,11 @@ launch_detached() {
   # caller does not kill the reviewer. macOS has no setsid(1); use perl's POSIX::setsid.
   self="$1"; d="$2"
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid bash "$self" _run "$d" </dev/null >/dev/null 2>&1 &
+    nohup setsid bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   elif command -v perl >/dev/null 2>&1; then
-    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' bash "$self" _run "$d" </dev/null >/dev/null 2>&1 &
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   else
-    nohup bash "$self" _run "$d" </dev/null >/dev/null 2>&1 &
+    nohup bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   fi
   lpid=$!
   disown "$lpid" 2>/dev/null || true
@@ -311,7 +306,7 @@ launch_detached() {
 }
 
 cmd_start() {
-  resolve_paths; resolve_knobs; lock_acquire; ensure_state
+  resolve_paths; resolve_knobs; ensure_state
   mode=""; base=""; since=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -390,7 +385,7 @@ cmd_wait() {
 }
 
 cmd_cancel() {
-  resolve_paths; lock_acquire; d=$(round_dir_arg "${1:-}") || exit 2
+  resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2
   [ "$(round_state "$d")" = "running" ] || { print_status "$d"; return 0; }
   rp=$(cat "$d/pid" 2>/dev/null)
   pg=$(ps -o pgid= -p "$rp" 2>/dev/null | tr -d ' ')
@@ -411,7 +406,7 @@ cmd_cancel() {
 }
 
 cmd_finish() {
-  resolve_paths; resolve_knobs; lock_acquire; ensure_state
+  resolve_paths; resolve_knobs; ensure_state
   d=$(round_dir_arg "${1:-}") || exit 2
   st=$(round_state "$d")
   [ "$st" = "running" ] && { printf 'VERDICT=running\n'; print_status "$d"; exit 4; }
@@ -476,14 +471,14 @@ cmd_finish() {
 }
 
 cmd_note() {
-  resolve_paths; lock_acquire; ensure_state
+  resolve_paths; ensure_state
   [ $# -gt 0 ] || die "note: text required (e.g. 'C3 fixed — prevention: REVIEW.md#stale-predicate')"
   printf -- '- note %s @%s: %s\n' "$(now_utc)" "$(git rev-parse --short HEAD)" "$*" >> "$LEDGER"
   printf 'NOTED\n'
 }
 
 cmd_add() {
-  resolve_paths; lock_acquire; ensure_state
+  resolve_paths; ensure_state
   sev="${1:-}"; title="${2:-}"; detail="${3:-}"
   case "$sev" in P0|P1|P2|P3) ;; *) die "add: severity must be P0..P3" ;; esac
   [ -n "$title" ] || die "add: title required ('<class title> — <file>:<line>')"
@@ -497,7 +492,7 @@ cmd_add() {
 }
 
 cmd_mark_converged() {
-  resolve_paths; lock_acquire; ensure_state
+  resolve_paths; ensure_state
   printf '\n## Converged at %s — %s (rounds so far: %s, step-backs: %s)\n' \
     "$(git rev-parse --short HEAD)" "$(now_utc)" "$(snum rounds_total)" "$(snum step_backs_done)" >> "$LEDGER"
   sset dirty_since_step_back 0
@@ -506,7 +501,7 @@ cmd_mark_converged() {
 }
 
 cmd_reset() {
-  resolve_paths; lock_acquire
+  resolve_paths
   [ -d "$STATE_DIR" ] || { printf 'NOTHING_TO_RESET\n'; return 0; }
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ] && [ "$(round_state "$cur")" = "running" ]; then die "a round is running — cancel it first"; fi
@@ -537,7 +532,12 @@ cmd_tree_clean() {
 
 cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
 
-sub="${1:-}"; [ $# -gt 0 ] && shift
+sub="${1:-}"
+case "$sub" in
+  init|next|start|finish|note|add|mark-converged|cancel|reset)
+    [ -n "${CR_REVIEW_LOCK_HELD:-}" ] || with_branch_lock "$@" ;;
+esac
+[ $# -gt 0 ] && shift
 case "$sub" in
   init) cmd_init "$@" ;;
   next) cmd_next "$@" ;;

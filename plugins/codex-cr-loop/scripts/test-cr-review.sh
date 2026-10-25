@@ -185,8 +185,22 @@ wait
 ids=$(cat "$TMP"/add.* | sed -n 's/^ID=//p' | sort -u | wc -l | tr -d ' ')
 expect "concurrent add: 8 unique ids" "8" "$ids"
 expect "next_class_id not lost" "9" "$(sed -n 's/^next_class_id=//p' "$(bash "$CR" paths | kv STATE)" | tail -n 1)"
-mkdir "$(bash "$CR" paths | kv STATE_DIR).lock" && echo 999999 > "$(bash "$CR" paths | kv STATE_DIR).lock/pid"
-bash "$CR" note "stale lock is broken" >/dev/null; expect "stale lock broken" "0" "$?"
+LOCKF="$(bash "$CR" paths | kv STATE_DIR).lock"
+hold_lock() { perl -MFcntl=:flock -e 'open(my $l, ">>", $ARGV[0]) or die; flock($l, LOCK_EX) or die; sleep $ARGV[1];' "$LOCKF" "$1" & HOLDER=$!; sleep 0.5; }
+hold_lock 30; kill -9 "$HOLDER"; wait "$HOLDER" 2>/dev/null
+t0=$(date +%s); bash "$CR" note "after holder crash" >/dev/null; rc=$?
+expect "lock released when holder crashes" "0" "$rc"
+[ $(( $(date +%s) - t0 )) -lt 5 ] && ok || bad "crash recovery should not wait for a timeout"
+hold_lock 2
+t0=$(date +%s); bash "$CR" note "waits for live holder" >/dev/null; rc=$?; el=$(( $(date +%s) - t0 ))
+expect "waits for a live holder, then succeeds" "0" "$rc"
+[ "$el" -ge 1 ] && ok || bad "note did not wait for the live lock holder (elapsed ${el}s)"
+wait "$HOLDER" 2>/dev/null
+FAKE_SLEEP=6 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+t0=$(date +%s); bash "$CR" note "while a round runs" >/dev/null; el=$(( $(date +%s) - t0 ))
+expect "running reviewer does not hold the lock" "running" "$(bash "$CR" status | kv STATE)"
+[ "$el" -lt 3 ] && ok || bad "note blocked ${el}s behind the running reviewer (lock fd leaked into it)"
+bash "$CR" wait --timeout 30 >/dev/null; bash "$CR" finish >/dev/null
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

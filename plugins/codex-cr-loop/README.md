@@ -157,9 +157,10 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
   caller's 10-minute tool timeout can't kill the reviewer.
 - **The reviewer computes the diff itself,** so diff size doesn't matter.
 - **State transactions take a branch-level lock.** Concurrent sessions on one branch cannot
-  start the same round twice, finish a round twice, or reuse a class id. The lock is an
-  `mkdir` lock because macOS has no `flock(1)`, and a lock left by a dead holder is broken
-  automatically.
+  start the same round twice, finish a round twice, or reuse a class id. The lock is a kernel
+  `flock` taken through perl, because macOS has no `flock(1)`. The kernel releases it when
+  the holder exits, so a crash never leaves a stale lock, and the detached reviewer doesn't
+  inherit it.
 - **Rounds are tracked by PID file, never by `pgrep -f`.** `cancel` stops only that round's
   process group.
 

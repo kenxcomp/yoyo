@@ -120,7 +120,7 @@ Everything is stored outside the working tree, under
 | `state` | Persisted counters: `rounds_total`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `next_class_id`, `current_round_dir`. |
 | `ledger.md` | The append-only findings ledger (see "Ledger contract"). |
 | `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta`, `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`. |
-| `../<branch-key>.lock/` | Branch-level lock directory, next to the state dir. Every state transaction (`init`, `next`, `start`, `finish`, `note`, `add`, `mark-converged`, `cancel`, `reset`) runs under it, so two sessions on the same branch cannot both start a round, finish a round twice, or allocate the same class id. A lock whose holder PID is dead is broken automatically; a live holder is waited for up to 30 s. |
+| `../<branch-key>.lock` | Branch-level **kernel advisory lock** (`flock`, taken through perl and held on fd 9). Every state transaction (`init`, `next`, `start`, `finish`, `note`, `add`, `mark-converged`, `cancel`, `reset`) runs under it, so two sessions on the same branch cannot both start a round, finish one twice, or allocate the same class id. The kernel releases the lock when the holder exits, crashes included, so there is no stale-lock state. A live holder is waited for up to 30 s. The detached reviewer is started with fd 9 closed, so it never holds the lock. |
 
 The state is shared by every worktree of the repository. It **survives across invocations
 for the same branch**. The round-cap counters persist too, so a re-invocation cannot reset
