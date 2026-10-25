@@ -103,6 +103,39 @@ ensure_state() {
   fi
 }
 
+# ---------------------------------------------------------------- lock ----
+# One branch-level lock serializes every state transaction (init / next / start /
+# finish / note / add / mark-converged / cancel / reset): check-then-update of the
+# state file, round-number and class-id allocation, ledger appends. It is a
+# directory (mkdir is atomic; macOS has no flock(1)) placed NEXT TO the state dir,
+# so `reset` can archive the state dir while holding it. A lock whose holder PID is
+# gone is broken; a live holder is waited for up to 30 s.
+
+lock_acquire() {
+  LOCK="$STATE_DIR.lock"
+  mkdir -p "$(dirname "$LOCK")" || die "cannot create $(dirname "$LOCK")"
+  tries=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    holder=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      # Stale: rename atomically so only one waiter breaks it, then retry.
+      mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null && rm -rf "$LOCK.stale.$$"
+      continue
+    fi
+    tries=$(( tries + 1 ))
+    [ "$tries" -ge 300 ] && { LOCK=""; die "state lock busy: $STATE_DIR.lock (held by pid ${holder:-?})"; }
+    sleep 0.1
+  done
+  printf '%s\n' "$$" > "$LOCK/pid"
+  trap 'lock_release' EXIT
+  trap 'lock_release; exit 130' INT TERM
+}
+
+lock_release() {
+  if [ -n "${LOCK:-}" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK"; fi
+  LOCK=""
+}
+
 # ---------------------------------------------------------------- knobs ----
 
 resolve_knobs() {
@@ -222,7 +255,7 @@ write_prompt() {
 }
 
 cmd_init() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; resolve_knobs; lock_acquire; ensure_state
   printf 'CR_REVIEW_VERSION=%s\nBRANCH=%s\nSTATE_DIR=%s\nLEDGER=%s\n' "$SELF_VERSION" "$BRANCH" "$STATE_DIR" "$LEDGER"
   printf 'ROUND_CAP=%s\nMAX_STEP_BACKS=%s\nSKIP_P3=%s\nREVIEW_EFFORT=%s\nREVIEW_MODEL=%s\n' \
     "$ROUND_CAP" "$MAX_STEP_BACKS" "$SKIP_P3" "$EFFORT" "${MODEL:-<codex default>}"
@@ -238,7 +271,7 @@ cmd_init() {
 }
 
 cmd_next() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; resolve_knobs; lock_acquire; ensure_state
   cs=0
   while [ $# -gt 0 ]; do
     case "$1" in --clean-streak) cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;; *) die "next: unknown arg $1" ;; esac
@@ -278,7 +311,7 @@ launch_detached() {
 }
 
 cmd_start() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; resolve_knobs; lock_acquire; ensure_state
   mode=""; base=""; since=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -307,7 +340,7 @@ cmd_start() {
   fi
   n=$(( $(snum rounds_started) + 1 ))
   d="$STATE_DIR/rounds/$(printf '%03d' "$n")-$mode"
-  mkdir -p "$d" || die "cannot create $d"
+  mkdir -p "$STATE_DIR/rounds" && mkdir "$d" 2>/dev/null || die "round dir already exists (concurrent start?): $d"
   {
     printf 'mode=%s\nbase_ref=%s\nbase_sha=%s\nsince=%s\nreviewed_head=%s\nround=%s\n' "$mode" "$base" "$base_sha" "$since" "$head" "$n"
     printf 'effort=%s\nmodel=%s\nroot=%s\nschema=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$SCHEMA" "$(now_utc)" "$(date +%s)"
@@ -357,7 +390,7 @@ cmd_wait() {
 }
 
 cmd_cancel() {
-  resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2
+  resolve_paths; lock_acquire; d=$(round_dir_arg "${1:-}") || exit 2
   [ "$(round_state "$d")" = "running" ] || { print_status "$d"; return 0; }
   rp=$(cat "$d/pid" 2>/dev/null)
   pg=$(ps -o pgid= -p "$rp" 2>/dev/null | tr -d ' ')
@@ -378,7 +411,7 @@ cmd_cancel() {
 }
 
 cmd_finish() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; resolve_knobs; lock_acquire; ensure_state
   d=$(round_dir_arg "${1:-}") || exit 2
   st=$(round_state "$d")
   [ "$st" = "running" ] && { printf 'VERDICT=running\n'; print_status "$d"; exit 4; }
@@ -443,14 +476,14 @@ cmd_finish() {
 }
 
 cmd_note() {
-  resolve_paths; ensure_state
+  resolve_paths; lock_acquire; ensure_state
   [ $# -gt 0 ] || die "note: text required (e.g. 'C3 fixed — prevention: REVIEW.md#stale-predicate')"
   printf -- '- note %s @%s: %s\n' "$(now_utc)" "$(git rev-parse --short HEAD)" "$*" >> "$LEDGER"
   printf 'NOTED\n'
 }
 
 cmd_add() {
-  resolve_paths; ensure_state
+  resolve_paths; lock_acquire; ensure_state
   sev="${1:-}"; title="${2:-}"; detail="${3:-}"
   case "$sev" in P0|P1|P2|P3) ;; *) die "add: severity must be P0..P3" ;; esac
   [ -n "$title" ] || die "add: title required ('<class title> — <file>:<line>')"
@@ -464,7 +497,7 @@ cmd_add() {
 }
 
 cmd_mark_converged() {
-  resolve_paths; ensure_state
+  resolve_paths; lock_acquire; ensure_state
   printf '\n## Converged at %s — %s (rounds so far: %s, step-backs: %s)\n' \
     "$(git rev-parse --short HEAD)" "$(now_utc)" "$(snum rounds_total)" "$(snum step_backs_done)" >> "$LEDGER"
   sset dirty_since_step_back 0
@@ -473,7 +506,7 @@ cmd_mark_converged() {
 }
 
 cmd_reset() {
-  resolve_paths
+  resolve_paths; lock_acquire
   [ -d "$STATE_DIR" ] || { printf 'NOTHING_TO_RESET\n'; return 0; }
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ] && [ "$(round_state "$cur")" = "running" ]; then die "a round is running — cancel it first"; fi

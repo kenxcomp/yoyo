@@ -156,6 +156,10 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
   has no `setsid(1)`, so the runner calls perl's `POSIX::setsid` instead. As a result, a
   caller's 10-minute tool timeout can't kill the reviewer.
 - **The reviewer computes the diff itself,** so diff size doesn't matter.
+- **State transactions take a branch-level lock.** Concurrent sessions on one branch cannot
+  start the same round twice, finish a round twice, or reuse a class id. The lock is an
+  `mkdir` lock because macOS has no `flock(1)`, and a lock left by a dead holder is broken
+  automatically.
 - **Rounds are tracked by PID file, never by `pgrep -f`.** `cancel` stops only that round's
   process group.
 
@@ -170,7 +174,7 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
 | `tree-clean` | The one clean-tree check, shared by the preflight and the completion step. It ignores only untracked repo-root `.cr-loop-handoff-round-<N>.md` files. |
 | `mark-converged` / `cancel` / `reset` / `paths` | Housekeeping. |
 
-`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers structured-verdict classification and fail-closed validation, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
+`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers structured-verdict classification and fail-closed validation, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, concurrent start/finish/add under the lock, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
 
 Your permission settings may prompt on every script call. To stop that, add an allow rule
 that wildcards the version segment of the install path, for example

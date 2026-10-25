@@ -168,5 +168,25 @@ sleep 1
 expect "cancel exit code" "130" "$(bash "$CR" status | kv EXIT)"
 if ps -axo command | grep -v grep | grep -q 'sleep 30$'; then bad "cancel left an orphaned reviewer child"; else ok; fi
 
+# --- C5: one branch lock serializes state transactions
+bash "$CR" reset >/dev/null
+for i in 1 2 3 4; do (FAKE_SLEEP=3 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main > "$TMP/start.$i" 2>&1; echo $? > "$TMP/start.$i.rc") & done
+wait
+okc=0; for i in 1 2 3 4; do [ "$(cat "$TMP/start.$i.rc")" = 0 ] && okc=$((okc + 1)); done
+expect "concurrent start: exactly one wins" "1" "$okc"
+bash "$CR" wait --timeout 30 >/dev/null
+for i in 1 2 3; do (bash "$CR" finish > "$TMP/fin.$i" 2>&1; echo $? > "$TMP/fin.$i.rc") & done
+wait
+okc=0; for i in 1 2 3; do [ "$(cat "$TMP/fin.$i.rc")" = 0 ] && okc=$((okc + 1)); done
+expect "concurrent finish: exactly one completes" "1" "$okc"
+expect "round appended to ledger once" "1" "$(grep -c '^## Round ' "$(bash "$CR" paths | kv LEDGER)")"
+for i in 1 2 3 4 5 6 7 8; do (bash "$CR" add P2 "concurrent class $i — a.txt:$i" > "$TMP/add.$i" 2>&1) & done
+wait
+ids=$(cat "$TMP"/add.* | sed -n 's/^ID=//p' | sort -u | wc -l | tr -d ' ')
+expect "concurrent add: 8 unique ids" "8" "$ids"
+expect "next_class_id not lost" "9" "$(sed -n 's/^next_class_id=//p' "$(bash "$CR" paths | kv STATE)" | tail -n 1)"
+mkdir "$(bash "$CR" paths | kv STATE_DIR).lock" && echo 999999 > "$(bash "$CR" paths | kv STATE_DIR).lock/pid"
+bash "$CR" note "stale lock is broken" >/dev/null; expect "stale lock broken" "0" "$?"
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
