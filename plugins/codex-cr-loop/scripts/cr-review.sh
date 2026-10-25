@@ -215,7 +215,8 @@ write_prompt() {
     printf -- '- [P2] [C3] <title of the reopened ledger class> — <file>:<line>\n  Still wrong: <what the fix missed>\n  Instances: ...\n  Fix: ...\n  Prevent: ...\n\n'
     printf 'Out of scope (pre-existing, not counted):\n  <file:line> — <one line>   (omit when empty; never start these lines with "- [P")\n\n'
     printf 'Every finding bullet starts with "- [P0]".."- [P3]" at column 0; detail lines are indented two spaces.\n'
-    printf 'If there are no findings, write the summary followed by the exact sentence: %s.\n' "$CLEAN_SENTENCE"
+    printf 'If there are no findings, write the summary and then this exact sentence alone on its own line:\n%s.\n' "$CLEAN_SENTENCE"
+    printf 'Never write that sentence when the review is incomplete; never put a severity tag like [P1] anywhere except at the start of a finding bullet.\n'
     printf 'Do not modify any files.\n'
   } > "$p"
 }
@@ -431,20 +432,29 @@ cmd_finish() {
   fi
   # Validate the whole response before classifying (never let a malformed or
   # unfinished review reach the convergence path):
-  #  - every line that looks like a severity-tagged finding must be a column-0 "- [Pn]" bullet;
-  #  - a response without findings is clean only with the explicit clean sentence.
-  bad=$(grep -nE '^[[:space:]]*([-*+]|[0-9]+[.)])?[[:space:]]*\[P[0-3]\]' "$res" | grep -vE '^[0-9]+:- \[P[0-3]\] ')
-  if [ -n "$bad" ]; then
-    printf 'VERDICT=error\nREASON=malformed finding line(s) — every finding must start with "- [Pn] " at column 0; read %s manually\n' "$res"
-    printf '%s\n' "$bad" | head -n 5 | sed 's/^/BAD| /'
-    exit 5
-  fi
+  #  1. every severity token "[Pn]" in the response must be the tag of a column-0
+  #     "- [Pn] " finding bullet (so "**[P1]**", "### [P1]", "* [P1]", indented
+  #     bullets, or tags in prose all fail closed and need a manual read);
+  #  2. list items / headings that carry a bare severity ("- **P1**", "## P1:") fail too;
+  #  3. a response without findings is clean only when the clean sentence stands
+  #     alone on its own line (a sentence embedded in prose — e.g. "I cannot state
+  #     that I did not find any definite correctness bugs" — is not a verdict).
   c0=$(grep -cE '^- \[P0\] ' "$res"); c1=$(grep -cE '^- \[P1\] ' "$res")
   c2=$(grep -cE '^- \[P2\] ' "$res"); c3=$(grep -cE '^- \[P3\] ' "$res")
   total=$(( c0 + c1 + c2 + c3 ))
+  # Inline code spans (`...`) are quotes, not verdicts: strip them before counting.
+  plain="$d/last.plain"
+  sed 's/`[^`]*`//g' "$res" > "$plain"
+  tokens=$(grep -oE '\[P[0-3]\]' "$plain" | wc -l | tr -d ' ')
+  bare=$(grep -nE '^[[:space:]]*([-*+]|[0-9]+[.)]|#+)[[:space:]]*(\*\*|__)?P[0-3]([^0-9A-Za-z]|$)' "$plain")
+  if [ "$tokens" != "$total" ] || [ -n "$bare" ]; then
+    printf 'VERDICT=error\nREASON=malformed finding(s): %s severity tag(s) but %s column-0 "- [Pn] " bullet(s) — read %s manually\n' "$tokens" "$total" "$res"
+    { grep -nE '\[P[0-3]\]' "$plain" | grep -vE '^[0-9]+:- \[P[0-3]\] '; printf '%s\n' "$bare"; } | grep -v '^$' | head -n 5 | sed 's/^/BAD| /'
+    exit 5
+  fi
   if [ "$total" -eq 0 ]; then
-    if ! grep -qiF "$CLEAN_SENTENCE" "$res"; then
-      printf 'VERDICT=error\nREASON=no findings and no explicit clean sentence ("%s") — incomplete or unparseable review, read %s manually\n' "$CLEAN_SENTENCE" "$res"
+    if ! grep -qiE "^[[:space:]]*$CLEAN_SENTENCE\.?[[:space:]]*\$" "$plain"; then
+      printf 'VERDICT=error\nREASON=no findings and no standalone clean-sentence line ("%s.") — incomplete or unparseable review, read %s manually\n' "$CLEAN_SENTENCE" "$res"
       exit 5
     fi
     verdict=clean
@@ -529,7 +539,12 @@ cmd_reset() {
 # everything must be clean except untracked repo-root .cr-loop-handoff-round-<N>.md files.
 cmd_tree_clean() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
-  all=$(git status --porcelain --untracked-files=all)
+  # A failing `git status` (corrupt / unreadable index, ...) must never read as clean.
+  all=$(git status --porcelain --untracked-files=all 2>/dev/null) || {
+    printf 'TREE=error\n'
+    git status --porcelain --untracked-files=all 2>&1 >/dev/null | sed 's/^/ERROR| /'
+    exit 2
+  }
   rest=$(printf '%s\n' "$all" | grep -vE '^\?\? \.cr-loop-handoff-round-[0-9]+\.md$' | grep -v '^$')
   ignored=$(printf '%s\n' "$all" | grep -cE '^\?\? \.cr-loop-handoff-round-[0-9]+\.md$')
   if [ -n "$rest" ]; then

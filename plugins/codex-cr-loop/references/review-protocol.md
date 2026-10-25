@@ -162,7 +162,8 @@ The prompt that `start` writes is the class-format reviewer contract. It asks th
   or left incomplete by the change
 - give, for each **class**, the `Pattern / Instances / Fix / Prevent` fields
 - list pre-existing issues under `Out of scope`, without a severity tag
-- end a clean review with the literal sentence `did not find any definite correctness bugs`
+- end a clean review with the literal sentence `did not find any definite correctness bugs.`
+  **alone on its own line**, and use a severity tag `[Pn]` only at the start of a finding bullet
 
 ### 3c. Wait for the round to finish
 
@@ -194,7 +195,7 @@ bash "$CR_REVIEW" finish
 | Exit | `VERDICT` | Meaning and handling |
 |---|---|---|
 | 3 | `head-drift` | HEAD moved while the reviewer ran (a concurrent agent, an auto-commit hook, or another shell). The round's verdict does not cover the current state. **Do not classify, do not touch `CLEAN_STREAK`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
-| 5 | `error` | The reviewer exited non-zero, produced no output, or produced output that does not follow the format. That includes severity tags without column-0 `- [Pn]` bullets. Read `last.md` and the `LOG|` tail it prints. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the log tail. Never classify an unreadable review as clean. |
+| 5 | `error` | The reviewer exited non-zero, produced no output, or produced output that does not follow the format. That includes any `[Pn]` tag outside a column-0 `- [Pn] ` bullet (bold, heading, starred, indented or in prose; quotes inside inline code are ignored), a bare `- **P1**` style severity, and a finding-less response without a standalone clean-sentence line. Read `last.md` and the `LOG|` tail it prints. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the log tail. Never classify an unreadable review as clean. |
 | 4 | `running` | The round has not finished. Go back to 3c. |
 | 0 | `clean`, `p3-only` or `dirty` | Continue with step 4. `finish` has already appended the round to the ledger, assigned ids to the new classes (`NEW_CLASSES=`), listed the cited ones (`REOPENED=`), listed the classes seen in two or more rounds (`RECURRING=`), and updated the persisted counters. |
 

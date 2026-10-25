@@ -46,7 +46,12 @@ run_round() {
 
 fixture() { printf '%b' "$2" > "$TMP/$1.md"; printf '%s\n' "$TMP/$1.md"; }
 
-F_CLEAN=$(fixture clean '# Codex Review\n\nAll fine. did not find any definite correctness bugs.\n')
+F_CLEAN=$(fixture clean '# Codex Review\n\nAll fine.\n\ndid not find any definite correctness bugs.\n')
+F_EMBEDDED=$(fixture embedded '# Codex Review\n\nI could not complete the review, so I cannot state that I did not find any definite correctness bugs.\n')
+F_BOLD=$(fixture bold '# Codex Review\n\nx\n\nReview comment:\n\n- [P3] ok nit — a.txt:1\n\n- **[P1]** bold tag — a.txt:2\n')
+F_HEADING=$(fixture heading '# Codex Review\n\nx\n\n- [P3] ok nit — a.txt:1\n\n### [P1] heading tag — a.txt:2\n')
+F_BARE=$(fixture bare '# Codex Review\n\nx\n\n- **P1** bare severity — a.txt:2\n')
+F_QUOTED=$(fixture quoted '# Codex Review\n\nx\n\nReview comment:\n\n- [P2] Quoted example — a.txt:1\n  Still wrong: mixing `- **[P1]** x` with a P3 passes\n')
 F_HEAD_ONLY=$(fixture headonly '# Codex Review\n\nI could not finish the review.\n')
 F_DIRTY=$(fixture dirty '# Codex Review\n\nx\n\nReview comment:\n\n- [P1] Class A — a.txt:1\n  Pattern: p\n  Instances: a.txt:1, a.txt:2\n  Fix: f\n  Prevent: t\n\n- [P3] Nit — a.txt:3\n  Pattern: n\n\nOut of scope (pre-existing, not counted):\n  a.txt:9 — old\n')
 F_P3=$(fixture p3 '# Codex Review\n\nx\n\nReview comment:\n\n- [P3] Another nit — a.txt:4\n  Pattern: n\n')
@@ -71,6 +76,13 @@ out=$(run_round "$F_MIXED" full); rc=$?
 expect "mixed valid P3 + malformed P1 is error" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
 out=$(run_round "$F_INDENT" full); rc=$?
 expect "indented finding is error" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+for f in "$F_EMBEDDED" "$F_BOLD" "$F_HEADING" "$F_BARE"; do
+  out=$(run_round "$f" full); rc=$?
+  expect "fails closed: $(basename "$f")" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+done
+out=$(run_round "$F_QUOTED" full)
+expect "code-quoted tag is not a finding" "dirty:1" "$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv P2)"
+bash "$CR" reset >/dev/null
 out=$(FAKE_RC=1 run_round "$F_CLEAN" full); rc=$?
 expect "non-zero codex exit is error" "5" "$rc"
 out=$(run_round "$F_DIRTY" full)
@@ -135,6 +147,9 @@ bash "$CR" tree-clean >/dev/null; expect "nested handoff-looking file blocks" "1
 rm sub/dir/.cr-loop-handoff-round-1.md; echo z >> a.txt
 bash "$CR" tree-clean >/dev/null; expect "tracked change blocks" "1" "$?"
 git checkout -q a.txt; rm -f .cr-loop-handoff-round-4.md
+printf 'garbage' > "$TMP/bad-index"
+out=$(GIT_INDEX_FILE="$TMP/bad-index" bash "$CR" tree-clean); rc=$?
+expect "git status failure is never clean" "2:error" "$rc:$(printf '%s\n' "$out" | kv TREE)"
 
 # --- cancel stops the whole round process group (no orphans)
 FAKE_SLEEP=30 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
