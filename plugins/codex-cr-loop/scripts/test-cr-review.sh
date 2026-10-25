@@ -185,6 +185,11 @@ wait
 ids=$(cat "$TMP"/add.* | sed -n 's/^ID=//p' | sort -u | wc -l | tr -d ' ')
 expect "concurrent add: 8 unique ids" "8" "$ids"
 expect "next_class_id not lost" "9" "$(sed -n 's/^next_class_id=//p' "$(bash "$CR" paths | kv STATE)" | tail -n 1)"
+# Same race with the caller holding fds 3-8 open, so the lock fd itself lands on 9.
+rm -f "$TMP"/add.*
+for i in 1 2 3 4 5 6 7 8; do (exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null 8</dev/null; bash "$CR" add P2 "fd9 class $i — a.txt:$i" > "$TMP/add.$i" 2>&1) & done
+wait
+expect "concurrent add with fds 3-8 open: 8 unique ids" "8" "$(cat "$TMP"/add.* | sed -n 's/^ID=//p' | sort -u | wc -l | tr -d ' ')"
 LOCKF="$(bash "$CR" paths | kv STATE_DIR).lock"
 hold_lock() { perl -MFcntl=:flock -e 'open(my $l, ">>", $ARGV[0]) or die; flock($l, LOCK_EX) or die; sleep $ARGV[1];' "$LOCKF" "$1" & HOLDER=$!; sleep 0.5; }
 hold_lock 30; kill -9 "$HOLDER"; wait "$HOLDER" 2>/dev/null

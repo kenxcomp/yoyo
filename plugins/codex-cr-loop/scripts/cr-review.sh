@@ -117,7 +117,7 @@ with_branch_lock() {
   lockfile="$STATE_DIR.lock"
   mkdir -p "$(dirname "$lockfile")" || die "cannot create $(dirname "$lockfile")"
   command -v perl >/dev/null 2>&1 || die "perl is required (state lock + JSON parsing)"
-  exec perl -MFcntl=:flock -MPOSIX -e '
+  exec perl -MFcntl=:flock,F_SETFD -MPOSIX -e '
     my $f = shift @ARGV;
     open(my $l, ">>", $f) or do { print STDERR "cr-review: cannot open lock $f: $!\n"; exit 2 };
     my $deadline = time + 30;
@@ -125,7 +125,12 @@ with_branch_lock() {
       if (time > $deadline) { print STDERR "cr-review: state lock busy for 30s: $f\n"; exit 2 }
       select(undef, undef, undef, 0.1);
     }
-    POSIX::dup2(fileno($l), 9) or do { print STDERR "cr-review: dup2: $!\n"; exit 2 };
+    # Hand the locked descriptor over as fd 9 and make sure it survives exec:
+    # dup2 is a no-op (keeping FD_CLOEXEC) when open() already returned fd 9,
+    # so always clear FD_CLOEXEC on fd 9 explicitly.
+    if (fileno($l) != 9) { defined POSIX::dup2(fileno($l), 9) or do { print STDERR "cr-review: dup2: $!\n"; exit 2 } }
+    open(my $nine, "+<&=", 9) or do { print STDERR "cr-review: fd 9: $!\n"; exit 2 };
+    defined fcntl($nine, F_SETFD, 0) or do { print STDERR "cr-review: fcntl(F_SETFD): $!\n"; exit 2 };
     $ENV{CR_REVIEW_LOCK_HELD} = 1;
     exec @ARGV or do { print STDERR "cr-review: exec: $!\n"; exit 2 };
   ' "$lockfile" bash "$(self_path)" "$@"
