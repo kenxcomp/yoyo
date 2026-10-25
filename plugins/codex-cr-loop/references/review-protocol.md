@@ -194,7 +194,10 @@ take more than 15 minutes.
 - **Long waits:** report progress at least every 30 minutes, using `bash "$CR_REVIEW" status`
   (elapsed time, log bytes, log age).
 - **Hung reviewer:** if `LOG_AGE_S` is frozen for a long time and the user agrees, run
-  `bash "$CR_REVIEW" cancel`. It stops only this round's own process group. Never auto-kill
+  `bash "$CR_REVIEW" cancel`. It stops only this round's own process group. A persisted PID
+  counts as the reviewer only while that process is still running `cr-review.sh _run <round dir>`
+  (and the codex child only while its parent is that runner). A PID reused after a crash or reboot
+  is reported `dead` and is never signalled. Never auto-kill
   a slow review.
 
 ### 3d. Finish the round

@@ -207,5 +207,19 @@ expect "running reviewer does not hold the lock" "running" "$(bash "$CR" status 
 [ "$el" -lt 3 ] && ok || bad "note blocked ${el}s behind the running reviewer (lock fd leaked into it)"
 bash "$CR" wait --timeout 30 >/dev/null; bash "$CR" finish >/dev/null
 
+# --- C6: a persisted PID reused by an unrelated process is never treated as the reviewer
+sleep 30 & STRANGER=$!
+SD=$(bash "$CR" paths | kv STATE_DIR)
+GHOST="$SD/rounds/999-full"; mkdir -p "$GHOST"
+printf 'mode=full\nreviewed_head=%s\nround=999\nstarted_epoch=%s\n' "$(git rev-parse HEAD)" "$(date +%s)" > "$GHOST/meta"
+printf '%s\n' "$STRANGER" > "$GHOST/pid"; printf '%s\n' "$STRANGER" > "$GHOST/codex.pid"
+expect "reused PID is not a running round" "dead" "$(bash "$CR" status "$GHOST" | kv STATE)"
+bash "$CR" cancel "$GHOST" >/dev/null
+kill -0 "$STRANGER" 2>/dev/null && ok || bad "cancel signalled an unrelated process that reused the PID"
+sed -i.bak "s#^current_round_dir=.*#current_round_dir=$GHOST#" "$(bash "$CR" paths | kv STATE)"
+FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; expect "start not blocked by a reused PID" "0" "$?"
+bash "$CR" wait --timeout 30 >/dev/null; bash "$CR" finish >/dev/null
+kill "$STRANGER" 2>/dev/null; wait "$STRANGER" 2>/dev/null
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

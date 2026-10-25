@@ -161,6 +161,8 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
   `flock` taken through perl, because macOS has no `flock(1)`. The kernel releases it when
   the holder exits, so a crash never leaves a stale lock, and the detached reviewer doesn't
   inherit it.
+- **PIDs are verified before use.** A persisted PID counts only while that process is still
+  `cr-review.sh _run <round dir>`, so a PID reused after a crash is never signalled.
 - **Rounds are tracked by PID file, never by `pgrep -f`.** `cancel` stops only that round's
   process group.
 

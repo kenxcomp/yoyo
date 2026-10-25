@@ -175,10 +175,27 @@ mget() { sed -n "s/^$2=//p" "$1/meta" | tail -n 1; }
 
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
+# A persisted PID only counts as this round's runner if the live process with that
+# PID is still running "cr-review.sh _run <this round dir>" (PIDs are reused after
+# a crash or reboot). Signals are only ever sent to verified processes.
+runner_pid() { # prints the verified runner PID of round $1, or nothing
+  rp=$(cat "$1/pid" 2>/dev/null)
+  pid_alive "$rp" || return 1
+  cmdline=$(ps -o command= -p "$rp" 2>/dev/null) || return 1
+  case "$cmdline" in *"_run $1"*) printf '%s\n' "$rp" ;; *) return 1 ;; esac
+}
+
+codex_pid() { # prints the verified codex child PID of round $1 (parent == verified runner)
+  rp=$(runner_pid "$1") || return 1
+  cp=$(cat "$1/codex.pid" 2>/dev/null)
+  pid_alive "$cp" || return 1
+  [ "$(ps -o ppid= -p "$cp" 2>/dev/null | tr -d ' ')" = "$rp" ] && printf '%s\n' "$cp"
+}
+
 round_state() {
   # prints running | done | dead
   if [ -f "$1/exit" ]; then printf 'done\n'; return; fi
-  if pid_alive "$(cat "$1/pid" 2>/dev/null)"; then printf 'running\n'; else printf 'dead\n'; fi
+  if runner_pid "$1" >/dev/null; then printf 'running\n'; else printf 'dead\n'; fi
 }
 
 file_size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '0\n'; fi; }
@@ -392,17 +409,16 @@ cmd_wait() {
 cmd_cancel() {
   resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2
   [ "$(round_state "$d")" = "running" ] || { print_status "$d"; return 0; }
-  rp=$(cat "$d/pid" 2>/dev/null)
+  rp=$(runner_pid "$d") || { print_status "$d"; return 0; }
+  cp=$(codex_pid "$d")
   pg=$(ps -o pgid= -p "$rp" 2>/dev/null | tr -d ' ')
-  if [ -n "$rp" ] && [ "$pg" = "$rp" ]; then
-    # The runner leads its own process group (setsid at launch): stop the whole
-    # group so codex's own children are not orphaned. Only this round's group.
+  if [ "$pg" = "$rp" ]; then
+    # The verified runner leads its own process group (setsid at launch): stop
+    # the whole group so codex's own children are not orphaned.
     kill -TERM -- "-$rp" 2>/dev/null
   else
-    for f in codex.pid pid; do
-      p=$(cat "$d/$f" 2>/dev/null)
-      pid_alive "$p" && kill -TERM "$p" 2>/dev/null
-    done
+    [ -n "$cp" ] && kill -TERM "$cp" 2>/dev/null
+    kill -TERM "$rp" 2>/dev/null
   fi
   sleep 1
   [ -f "$d/exit" ] || printf '130\n' > "$d/exit"
