@@ -88,8 +88,19 @@ the reviewer as:
 
 ```text
 codex exec --sandbox read-only -C <repo root> -c model_reasoning_effort=<CR_LOOP_REVIEW_EFFORT, default high>
-           --output-last-message <round>/last.md "<prompt>" < /dev/null
+           --output-schema references/review-output.schema.json
+           --output-last-message <round>/result.json "<prompt>" < /dev/null
 ```
+
+- **Structured verdict.** `--output-schema` forces the final message to be a strict JSON
+  object: `verdict` (`clean` or `findings`), `findings[]` (with `severity`, `reopens`,
+  `title`, `location`, `pattern`, `still_wrong`, `instances[]`, `fix` and `prevent`),
+  `step_back[]` and `out_of_scope[]`. `scripts/parse-review.pl` (perl core `JSON::PP`)
+  validates the object and renders the human-readable `review.md` from it. The loop
+  classifies a round from these fields only and **never** parses prose. Before v1.7.0's
+  step-back, every regex over markdown (headings, bold text, code spans, fences, an
+  embedded "did not find…" sentence) left another way for an unfinished review to pass as
+  clean.
 
 - Stdin is always `/dev/null`. With piped stdin, `codex exec` waits for a `<stdin>` block and
   can hang forever.
@@ -108,7 +119,7 @@ Everything is stored outside the working tree, under
 |---|---|
 | `state` | Persisted counters: `rounds_total`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `next_class_id`, `current_round_dir`. |
 | `ledger.md` | The append-only findings ledger (see "Ledger contract"). |
-| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta`, `log`, `last.md` (the review), `exit`, `verdict`, `ledger-fragment.md`. |
+| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta`, `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`. |
 
 The state is shared by every worktree of the repository. It **survives across invocations
 for the same branch**. The round-cap counters persist too, so a re-invocation cannot reset
@@ -160,10 +171,11 @@ The prompt that `start` writes is the class-format reviewer contract. It asks th
 - read the ledger first and obey the no-repeat rule
 - report only definite correctness, data-safety, concurrency or performance bugs introduced
   or left incomplete by the change
-- give, for each **class**, the `Pattern / Instances / Fix / Prevent` fields
-- list pre-existing issues under `Out of scope`, without a severity tag
-- end a clean review with the literal sentence `did not find any definite correctness bugs.`
-  **alone on its own line**, and use a severity tag `[Pn]` only at the start of a finding bullet
+- give, for each **class**, the `Pattern / Instances / Fix / Prevent` fields (`pattern`,
+  `instances[]`, `fix` and `prevent` in the schema)
+- set `reopens` to the ledger id for an incomplete fix, and fill `still_wrong`
+- put pre-existing issues in `out_of_scope`
+- use `verdict: "clean"` only for a complete review with no findings
 
 ### 3c. Wait for the round to finish
 
@@ -195,12 +207,13 @@ bash "$CR_REVIEW" finish
 | Exit | `VERDICT` | Meaning and handling |
 |---|---|---|
 | 3 | `head-drift` | HEAD moved while the reviewer ran (a concurrent agent, an auto-commit hook, or another shell). The round's verdict does not cover the current state. **Do not classify, do not touch `CLEAN_STREAK`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
-| 5 | `error` | The reviewer exited non-zero, produced no output, or produced output that does not follow the format. That includes any `[Pn]` tag outside a column-0 `- [Pn] ` bullet (bold, heading, starred, indented or in prose; quotes inside inline code are ignored), a bare `- **P1**` style severity, and a finding-less response without a standalone clean-sentence line. Read `last.md` and the `LOG|` tail it prints. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the log tail. Never classify an unreadable review as clean. |
+| 5 | `error` | The reviewer exited non-zero or produced no result, or the result failed validation in `parse-review.pl`. Validation fails on: invalid JSON (for example a prose answer), a missing field, a `verdict` that disagrees with `findings` (`clean` with findings, or `findings` with none), a bad severity or `reopens` value, or a class with no instances. `REASON=` says which. Read `result.json` and the `LOG|` tail. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the reason. Never classify an unreadable review as clean. |
 | 4 | `running` | The round has not finished. Go back to 3c. |
 | 0 | `clean`, `p3-only` or `dirty` | Continue with step 4. `finish` has already appended the round to the ledger, assigned ids to the new classes (`NEW_CLASSES=`), listed the cited ones (`REOPENED=`), listed the classes seen in two or more rounds (`RECURRING=`), and updated the persisted counters. |
 
-Read the review itself from `RESULT=` (`last.md`). Everything in `log` is the reviewer's
-command trace.
+Read the review from `RESULT=`, the rendered `review.md` in the documented
+`# Codex Review` / `Review comment:` layout. The raw object is at `RESULT_JSON=`.
+Everything in `log` is the reviewer's command trace.
 
 ---
 
@@ -279,7 +292,7 @@ and then the user is asked. Clean and confirmation rounds do not count toward th
 
 This replaces step 5 for one round.
 
-**Phase 1 — Write the step-back assessment.** Read the reviewer's `## Step-back assessment`
+**Phase 1 — Write the step-back assessment.** Read the reviewer's step-back assessment (`step_back[]`, rendered as `## Step-back assessment` in `review.md`)
 and the full ledger. For each **recurring class** (any id in `RECURRING=`, any class the
 step-back names, and any group of differently-titled classes that share one root pattern),
 write down:
@@ -501,12 +514,12 @@ Go back to step 3. `next` picks the mode:
   `<git-common-dir>/cr-loop/<branch-key>/ledger.md`. It is shared by every worktree of the
   repository and survives across invocations.
 - **Stable class ids.** `finish` assigns each new class id `C1`, `C2`, … in report order. A
-  reviewer bullet whose title starts with `[Cn]` is recorded as **reopened** under the same
-  id.
+  finding whose `reopens` field names a known ledger id is recorded as **reopened** under
+  that id. An unknown id gets a new id, with a note.
 - **Every round reads it.** The prompt points the reviewer at the ledger and forbids
   re-reporting any class in it. The only exception is a class whose fix is incomplete or
-  regressed in the reviewed code; the reviewer reports that as `[Cn]` with a
-  `Still wrong:` line. Classes noted as deferred, accepted or wontfix are never reported,
+  regressed in the reviewed code; the reviewer reports that one with `reopens: "Cn"`
+  and `still_wrong`. Classes noted as deferred, accepted or wontfix are never reported,
   not even as reopened.
 - **The author annotates with `note`:** fixed, deferred, accepted, wontfix, codified, and
   step-back assessments.

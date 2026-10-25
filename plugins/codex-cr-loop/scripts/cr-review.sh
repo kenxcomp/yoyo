@@ -32,7 +32,8 @@
 set -u
 
 SELF_VERSION="1.7.0"
-CLEAN_SENTENCE="did not find any definite correctness bugs"
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+SCHEMA="$HERE/../references/review-output.schema.json"
 
 die() { printf 'cr-review: %s\n' "$*" >&2; exit 2; }
 
@@ -185,9 +186,7 @@ write_prompt() {
         printf -- '  (2) for each, judge whether the current approach structurally invites it (e.g. duplicated predicates for display vs action, several owners of one piece of state,\n'
         printf -- '  per-event full recomputation, async work without an owned lifetime/cancellation, ad-hoc or imprecise equality);\n'
         printf -- '  (3) propose the approach change (single source of truth, ownership, invariant, API shape) that eliminates the whole class, plus the prevention artifact.\n'
-        printf -- '- Write that under "## Step-back assessment", one bullet per recurring class:\n'
-        printf -- '  "- [C2, C5] <class> — Invites it because: ... — Approach change: ... — Prevent: ..."\n'
-        printf -- '  Then list instances that are still present as normal findings under "Review comment:".\n'
+        printf -- '- Put that in the step_back array (one entry per recurring class), and list still-present instances as normal findings.\n'
         ;;
       *)
         printf -- '- Review the whole branch diff `git diff %s...%s` (start with --stat, then read the hunks and the surrounding code you need).\n' "$base_sha" "$head"
@@ -199,24 +198,25 @@ write_prompt() {
     printf -- '- Follow AGENTS.md / CLAUDE.md (root and nested next to changed files) if present.\n'
     printf '\nLEDGER (no repeats)\n'
     printf -- '- Read the findings ledger first: %s\n' "$LEDGER"
-    printf -- '- Never report a ledger class again. Exception: its fix is incomplete or regressed in the code under review — then begin the title with its id, e.g. "[C3] <title>", and add a "Still wrong:" line.\n'
+    printf -- '- Never report a ledger class again. Exception: its fix is incomplete or regressed in the code under review — then set reopens to its id (e.g. "C3") and fill still_wrong.\n'
     printf -- '- Classes the ledger notes mark deferred / accepted / wontfix must not be reported at all, not even as reopened.\n'
     printf '\nWHAT TO REPORT\n'
     printf -- '- Only definite, actionable correctness, data-safety, concurrency or performance bugs introduced (or left incomplete) by this change. No style nits, no speculative hardening.\n'
     printf -- '- Report bug CLASSES, not single lines. One bullet per class: the root pattern and why it is wrong; EVERY instance in the reviewed scope (search for the pattern — do not stop at the first hit);\n'
     printf -- '  the systematic fix that removes all instances in one pass; how to prevent recurrence at the source (lint rule, source-guard or regression test, REVIEW.md entry, AGENTS.md/CLAUDE.md rule).\n'
     printf -- '- Severity: P0 data loss / security / crash on a common path; P1 wrong behaviour on a realistic path; P2 edge-case bug or measurable performance regression; P3 minor / defensive.\n'
-    printf -- '- Pre-existing issues outside this change go under "Out of scope" without a severity tag; they do not count.\n'
-    printf '\nOUTPUT FORMAT (exact; the loop parses it)\n'
-    printf '# Codex Review\n\n<one-paragraph summary>\n\n'
-    [ "$mode" = "step-back" ] && printf '## Step-back assessment\n\n- [C<ids>] <class> — Invites it because: ... — Approach change: ... — Prevent: ...\n\n'
-    printf 'Review comment:\n\n'
-    printf -- '- [P1] <class title> — <primary file>:<line>\n  Pattern: <root pattern and why it is wrong>\n  Instances: <file:line>, <file:line>, ...\n  Fix: <systematic fix>\n  Prevent: <lint rule / source-guard test / REVIEW.md entry>\n\n'
-    printf -- '- [P2] [C3] <title of the reopened ledger class> — <file>:<line>\n  Still wrong: <what the fix missed>\n  Instances: ...\n  Fix: ...\n  Prevent: ...\n\n'
-    printf 'Out of scope (pre-existing, not counted):\n  <file:line> — <one line>   (omit when empty; never start these lines with "- [P")\n\n'
-    printf 'Every finding bullet starts with "- [P0]".."- [P3]" at column 0; detail lines are indented two spaces.\n'
-    printf 'If there are no findings, write the summary and then this exact sentence alone on its own line:\n%s.\n' "$CLEAN_SENTENCE"
-    printf 'Never write that sentence when the review is incomplete; never put a severity tag like [P1] anywhere except at the start of a finding bullet.\n'
+    printf -- '- Pre-existing issues outside this change go in out_of_scope; they do not count.\n'
+    printf '\nOUTPUT (structured; enforced by an output schema — the loop reads only these fields)\n'
+    printf -- '- verdict: "clean" only when the review is complete and findings is empty; otherwise "findings". An incomplete review is never "clean".\n'
+    printf -- '- findings: one object per bug class: severity (P0..P3), reopens ("" for a new class, or the ledger id such as "C3" for an incomplete/regressed fix),\n'
+    printf -- '  title, location (primary file:line), pattern (root pattern + why wrong), still_wrong ("" unless reopens), instances (EVERY file:line), fix, prevent.\n'
+    if [ "$mode" = "step-back" ]; then
+      printf -- '- step_back: one object per recurring class: classes (ledger ids), name, invites_because, approach_change, prevent.\n'
+    else
+      printf -- '- step_back: [] (only used in step-back rounds).\n'
+    fi
+    printf -- '- out_of_scope: pre-existing issues outside this change as {location, note}; they do not count.\n'
+    printf -- '- summary: one paragraph.\n'
     printf 'Do not modify any files.\n'
   } > "$p"
 }
@@ -232,6 +232,7 @@ cmd_init() {
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ]; then printf 'CURRENT_ROUND=%s (%s)\n' "$cur" "$(round_state "$cur")"; fi
   command -v codex >/dev/null 2>&1 && printf 'CODEX=%s\n' "$(command -v codex)" || printf 'CODEX=missing\n'
+  perl -MJSON::PP -e 1 2>/dev/null && printf 'PERL_JSON=ok\n' || printf 'PERL_JSON=missing\n'
   [ -n "$WARNINGS" ] && printf 'WARNINGS=%s\n' "$WARNINGS"
   return 0
 }
@@ -290,6 +291,8 @@ cmd_start() {
   case "$mode" in full|incremental|step-back) ;; *) die "start: --mode must be full|incremental|step-back" ;; esac
   [ -n "$base" ] || die "start: --base is required"
   command -v codex >/dev/null 2>&1 || die "codex CLI not found on PATH — install it (e.g. 'npm i -g @openai/codex' or 'brew install codex') and run 'codex login'"
+  perl -MJSON::PP -e 1 2>/dev/null || die "perl with JSON::PP is required to parse review results (macOS system perl has it)"
+  [ -f "$SCHEMA" ] || die "output schema missing: $SCHEMA"
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ] && [ "$(round_state "$cur")" = "running" ]; then
     die "a review round is already running for this branch: $cur (use 'wait', 'finish' or 'cancel')"
@@ -307,7 +310,7 @@ cmd_start() {
   mkdir -p "$d" || die "cannot create $d"
   {
     printf 'mode=%s\nbase_ref=%s\nbase_sha=%s\nsince=%s\nreviewed_head=%s\nround=%s\n' "$mode" "$base" "$base_sha" "$since" "$head" "$n"
-    printf 'effort=%s\nmodel=%s\nroot=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$(now_utc)" "$(date +%s)"
+    printf 'effort=%s\nmodel=%s\nroot=%s\nschema=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$SCHEMA" "$(now_utc)" "$(date +%s)"
   } > "$d/meta"
   write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"
   sset rounds_started "$n"
@@ -315,20 +318,20 @@ cmd_start() {
   launch_detached "$(self_path)" "$d"
   printf 'ROUND=%s\nMODE=%s\nROUND_DIR=%s\nPID=%s\nREVIEWED_HEAD=%s\nBASE_SHA=%s\n' "$n" "$mode" "$d" "$(cat "$d/pid")" "$head" "$base_sha"
   [ -n "$since" ] && printf 'SINCE=%s\n' "$since"
-  printf 'RESULT=%s/last.md\n' "$d"
+  printf 'RESULT_JSON=%s/result.json\n' "$d"
 }
 
 cmd__run() {
   d="$1"
   printf '%s\n' "$$" > "$d/pid"
-  root=$(mget "$d" root); effort=$(mget "$d" effort); model=$(mget "$d" model)
+  root=$(mget "$d" root); effort=$(mget "$d" effort); model=$(mget "$d" model); schema=$(mget "$d" schema)
   prompt=$(cat "$d/prompt.md")
   if [ -n "$model" ]; then
     codex exec --sandbox read-only -C "$root" -m "$model" -c "model_reasoning_effort=$effort" \
-      --output-last-message "$d/last.md" "$prompt" </dev/null >"$d/log" 2>&1 &
+      --output-schema "$schema" --output-last-message "$d/result.json" "$prompt" </dev/null >"$d/log" 2>&1 &
   else
     codex exec --sandbox read-only -C "$root" -c "model_reasoning_effort=$effort" \
-      --output-last-message "$d/last.md" "$prompt" </dev/null >"$d/log" 2>&1 &
+      --output-schema "$schema" --output-last-message "$d/result.json" "$prompt" </dev/null >"$d/log" 2>&1 &
   fi
   cpid=$!
   printf '%s\n' "$cpid" > "$d/codex.pid"
@@ -374,43 +377,6 @@ cmd_cancel() {
   print_status "$d"
 }
 
-# Parse last.md into a ledger fragment, assigning class ids.
-# stdout: NEW=<ids> / REOPENED=<ids> / NEXT=<n>
-parse_findings() {
-  awk -v nid="$2" -v frag="$3" '
-    BEGIN { new=""; reo=""; inblock=0; insec="" }
-    /^- \[P[0-3]\]/ {
-      inblock=1; insec=""
-      sev=substr($0, 4, 2)
-      rest=substr($0, 7)
-      sub(/^[ \t]+/, "", rest)
-      if (match(rest, /^\[C[0-9]+\]/)) {
-        id=substr(rest, RSTART+1, RLENGTH-2)
-        rest=substr(rest, RLENGTH+1); sub(/^[ \t]+/, "", rest)
-        print "### " id " (reopened) [" sev "] " rest > frag
-        reo = reo (reo=="" ? "" : ",") id
-      } else {
-        id="C" nid; nid++
-        print "### " id " [" sev "] " rest > frag
-        new = new (new=="" ? "" : ",") id
-      }
-      next
-    }
-    /^## Step-back assessment/ { inblock=0; insec="sb"; print "#### Step-back assessment" > frag; next }
-    /^Out of scope/ { inblock=0; insec="oos"; print "#### Out of scope (pre-existing, not counted)" > frag; next }
-    /^Review comment:/ { inblock=0; insec=""; next }
-    /^#/ { inblock=0; insec=""; next }
-    {
-      if (inblock) {
-        if ($0 ~ /^[ \t]/ || $0 == "") { if ($0 != "") print $0 > frag; next }
-        inblock=0
-      }
-      if (insec != "" && $0 != "") print $0 > frag
-    }
-    END { print "NEW=" new; print "REOPENED=" reo; print "NEXT=" nid }
-  ' "$1"
-}
-
 cmd_finish() {
   resolve_paths; resolve_knobs; ensure_state
   d=$(round_dir_arg "${1:-}") || exit 2
@@ -424,50 +390,31 @@ cmd_finish() {
     exit 3
   fi
   rc=$(cat "$d/exit" 2>/dev/null || printf 'dead')
-  res="$d/last.md"
+  res="$d/result.json"
   if [ "$rc" != "0" ] || [ ! -s "$res" ]; then
     printf 'VERDICT=error\nEXIT=%s\nRESULT=%s\nLOG=%s\n' "$rc" "$res" "$d/log"
     tail -n 20 "$d/log" 2>/dev/null | sed 's/^/LOG| /'
     exit 5
   fi
-  # Validate the whole response before classifying (never let a malformed or
-  # unfinished review reach the convergence path):
-  #  1. every severity token "[Pn]" in the response must be the tag of a column-0
-  #     "- [Pn] " finding bullet (so "**[P1]**", "### [P1]", "* [P1]", indented
-  #     bullets, or tags in prose all fail closed and need a manual read);
-  #  2. list items / headings that carry a bare severity ("- **P1**", "## P1:") fail too;
-  #  3. a response without findings is clean only when the clean sentence stands
-  #     alone on its own line (a sentence embedded in prose — e.g. "I cannot state
-  #     that I did not find any definite correctness bugs" — is not a verdict).
-  c0=$(grep -cE '^- \[P0\] ' "$res"); c1=$(grep -cE '^- \[P1\] ' "$res")
-  c2=$(grep -cE '^- \[P2\] ' "$res"); c3=$(grep -cE '^- \[P3\] ' "$res")
-  total=$(( c0 + c1 + c2 + c3 ))
-  # Inline code spans (`...`) are quotes, not verdicts: strip them before counting.
-  plain="$d/last.plain"
-  sed 's/`[^`]*`//g' "$res" > "$plain"
-  tokens=$(grep -oE '\[P[0-3]\]' "$plain" | wc -l | tr -d ' ')
-  bare=$(grep -nE '^[[:space:]]*([-*+]|[0-9]+[.)]|#+)[[:space:]]*(\*\*|__)?P[0-3]([^0-9A-Za-z]|$)' "$plain")
-  if [ "$tokens" != "$total" ] || [ -n "$bare" ]; then
-    printf 'VERDICT=error\nREASON=malformed finding(s): %s severity tag(s) but %s column-0 "- [Pn] " bullet(s) — read %s manually\n' "$tokens" "$total" "$res"
-    { grep -nE '\[P[0-3]\]' "$plain" | grep -vE '^[0-9]+:- \[P[0-3]\] '; printf '%s\n' "$bare"; } | grep -v '^$' | head -n 5 | sed 's/^/BAD| /'
+  # The verdict comes from structured JSON (codex exec --output-schema) validated by
+  # parse-review.pl — never from heuristics over prose (step-back of C1, v1.7.0).
+  frag="$d/ledger-fragment.md"; md="$d/review.md"
+  parsed=$(perl "$HERE/parse-review.pl" "$res" "$(snum next_class_id)" "$LEDGER" "$frag" "$md")
+  prc=$?
+  if [ "$prc" -ne 0 ]; then
+    printf 'VERDICT=error\n%s\nRESULT=%s\n' "$(printf '%s\n' "$parsed" | sed -n 's/^ERROR=/REASON=/p')" "$res"
     exit 5
   fi
+  pv() { printf '%s\n' "$parsed" | sed -n "s/^$1=//p"; }
+  c0=$(pv P0); c1=$(pv P1); c2=$(pv P2); c3=$(pv P3); total=$(pv TOTAL)
+  new=$(pv NEW); reo=$(pv REOPENED); nxt=$(pv NEXT)
   if [ "$total" -eq 0 ]; then
-    if ! grep -qiE "^[[:space:]]*$CLEAN_SENTENCE\.?[[:space:]]*\$" "$plain"; then
-      printf 'VERDICT=error\nREASON=no findings and no standalone clean-sentence line ("%s.") — incomplete or unparseable review, read %s manually\n' "$CLEAN_SENTENCE" "$res"
-      exit 5
-    fi
     verdict=clean
   elif [ $(( c0 + c1 + c2 )) -eq 0 ] && [ "$SKIP_P3" = "1" ]; then
     verdict=p3-only
   else
     verdict=dirty
   fi
-  frag="$d/ledger-fragment.md"; : > "$frag"
-  parsed=$(parse_findings "$res" "$(snum next_class_id)" "$frag")
-  new=$(printf '%s\n' "$parsed" | sed -n 's/^NEW=//p')
-  reo=$(printf '%s\n' "$parsed" | sed -n 's/^REOPENED=//p')
-  nxt=$(printf '%s\n' "$parsed" | sed -n 's/^NEXT=//p')
   {
     printf '\n## Round %s — %s — %s — %s (P0×%s P1×%s P2×%s P3×%s) — %s\n' \
       "$n" "$mode" "$(git rev-parse --short "$reviewed")" "$verdict" "$c0" "$c1" "$c2" "$c3" "$(now_utc)"
@@ -490,7 +437,7 @@ cmd_finish() {
     printf 'VERDICT=%s\nMODE=%s\nROUND=%s\nP0=%s\nP1=%s\nP2=%s\nP3=%s\n' "$verdict" "$mode" "$n" "$c0" "$c1" "$c2" "$c3"
     printf 'NEW_CLASSES=%s\nREOPENED=%s\nRECURRING=%s\n' "$new" "$reo" "$recurring"
     printf 'DIRTY_SINCE_STEP_BACK=%s/%s\nSTEP_BACKS_DONE=%s/%s\n' "$(snum dirty_since_step_back)" "$ROUND_CAP" "$(snum step_backs_done)" "$MAX_STEP_BACKS"
-    printf 'REVIEWED_HEAD=%s\nRESULT=%s\nLEDGER=%s\n' "$reviewed" "$res" "$LEDGER"
+    printf 'REVIEWED_HEAD=%s\nRESULT=%s\nRESULT_JSON=%s\nLEDGER=%s\n' "$reviewed" "$md" "$res" "$LEDGER"
   } | tee "$d/verdict"
   : > "$d/finished"
 }

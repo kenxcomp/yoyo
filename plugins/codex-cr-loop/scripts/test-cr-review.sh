@@ -44,20 +44,35 @@ run_round() {
   bash "$CR" finish
 }
 
-fixture() { printf '%b' "$2" > "$TMP/$1.md"; printf '%s\n' "$TMP/$1.md"; }
+fixture() { printf '%s\n' "$2" > "$TMP/$1.json"; printf '%s\n' "$TMP/$1.json"; }
+find_obj() { # find_obj <sev> <reopens> <title> [<still_wrong>]
+  printf '{"severity":"%s","reopens":"%s","title":"%s","location":"a.txt:1","pattern":"p","still_wrong":"%s","instances":["a.txt:1","a.txt:2"],"fix":"f","prevent":"t"}' "$1" "$2" "$3" "${4:-}"
+}
+result() { # result <verdict> <findings-json-array> [<step_back-array>] [<oos-array>]
+  printf '{"summary":"s","verdict":"%s","findings":%s,"step_back":%s,"out_of_scope":%s}' "$1" "$2" "${3:-[]}" "${4:-[]}"
+}
 
-F_CLEAN=$(fixture clean '# Codex Review\n\nAll fine.\n\ndid not find any definite correctness bugs.\n')
-F_EMBEDDED=$(fixture embedded '# Codex Review\n\nI could not complete the review, so I cannot state that I did not find any definite correctness bugs.\n')
-F_BOLD=$(fixture bold '# Codex Review\n\nx\n\nReview comment:\n\n- [P3] ok nit — a.txt:1\n\n- **[P1]** bold tag — a.txt:2\n')
-F_HEADING=$(fixture heading '# Codex Review\n\nx\n\n- [P3] ok nit — a.txt:1\n\n### [P1] heading tag — a.txt:2\n')
-F_BARE=$(fixture bare '# Codex Review\n\nx\n\n- **P1** bare severity — a.txt:2\n')
-F_QUOTED=$(fixture quoted '# Codex Review\n\nx\n\nReview comment:\n\n- [P2] Quoted example — a.txt:1\n  Still wrong: mixing `- **[P1]** x` with a P3 passes\n')
-F_HEAD_ONLY=$(fixture headonly '# Codex Review\n\nI could not finish the review.\n')
-F_DIRTY=$(fixture dirty '# Codex Review\n\nx\n\nReview comment:\n\n- [P1] Class A — a.txt:1\n  Pattern: p\n  Instances: a.txt:1, a.txt:2\n  Fix: f\n  Prevent: t\n\n- [P3] Nit — a.txt:3\n  Pattern: n\n\nOut of scope (pre-existing, not counted):\n  a.txt:9 — old\n')
-F_P3=$(fixture p3 '# Codex Review\n\nx\n\nReview comment:\n\n- [P3] Another nit — a.txt:4\n  Pattern: n\n')
-F_MIXED=$(fixture mixed '# Codex Review\n\nx\n\nReview comment:\n\n- [P3] ok nit — a.txt:1\n\n* [P1] star bullet — a.txt:2\n')
-F_INDENT=$(fixture indent '# Codex Review\n\nx\n\n  - [P0] indented — a.txt:1\n')
-F_REOPEN=$(fixture reopen '# Codex Review\n\nx\n\nReview comment:\n\n- [P2] [C1] Class A — a.txt:2\n  Still wrong: one left\n')
+F_CLEAN=$(fixture clean "$(result clean '[]')")
+F_DIRTY=$(fixture dirty "$(result findings "[$(find_obj P1 '' 'Class A'),$(find_obj P3 '' 'Nit')]" '[]' '[{"location":"a.txt:9","note":"old"}]')")
+F_P3=$(fixture p3 "$(result findings "[$(find_obj P3 '' 'Another nit')]")")
+F_REOPEN=$(fixture reopen "$(result findings "[$(find_obj P2 C1 'Class A' 'one left')]")")
+F_STEPBACK=$(fixture stepback "$(result findings "[$(find_obj P2 C1 'Class A' 'one left')]" '[{"classes":["C1"],"name":"Heuristic verdict","invites_because":"prose","approach_change":"schema","prevent":"test"}]')")
+F_UNKNOWN=$(fixture unknown "$(result findings "[$(find_obj P2 C99 'Cites unknown id')]")")
+# fail-closed fixtures: none of these may ever classify as clean
+F_PROSE=$(fixture prose '# Codex Review
+
+I could not complete the review.
+
+```
+did not find any definite correctness bugs.
+```')
+F_CLEAN_WITH_FINDINGS=$(fixture cleanwith "$(result clean "[$(find_obj P1 '' 'x')]")")
+F_FINDINGS_EMPTY=$(fixture findempty "$(result findings '[]')")
+F_BAD_SEV=$(fixture badsev "$(result findings "[$(find_obj P9 '' 'x')]")")
+F_BAD_VERDICT=$(fixture badverdict "$(result maybe '[]')")
+F_NO_INSTANCES=$(fixture noinst '{"summary":"s","verdict":"findings","findings":[{"severity":"P1","reopens":"","title":"t","location":"a:1","pattern":"p","still_wrong":"","instances":[],"fix":"f","prevent":"t"}],"step_back":[],"out_of_scope":[]}')
+F_MISSING=$(fixture missing '{"summary":"s","verdict":"clean","findings":[]}')
+F_BAD_REOPEN=$(fixture badreopen "$(result findings "[$(find_obj P1 'see C1' 'x')]")")
 
 # --- C2: state dir resolves identically from root, a subdirectory and a linked worktree
 P_ROOT=$(bash "$CR" paths | kv STATE_DIR)
@@ -67,22 +82,13 @@ git worktree add -q "$TMP/wt" -b feat/other >/dev/null 2>&1
 P_WT=$(cd "$TMP/wt" && bash "$CR" paths | kv STATE_DIR)
 expect "linked worktree common dir" "$(dirname "$P_ROOT")/feat__other" "$P_WT"
 
-# --- C1: classification table
+# --- C1: classification table (structured verdict, fail closed)
 expect "clean"           "clean"   "$(run_round "$F_CLEAN" full | kv VERDICT)"
-out=$(run_round "$F_HEAD_ONLY" full); rc=$?
-expect "heading-only is error (exit)" "5" "$rc"
-expect "heading-only is error" "error" "$(printf '%s\n' "$out" | kv VERDICT)"
-out=$(run_round "$F_MIXED" full); rc=$?
-expect "mixed valid P3 + malformed P1 is error" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
-out=$(run_round "$F_INDENT" full); rc=$?
-expect "indented finding is error" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
-for f in "$F_EMBEDDED" "$F_BOLD" "$F_HEADING" "$F_BARE"; do
+grep -q '^did not find any definite correctness bugs\.$' "$(bash "$CR" paths | kv STATE_DIR)"/rounds/*-full/review.md && ok || bad "clean review.md rendered"
+for f in "$F_PROSE" "$F_CLEAN_WITH_FINDINGS" "$F_FINDINGS_EMPTY" "$F_BAD_SEV" "$F_BAD_VERDICT" "$F_NO_INSTANCES" "$F_MISSING" "$F_BAD_REOPEN"; do
   out=$(run_round "$f" full); rc=$?
   expect "fails closed: $(basename "$f")" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
 done
-out=$(run_round "$F_QUOTED" full)
-expect "code-quoted tag is not a finding" "dirty:1" "$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv P2)"
-bash "$CR" reset >/dev/null
 out=$(FAKE_RC=1 run_round "$F_CLEAN" full); rc=$?
 expect "non-zero codex exit is error" "5" "$rc"
 out=$(run_round "$F_DIRTY" full)
@@ -91,6 +97,8 @@ expect "dirty counts" "1:1" "$(printf '%s\n' "$out" | kv P1):$(printf '%s\n' "$o
 expect "class ids" "C1,C2" "$(printf '%s\n' "$out" | kv NEW_CLASSES)"
 LEDGER=$(bash "$CR" paths | kv LEDGER)
 grep -q 'a.txt:9 — old' "$LEDGER" && ok || bad "out-of-scope section recorded in ledger"
+grep -q '^- \[P1\] Class A — a.txt:1$' "$(printf '%s\n' "$out" | kv RESULT)" && ok || bad "review.md renders class bullets"
+expect "unknown reopen id becomes a new class" "C3:" "$(run_round "$F_UNKNOWN" full | sed -n 's/^NEW_CLASSES=//p;s/^REOPENED=//p' | paste -sd: -)"
 expect "p3-only (skip on)" "p3-only" "$(run_round "$F_P3" full | kv VERDICT)"
 expect "p3-only strict" "dirty" "$(CR_LOOP_SKIP_P3=0 run_round "$F_P3" full | kv VERDICT)"
 
@@ -107,7 +115,8 @@ expect "recurring after reopen" "C1" "$(printf '%s\n' "$out" | kv RECURRING)"
 echo f3 >> a.txt && git commit -qam f3
 expect "cap -> step-back" "step-back" "$(bash "$CR" next | kv MODE)"
 expect "cap wins over confirmation" "step-back" "$(bash "$CR" next --clean-streak 1 | kv MODE)"
-out=$(run_round "$F_REOPEN" step-back)
+out=$(run_round "$F_STEPBACK" step-back)
+grep -q '^- \[C1\] Heuristic verdict — Invites it because: prose' "$LEDGER" && ok || bad "step-back assessment recorded in ledger"
 expect "step-back resets dirty counter" "0/3" "$(printf '%s\n' "$out" | kv DIRTY_SINCE_STEP_BACK)"
 for i in 4 5 6; do
   echo "f$i" >> a.txt && git commit -qam "f$i"

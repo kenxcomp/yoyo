@@ -45,6 +45,8 @@ convergence:
   `brew install codex`, then run `codex login`. `/codex:setup` from the `openai-codex`
   plugin can check this, but that plugin is no longer required (see
   [Breaking changes](#breaking-changes-in-v170)).
+- `perl` with the core `JSON::PP` module (macOS system perl includes it). It validates the
+  structured review result and detaches the reviewer.
 - `git`, and a clean working tree. Untracked `.cr-loop-handoff-round-*.md` files from an
   earlier stop are ignored.
 - A feature branch built on top of its base. Otherwise the preflight gate asks you to rebase
@@ -133,8 +135,20 @@ The runner launches:
 
 ```text
 codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
-           --output-last-message <round>/last.md "<class-format prompt>" < /dev/null
+           --output-schema references/review-output.schema.json \
+           --output-last-message <round>/result.json "<class-format prompt>" < /dev/null
 ```
+
+- **The verdict is structured data.** `--output-schema` forces a strict JSON result:
+  - `verdict`: `clean` or `findings`
+  - `findings[]`: each with `severity`, `reopens`, `title`, `location`, `pattern`,
+    `still_wrong`, `instances[]`, `fix`, `prevent`
+  - `step_back[]`
+  - `out_of_scope[]`
+
+  [`scripts/parse-review.pl`](./scripts/parse-review.pl) (perl core `JSON::PP`) validates
+  that result and renders `review.md`. A prose answer, a `verdict` that contradicts
+  `findings`, or a missing field becomes an `error`, never `clean`. No markdown is parsed.
 
 - **stdin is `/dev/null`.** With a piped stdin, `codex exec` waits for a `<stdin>` block and
   can hang forever.
@@ -156,7 +170,7 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
 | `tree-clean` | The one clean-tree check, shared by the preflight and the completion step. It ignores only untracked repo-root `.cr-loop-handoff-round-<N>.md` files. |
 | `mark-converged` / `cancel` / `reset` / `paths` | Housekeeping. |
 
-`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers verdict classification, malformed output, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
+`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers structured-verdict classification and fail-closed validation, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
 
 Your permission settings may prompt on every script call. To stop that, add an allow rule
 that wildcards the version segment of the install path, for example
@@ -198,9 +212,8 @@ that wildcards the version segment of the install path, for example
 - **Stop reasons changed.** `widening-hint`, `widening-sweeps-exhausted`,
   `widening-hint-no-clear-root-cause`, and `round-cap-reached` are replaced by
   `step-back-exhausted`, `step-back-scope-declined`, and `reviewer-error`.
-- **The review output format is class-based** (`Pattern / Instances / Fix / Prevent`).
-  Findings are still detected from `- [P0]` to `- [P3]` bullets at column 0. Output that
-  can't be parsed is an `error`, never a clean round.
+- **The review output is structured JSON** (`references/review-output.schema.json`), not markdown. The class fields are `pattern`, `instances`, `fix` and `prevent`, and the loop renders a markdown `review.md` for people to read. This change came out of the plugin's own step-back: free-text verdict parsing kept leaking edge cases. Requires perl with `JSON::PP`, which macOS system perl includes.
+  Output that doesn't validate is an `error`, never a clean round.
 - **`/cr-loop-pr` fixes:**
   - The PR body is written to a file and passed with `--body-file`.
   - The body's test plan is now generic instead of listing hard-coded project commands, and
