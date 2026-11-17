@@ -142,7 +142,8 @@ knobs removed in v1.7.0 and how they are mapped. `/cr-loop` has no knobs of its 
 
    **9a. Handoff.** On any stop without convergence, write the handoff as protocol 9a
    describes. `/cr-loop` has only the shared stop reasons: `head-drift-during-review`,
-   `reviewer-error`, `step-back-exhausted`, `step-back-scope-declined`, `user-stopped`. The
+   `reviewer-error`, `rule-edits-declined`, `step-back-exhausted`, `step-back-scope-declined`,
+   `user-stopped`. The
    resume instructions name `/cr-loop $ARGUMENTS`.
 
    **9b. Report.** Always output the shared lines from protocol 9b, ending with the Chinese

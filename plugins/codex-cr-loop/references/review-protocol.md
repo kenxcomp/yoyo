@@ -1,4 +1,4 @@
-# codex-cr-loop review protocol (v1.7.0)
+# codex-cr-loop review protocol (v1.8.0)
 
 This document is the **authoritative review-loop body** shared by `/cr-loop`, `/cr-loop-merge`
 and `/cr-loop-pr`. Each command owns only its preflight (step 1) and its completion step
@@ -87,7 +87,7 @@ findings. It also fails with `spawnSync ENOBUFS` on diffs larger than 1 MiB. The
 the reviewer as:
 
 ```text
-codex exec --sandbox read-only -C <repo root> -c model_reasoning_effort=<CR_LOOP_REVIEW_EFFORT, default high>
+codex exec --sandbox read-only -C <repo root> -c project_doc_max_bytes=0 -c model_reasoning_effort=<CR_LOOP_REVIEW_EFFORT, default high>
            --output-schema references/review-output.schema.json
            --output-last-message <round>/result.json "<prompt>" < /dev/null
 ```
@@ -117,9 +117,9 @@ Everything is stored outside the working tree, under
 
 | Path | Content |
 |---|---|
-| `state` | Persisted counters: `rounds_total`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `next_class_id`, `current_round_dir`. |
+| `state` | Persisted counters: `rounds_total`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `next_class_id`, `current_round_dir`, and (v1.8.0) `rules_pending_fp` / `rules_ack_fp` for the rule-file approval (4h). Older state dirs simply lack the new keys. |
 | `ledger.md` | The append-only findings ledger (see "Ledger contract"). |
-| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta`, `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`. |
+| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta` (v1.8.0 adds `head_moves` and `tree_fp`, the snapshot `finish` checks for drift), `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`. |
 | `../<branch-key>.lock` | Branch-level **kernel advisory lock** (`flock`, taken through perl and held on fd 9). Every state transaction (`init`, `next`, `start`, `finish`, `note`, `add`, `mark-converged`, `cancel`, `reset`) runs under it, so two sessions on the same branch cannot both start a round, finish one twice, or allocate the same class id. The kernel releases the lock when the holder exits, crashes included, so there is no stale-lock state. A live holder is waited for up to 30 s. The detached reviewer is started with fd 9 closed, so it never holds the lock. |
 
 The state is shared by every worktree of the repository. It **survives across invocations
@@ -167,8 +167,10 @@ because unquoted `${SINCE:+…}` does not word-split there.
 
 The prompt that `start` writes is the class-format reviewer contract. It asks the reviewer to:
 
-- read `REVIEW.md`, `AGENTS.md` and `CLAUDE.md` (at the repo root and next to the changed
-  files) when present, and treat any violation of a codified `REVIEW.md` class as a finding
+- read the **base** versions of `REVIEW.md`, `AGENTS.md`, `AGENTS.override.md` and
+  `CLAUDE.md` (at the repo root and in the directories of the changed files) with
+  `git show <base_sha>:<path>`, never the working tree, and treat any violation of a
+  codified base `REVIEW.md` class as a finding (see **Rule source** below)
 - read the ledger first and obey the no-repeat rule
 - report only definite correctness, data-safety, concurrency or performance bugs introduced
   or left incomplete by the change
@@ -177,6 +179,31 @@ The prompt that `start` writes is the class-format reviewer contract. It asks th
 - set `reopens` to the ledger id for an incomplete fix, and fill `still_wrong`
 - put pre-existing issues in `out_of_scope`
 - use `verdict: "clean"` only for a complete review with no findings
+
+#### Rule source (v1.8.0)
+
+The change under review must not be able to edit the checks that review it.
+
+- **Rules come from the base.** The prompt pins the base commit `start` resolved
+  (`BASE_SHA=`), lists the rule files present there, and tells the reviewer to read each with
+  `git show <base_sha>:<path>`. The reviewer also runs with `-c project_doc_max_bytes=0`, so
+  Codex does not auto-load the worktree's (branch's) `AGENTS.md` into its instructions. The
+  user-level `~/.codex/AGENTS.md` still loads.
+- **The branch's rule-file edits are content under review.** `scripts/review-rules.sh`
+  classifies each edited `REVIEW.md` / `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md`
+  (`git diff --no-renames <base>...<head>`):
+  - `additive`: a new file, or only added lines. Allowed (codify at source, 5c), listed in
+    the prompt and in `review.md`, but never used as a rule on this branch, so it cannot
+    exempt or downgrade this branch's findings. It applies to later branches once merged.
+  - `needs-human`: any removed or rewritten line, a deleted file, a type change, a binary
+    file, or a diff that could not be computed. The loop flags these itself; the reviewer is
+    told not to report them and not to let them move the verdict.
+- **Why deterministic, not a schema field.** The classification is line-based and computed
+  by the script from the reviewed commit, not reported by the reviewer. A reviewer cannot
+  miss it, the branch cannot argue it away, it is testable without Codex, and the output
+  schema and `parse-review.pl` stay unchanged (pre-1.8.0 results still validate).
+  Limitation: a purely additive line that grants an exception is classified `additive`; the
+  reviewer is still told added entries never exempt anything in this branch.
 
 ### 3c. Wait for the round to finish
 
@@ -210,10 +237,10 @@ bash "$CR_REVIEW" finish
 
 | Exit | `VERDICT` | Meaning and handling |
 |---|---|---|
-| 3 | `head-drift` | HEAD moved while the reviewer ran (a concurrent agent, an auto-commit hook, or another shell). The round's verdict does not cover the current state. **Do not classify, do not touch `CLEAN_STREAK`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
+| 3 | `head-drift` | What the reviewer read changed while it ran (a concurrent agent, an auto-commit hook, or another shell). `REASON=` is `head-moved` (HEAD differs from `REVIEWED_HEAD`), `head-moved-and-returned` (the HEAD reflog grew during the round although HEAD is back on `REVIEWED_HEAD`), or `tree-changed` (tracked files were edited without committing). Rounds started before v1.8.0 only get the `head-moved` check. The round's verdict does not cover the current state. **Do not classify, do not touch `CLEAN_STREAK`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
 | 5 | `error` | The reviewer exited non-zero or produced no result, or the result failed validation in `parse-review.pl`. Validation fails on: invalid JSON (for example a prose answer), a missing field, a `verdict` that disagrees with `findings` (`clean` with findings, or `findings` with none), a bad severity or `reopens` value, or a class with no instances. `REASON=` says which. Read `result.json` and the `LOG|` tail. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the reason. Never classify an unreadable review as clean. |
 | 4 | `running` | The round has not finished. Go back to 3c. |
-| 0 | `clean`, `p3-only` or `dirty` | Continue with step 4. `finish` has already appended the round to the ledger, assigned ids to the new classes (`NEW_CLASSES=`), listed the cited ones (`REOPENED=`), listed the classes seen in two or more rounds (`RECURRING=`), and updated the persisted counters. |
+| 0 | `clean`, `p3-only`, `needs-human` or `dirty` | Continue with step 4. `finish` has already appended the round to the ledger, assigned ids to the new classes (`NEW_CLASSES=`), listed the cited ones (`REOPENED=`), listed the classes seen in two or more rounds (`RECURRING=`), and updated the persisted counters. It also prints `RULE_CHANGES=`, `RULES_NEED_HUMAN=`, `RULES_FP=` and one `RULE|` line per edited rule file (see Rule source in 3b). |
 
 Read the review from `RESULT=`, the rendered `review.md` in the documented
 `# Codex Review` / `Review comment:` layout. The raw object is at `RESULT_JSON=`.
@@ -254,6 +281,34 @@ round comes back as `dirty`.
 A P3-only round makes no commit. The next round therefore reviews the same HEAD, and the
 ledger stops the P3s from being reported again. Without this, the loop would rerun the same
 P3-only verdict forever.
+
+### 4h. Rule-file edits need a person
+
+`VERDICT=needs-human`: the code review itself was clean (or P3-only with
+`CR_LOOP_SKIP_P3=1`), but the branch removes or rewrites lines in a rule file and no person
+has approved exactly these edits yet (`RULES_NEED_HUMAN≥1`). It is **not** clean: do not
+touch `CLEAN_STREAK`. It is not dirty either: `dirty_since_step_back` does not grow.
+
+1. Show the user the `RULE|` lines, the `## Rule-file edits that need a person` section of
+   `review.md`, and `git diff <BASE_SHA>...<REVIEWED_HEAD> -- <each needs-human path>`.
+   Say what each edit removes or loosens and that, once merged, it changes the rules every
+   later review reads.
+2. Ask through the step-5a surface (the `form-base` radio when loaded, inline A/B/C
+   otherwise):
+   - **(A) Approve these edits.** Run `bash "$CR_REVIEW" ack-rules <RULES_FP> "<who / why>"`,
+     then handle this round as **4a clean** (same HEAD; the code review was clean).
+   - **(B) Restore the rules.** Revert the removed / rewritten lines (keep additive entries),
+     commit it as a fix (step 6), reset `CLEAN_STREAK=0`, and go back to step 3.
+   - **(C) Stop.** Handoff with `Stop reason: rule-edits-declined`.
+3. Block on the reply. "No response" is never consent, and an agent never approves its own
+   rule edits.
+
+The approval is bound to `RULES_FP`, a hash of the flagged edits. Any further removal or
+rewrite changes the fingerprint and the next round asks again. `ack-rules` refuses a
+fingerprint that is not the one pending.
+
+A `dirty` round can also carry `RULES_NEED_HUMAN≥1`. Fix the findings first (4b); the
+rule-file question comes when the code is otherwise clean.
 
 ### 4b. Dirty
 
@@ -478,8 +533,12 @@ Then:
 
 - Add `Prevention: <artifact path or REVIEW.md#anchor> (<Cn>)` to the commit body.
 - Run `bash "$CR_REVIEW" note "<Cn> codified: <artifact>"`.
-- Reviewers read `REVIEW.md` every round. From then on the class is checked at the source,
-  not rediscovered.
+- Reviewers read the **base** `REVIEW.md` every round. A new entry is reviewed as content on
+  this branch (it never exempts this branch's findings) and becomes a rule for every branch
+  reviewed after it merges. Prefer an executable artifact (1 or 2) when the class must be
+  enforced on this branch too.
+- Only **add** entries. Removing or rewriting an existing rule makes `finish` return
+  `needs-human` (4h).
 
 **Never edit user-global files.** `~/.claude/**`, `~/.codex/**`, global `CLAUDE.md` or
 `AGENTS.md` files and agent memory belong to the user. Prevention artifacts live in the
@@ -561,6 +620,7 @@ clean-tree check inline with `git status --short`.
 
 - `head-drift-during-review`
 - `reviewer-error`
+- `rule-edits-declined`: the user chose (C) in 4h.
 - `step-back-exhausted`
 - `step-back-scope-declined`: the user chose a hand-off in 4s phase 2.
 - `user-stopped`

@@ -20,6 +20,7 @@ expect() { # expect <label> <expected> <actual>
 mkdir -p "$TMP/bin"
 {
   printf '#!/bin/bash\n'
+  printf '[ -n "${FAKE_ARGS:-}" ] && printf "%%s\\n" "$*" > "$FAKE_ARGS"\n'
   printf 'out=""; while [ $# -gt 0 ]; do case "$1" in --output-last-message) out="$2"; shift 2;; *) shift;; esac; done\n'
   printf '[ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"\n'
   printf '[ -n "${FAKE_OUT:-}" ] && cat "$FAKE_OUT" > "$out"\n'
@@ -220,6 +221,71 @@ sed -i.bak "s#^current_round_dir=.*#current_round_dir=$GHOST#" "$(bash "$CR" pat
 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; expect "start not blocked by a reused PID" "0" "$?"
 bash "$CR" wait --timeout 30 >/dev/null; bash "$CR" finish >/dev/null
 kill "$STRANGER" 2>/dev/null; wait "$STRANGER" 2>/dev/null
+
+# --- v1.8.0: rules come from the base, the branch's rule-file edits are reviewed content
+R2="$TMP/repo2"; mkdir -p "$R2/sub" && cd "$R2" || exit 2
+git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+echo code > app.txt
+printf '# REVIEW\n\n## no-raw-sql\nNever build SQL by string concatenation.\n' > REVIEW.md
+printf '# sub rules\nAlways close handles.\n' > sub/AGENTS.md
+git add . && git commit -qm base
+BASE_SHA=$(git rev-parse main)
+new_branch() { git switch -q main && git switch -qc "$1" && echo "$1" >> app.txt && git commit -qam "code $1"; }
+rd() { bash "$CR" paths | kv STATE_DIR; }
+last_round() { ls -d "$(rd)"/rounds/* | tail -n 1; }
+
+new_branch rules/delete; git rm -q REVIEW.md && git commit -qm "drop review rules"
+out=$(FAKE_ARGS="$TMP/args" run_round "$F_CLEAN" full); rc=$?; P="$(last_round)/prompt.md"
+grep -qF "\`git show $BASE_SHA:<path>\`" "$P" && grep -qx '    REVIEW.md' "$P" && ok || bad "base rule deleted on branch: prompt still points at the base copy"
+grep -q 'Read REVIEW.md (repository root' "$P" && bad "prompt still tells the reviewer to read the working tree" || ok
+grep -q 'project_doc_max_bytes=0' "$TMP/args" && ok || bad "codex must run with project docs (worktree AGENTS.md) disabled"
+expect "branch deletes rule file: listed for a person" "0:needs-human:1" "$rc:$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv RULES_NEED_HUMAN)"
+grep -q '^\s*\[needs-human\] D ' "$P" && ok || bad "prompt lists the deletion as content under review"
+
+new_branch rules/relax; sed -i.bak 's/^Never build SQL/Prefer not to build SQL/' REVIEW.md && rm REVIEW.md.bak && git commit -qam "relax rule"
+out=$(run_round "$F_CLEAN" full)
+expect "branch relaxes rule: not clean" "needs-human" "$(printf '%s\n' "$out" | kv VERDICT)"
+FP=$(printf '%s\n' "$out" | kv RULES_FP)
+grep -q '^## Rule-file edits that need a person' "$(printf '%s\n' "$out" | kv RESULT)" && grep -q '^- M +1/-1 REVIEW.md$' "$(printf '%s\n' "$out" | kv RESULT)" && ok || bad "relaxation listed in its own review.md section"
+grep -q "^#### Rule-file edits awaiting a person (fingerprint $FP)" "$(bash "$CR" paths | kv LEDGER)" && ok || bad "relaxation recorded in the ledger"
+expect "relaxation does not count as dirty" "0/3" "$(printf '%s\n' "$out" | kv DIRTY_SINCE_STEP_BACK)"
+expect "relaxation alongside findings stays dirty and flagged" "dirty:1" "$(run_round "$F_DIRTY" full | sed -n 's/^VERDICT=//p;s/^RULES_NEED_HUMAN=//p' | paste -sd: -)"
+bash "$CR" ack-rules deadbeef >/dev/null 2>&1; expect "ack with a stale fingerprint is refused" "2" "$?"
+run_round "$F_CLEAN" full >/dev/null
+expect "ack with the pending fingerprint" "$FP" "$(bash "$CR" ack-rules "$FP" "reviewed by owner" | kv ACKED)"
+out=$(run_round "$F_CLEAN" full)
+expect "acked rule edit: clean" "clean:0" "$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv RULES_NEED_HUMAN)"
+sed -i.bak 's/^Prefer not to/You may/' REVIEW.md && rm REVIEW.md.bak && git commit -qam "relax more"
+out=$(run_round "$F_CLEAN" full)
+expect "further rule edit re-arms the gate" "needs-human" "$(printf '%s\n' "$out" | kv VERDICT)"
+[ "$(printf '%s\n' "$out" | kv RULES_FP)" != "$FP" ] && ok || bad "new rule edit must get a new fingerprint"
+
+new_branch rules/add; printf '\n## close-handles\nClose every handle you open.\n' >> REVIEW.md
+printf '# new\nPrefer small functions.\n' > NEWDIR_AGENTS.tmp; mkdir -p lib && mv NEWDIR_AGENTS.tmp lib/AGENTS.md
+git add . && git commit -qm "codify at source"
+out=$(run_round "$F_CLEAN" full)
+expect "branch only adds rule entries: no false positive" "clean:2:0" "$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv RULE_CHANGES):$(printf '%s\n' "$out" | kv RULES_NEED_HUMAN)"
+grep -q '^\s*\[additive\] M +3/-0 REVIEW.md' "$(last_round)/prompt.md" && ok || bad "additions listed as content under review in the prompt"
+grep -q '^## Rule-file additions' "$(printf '%s\n' "$out" | kv RESULT)" && ok || bad "additions listed in review.md"
+
+new_branch rules/nested; git rm -q sub/AGENTS.md && git commit -qm "drop nested rules"
+expect "nested rule file deleted: listed for a person" "needs-human" "$(run_round "$F_CLEAN" full | kv VERDICT)"
+
+# --- v1.8.0: a result is bound to the commit + tracked tree the reviewer read
+new_branch drift/tree
+FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+echo edit >> app.txt; bash "$CR" wait --timeout 30 >/dev/null
+out=$(bash "$CR" finish); rc=$?
+expect "uncommitted edit during the round" "3:tree-changed" "$rc:$(printf '%s\n' "$out" | kv REASON)"
+git checkout -q app.txt
+FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+echo tmp >> app.txt && git commit -qam tmp && git reset -q --hard HEAD~1
+bash "$CR" wait --timeout 30 >/dev/null
+out=$(bash "$CR" finish); rc=$?
+expect "HEAD moved and came back during the round" "3:head-moved-and-returned" "$rc:$(printf '%s\n' "$out" | kv REASON)"
+FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; bash "$CR" wait --timeout 30 >/dev/null
+sed -i.bak '/^head_moves=/d; /^tree_fp=/d' "$(last_round)/meta"
+expect "pre-1.8.0 round meta still finishes" "clean" "$(bash "$CR" finish | kv VERDICT)"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
