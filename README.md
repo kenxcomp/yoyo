@@ -6,7 +6,7 @@ A curated collection of useful plugins for Claude Code.
 
 | Plugin | Description | Tags |
 |--------|-------------|------|
-| [claude-md](./plugins/claude-md) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
+| [project-memory-updater](./plugins/project-memory-updater) | A plugin for managing CLAUDE.md configurations with auto-update detection | configuration, productivity, hooks |
 | [darwin](./plugins/darwin) | Automatic error-fixing plugin that offloads runtime errors to dedicated agents, preserving main conversation context | error-handling, agents, automation |
 | [plan-guardian](./plugins/plan-guardian) | Plan review workflow plugin that ensures plans are rigorously reviewed before execution | planning, review, agents, quality |
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
@@ -25,7 +25,7 @@ First, add this marketplace to Claude Code:
 Then install the plugins you need:
 
 ```
-/plugin install claude-md@kenxcomp-yoyo
+/plugin install project-memory-updater@kenxcomp-yoyo
 /plugin install darwin@kenxcomp-yoyo
 /plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
@@ -48,7 +48,7 @@ Clone the repository and load plugins locally for development/testing:
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo.git
-claude --plugin-dir ./yoyo/plugins/claude-md
+claude --plugin-dir ./yoyo/plugins/project-memory-updater
 ```
 
 > **Note**: Requires Claude Code version 1.0.33 or later. Check with `claude --version`.
@@ -70,9 +70,9 @@ plugin-name/
 
 ## Plugin Features
 
-### claude-md Plugin
+### project-memory-updater Plugin
 
-The `claude-md` plugin provides automatic detection of major updates during your work session. Key features:
+The `project-memory-updater` plugin provides automatic detection of major updates during your work session. Key features:
 
 - **Stop Hook**: Automatically evaluates if changes warrant a CLAUDE.md update
 - **Smart Detection**: Uses LLM to identify code architecture, functional, and configuration changes

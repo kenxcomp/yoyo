@@ -1,6 +1,6 @@
 {
   "name": "socratic-questioning",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A plugin that guides Claude to use Socratic questioning methods with multiple choice questions to clarify unclear prompts. Uses skill-based approach for natural conversation flow.",
   "author": {
     "name": "kenxcomp"

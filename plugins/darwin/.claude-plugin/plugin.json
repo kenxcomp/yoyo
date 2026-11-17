@@ -1,6 +1,6 @@
 {
   "name": "darwin",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Automatic error-fixing plugin that offloads runtime error resolution to a dedicated agent, saving main conversation context.",
   "author": {
     "name": "kenxcomp"

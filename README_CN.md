@@ -6,7 +6,7 @@
 
 | 插件 | 描述 | 标签 |
 |------|------|------|
-| [claude-md](./plugins/claude-md) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
+| [project-memory-updater](./plugins/project-memory-updater) | 用于管理 CLAUDE.md 配置的插件，支持自动更新检测 | 配置, 效率, 钩子 |
 | [darwin](./plugins/darwin) | 自动错误修复插件，将运行时错误交给专用代理处理，保留主对话上下文 | 错误处理, 代理, 自动化 |
 | [plan-guardian](./plugins/plan-guardian) | 计划审查工作流插件，确保计划在执行前经过严格审查 | 规划, 审查, 代理, 质量 |
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
@@ -25,7 +25,7 @@
 然后安装所需的插件：
 
 ```
-/plugin install claude-md@kenxcomp-yoyo
+/plugin install project-memory-updater@kenxcomp-yoyo
 /plugin install darwin@kenxcomp-yoyo
 /plugin install plan-guardian@kenxcomp-yoyo
 /plugin install socratic-questioning@kenxcomp-yoyo
@@ -48,7 +48,7 @@
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo.git
-claude --plugin-dir ./yoyo/plugins/claude-md
+claude --plugin-dir ./yoyo/plugins/project-memory-updater
 ```
 
 > **注意**: 需要 Claude Code 1.0.33 或更高版本。使用 `claude --version` 检查版本。
@@ -70,9 +70,9 @@ plugin-name/
 
 ## 插件功能
 
-### claude-md 插件
+### project-memory-updater 插件
 
-`claude-md` 插件提供工作会话期间的重大更新自动检测功能。主要特性：
+`project-memory-updater` 插件提供工作会话期间的重大更新自动检测功能。主要特性：
 
 - **Stop 钩子**：自动评估变更是否需要更新 CLAUDE.md
 - **智能检测**：使用 LLM 识别代码架构、功能和配置变更
