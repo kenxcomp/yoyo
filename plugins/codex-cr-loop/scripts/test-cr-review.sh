@@ -294,6 +294,17 @@ sed -i.bak 's/^Sometimes build SQL/Always build SQL/' REVIEW.md && rm REVIEW.md.
 expect "textconv does not hide a rewrite from classification" "needs-human" "$(bash "$HERE/review-rules.sh" list "$BASE_SHA" HEAD | cut -f1)"
 rm -f "$(git rev-parse --git-dir)/info/attributes"; git config --unset diff.lossy.textconv
 
+# a failed rule-file scan is an error, never "no rule edits"
+FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; bash "$CR" wait --timeout 30 >/dev/null
+out=$(TMPDIR="$TMP/no-such-dir" bash "$CR" finish 2>/dev/null); rc=$?
+expect "rule scan failure at finish fails closed" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+expect "round stays retryable after a scan failure" "needs-human" "$(bash "$CR" finish | kv VERDICT)"
+nb=$(ls "$(rd)/rounds" | wc -l | tr -d ' ')
+TMPDIR="$TMP/no-such-dir" FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null 2>&1; rc=$?
+expect "rule scan failure at start starts nothing" "2:$nb" "$rc:$(ls "$(rd)/rounds" | wc -l | tr -d ' ')"
+FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; expect "start works again after a scan failure" "0" "$?"
+bash "$CR" wait --timeout 30 >/dev/null; bash "$CR" finish >/dev/null
+
 # --- v1.8.0: a result is bound to the commit + tracked tree the reviewer read
 new_branch drift/tree
 FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
@@ -301,6 +312,12 @@ echo edit >> app.txt; bash "$CR" wait --timeout 30 >/dev/null
 out=$(bash "$CR" finish); rc=$?
 expect "uncommitted edit during the round" "3:tree-changed" "$rc:$(printf '%s\n' "$out" | kv REASON)"
 git checkout -q app.txt
+printf 'app.txt diff=lossy\n' > "$(git rev-parse --git-dir)/info/attributes"; git config diff.lossy.textconv 'head -n 1'
+FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+echo hidden-by-textconv >> app.txt; bash "$CR" wait --timeout 30 >/dev/null
+out=$(bash "$CR" finish); rc=$?
+expect "edit hidden by a lossy textconv is still tree drift" "3:tree-changed" "$rc:$(printf '%s\n' "$out" | kv REASON)"
+git checkout -q app.txt; rm -f "$(git rev-parse --git-dir)/info/attributes"; git config --unset diff.lossy.textconv
 FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
 echo tmp >> app.txt && git commit -qam tmp && git reset -q --hard HEAD~1
 bash "$CR" wait --timeout 30 >/dev/null

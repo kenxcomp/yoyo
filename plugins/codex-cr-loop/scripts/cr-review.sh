@@ -204,7 +204,7 @@ round_state() {
 # (catches HEAD moving away and back during the round) and a hash of the tracked
 # working-tree diff (catches uncommitted edits the reviewer may have read).
 head_moves() { git reflog show --format=%H HEAD 2>/dev/null | wc -l | tr -d ' '; }
-tree_fp() { git diff HEAD --no-ext-diff --binary 2>/dev/null | git hash-object --stdin; }
+tree_fp() { git diff HEAD --no-ext-diff --no-textconv --binary 2>/dev/null | git hash-object --stdin; }
 
 file_size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '0\n'; fi; }
 
@@ -252,7 +252,7 @@ write_prompt() {
         ;;
     esac
     # Rules come from the base commit, never the branch's working tree (review-rules.sh).
-    bash "$RULES" prompt "$base_ref" "$base_sha" "$head"
+    bash "$RULES" prompt "$base_ref" "$base_sha" "$head" || return 1
     printf '\nLEDGER (no repeats)\n'
     printf -- '- Read the findings ledger first: %s\n' "$LEDGER"
     printf -- '- Never report a ledger class again. Exception: its fix is incomplete or regressed in the code under review — then set reopens to its id (e.g. "C3") and fill still_wrong.\n'
@@ -370,7 +370,9 @@ cmd_start() {
     printf 'effort=%s\nmodel=%s\nroot=%s\nschema=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$SCHEMA" "$(now_utc)" "$(date +%s)"
     printf 'head_moves=%s\ntree_fp=%s\n' "$(head_moves)" "$(tree_fp)"
   } > "$d/meta"
-  write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"
+  if ! write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"; then
+    rm -rf "$d"; die "start: could not build the reviewer prompt (rule-file scan failed) — nothing started"
+  fi
   sset rounds_started "$n"
   sset current_round_dir "$d"
   launch_detached "$(self_path)" "$d"
@@ -484,7 +486,11 @@ cmd_finish() {
   # clean round from counting as clean: VERDICT=needs-human.
   rules=""; rules_fp=""; rules_open=0; rbase=$(mget "$d" base_sha)
   if [ -n "$rbase" ]; then
-    rules=$(bash "$RULES" list "$rbase" "$reviewed"); rules_fp=$(bash "$RULES" fp "$rbase" "$reviewed")
+    # Fail closed: a failed scan is an error (retryable), never "no rule edits".
+    if ! rules=$(bash "$RULES" list "$rbase" "$reviewed") || ! rules_fp=$(bash "$RULES" fp "$rbase" "$reviewed"); then
+      printf 'VERDICT=error\nREASON=rule-file scan failed (review-rules.sh); the round is not finished — retry finish\nRESULT=%s\n' "$res"
+      exit 5
+    fi
   fi
   [ -n "$rules_fp" ] && [ "$rules_fp" != "$(sget rules_ack_fp)" ] && rules_open=1
   [ "$rules_open" = 1 ] && case "$verdict" in clean|p3-only) verdict=needs-human ;; esac

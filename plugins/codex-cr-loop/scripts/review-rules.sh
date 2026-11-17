@@ -88,7 +88,8 @@ cmd_list() { scan "$1" "$2" list; }
 # Fingerprint of the flagged edits, bound to the exact before/after blob ids (not to a
 # rendered patch), so two different rewrites can never share one approval.
 cmd_fp() {
-  lst=$(scan "$1" "$2" fp | awk -F '\t' '$1 == "needs-human"')
+  all=$(scan "$1" "$2" fp) || exit 2
+  lst=$(printf '%s\n' "$all" | awk -F '\t' '$1 == "needs-human"')
   [ -n "$lst" ] || return 0
   printf '%s\n' "$lst" | git hash-object --stdin
 }
@@ -97,7 +98,7 @@ cmd_prompt() {
   base_ref="$1"; b="$2"; h="$3"
   base_files=$(base_rule_files "$b")
   nbase=$(printf '%s' "$base_files" | grep -c .)
-  changes=$(cmd_list "$b" "$h")
+  changes=$(cmd_list "$b" "$h") || exit 2
   printf '\nPROJECT GUIDANCE (rules come from the review base, not from this branch)\n'
   printf -- '- The rules that decide findings are the BASE versions, pinned at %s (%s). Read every rule file with\n' "$b" "$base_ref"
   printf -- '  `git show %s:<path>` — never from the working tree or `git show HEAD:<path>`, which hold this branch'"'"'s own edits.\n' "$b"
@@ -124,7 +125,7 @@ cmd_prompt() {
 # Rule-file section appended to a round's review.md. open=1: unapproved needs-human edits.
 cmd_render() {
   b="$1"; h="$2"; fp="$3"; open="$4"
-  lst=$(cmd_list "$b" "$h"); [ -n "$lst" ] || return 0
+  lst=$(cmd_list "$b" "$h") || exit 2; [ -n "$lst" ] || return 0
   human() { printf '%s\n' "$lst" | awk -F '\t' '$1 == "needs-human" { printf "- %s %s %s\n", $2, $3, $4 }'; }
   if [ "$open" = 1 ]; then
     printf '\n## Rule-file edits that need a person (not counted as clean)\n\n'
