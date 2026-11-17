@@ -133,7 +133,7 @@ git branch -d <branch-name>
 ## Installation
 
 ```
-/plugin install bug-fix-testcase@kenxcomp-yoyo
+/plugin install bug-fix-testcase@yoyo
 ```
 
 ## Version History

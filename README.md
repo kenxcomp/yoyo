@@ -25,11 +25,11 @@ First, add this marketplace to Claude Code:
 Then install the plugins you need:
 
 ```
-/plugin install project-memory-updater@kenxcomp-yoyo
-/plugin install darwin@kenxcomp-yoyo
-/plugin install plan-guardian@kenxcomp-yoyo
-/plugin install socratic-questioning@kenxcomp-yoyo
-/plugin install bug-fix-testcase@kenxcomp-yoyo
+/plugin install project-memory-updater@yoyo
+/plugin install darwin@yoyo
+/plugin install plan-guardian@yoyo
+/plugin install socratic-questioning@yoyo
+/plugin install bug-fix-testcase@yoyo
 ```
 
 ### Method 2: Interactive UI
@@ -74,8 +74,8 @@ plugin-name/
 
 The `project-memory-updater` plugin provides automatic detection of major updates during your work session. Key features:
 
-- **Stop Hook**: Automatically evaluates if changes warrant a CLAUDE.md update
-- **Smart Detection**: Uses LLM to identify code architecture, functional, and configuration changes
+- **SessionStart Hook**: Injects CLAUDE.md update awareness at session start
+- **Major-Change Prompt**: After significant code architecture, functional, or configuration changes in a git repo, Claude asks whether to update CLAUDE.md
 - **Update Skill**: Guides users through updating or creating CLAUDE.md
 
 ### darwin Plugin

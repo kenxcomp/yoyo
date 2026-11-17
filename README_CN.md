@@ -25,11 +25,11 @@
 然后安装所需的插件：
 
 ```
-/plugin install project-memory-updater@kenxcomp-yoyo
-/plugin install darwin@kenxcomp-yoyo
-/plugin install plan-guardian@kenxcomp-yoyo
-/plugin install socratic-questioning@kenxcomp-yoyo
-/plugin install bug-fix-testcase@kenxcomp-yoyo
+/plugin install project-memory-updater@yoyo
+/plugin install darwin@yoyo
+/plugin install plan-guardian@yoyo
+/plugin install socratic-questioning@yoyo
+/plugin install bug-fix-testcase@yoyo
 ```
 
 ### 方法二：交互式界面
@@ -74,8 +74,8 @@ plugin-name/
 
 `project-memory-updater` 插件提供工作会话期间的重大更新自动检测功能。主要特性：
 
-- **Stop 钩子**：自动评估变更是否需要更新 CLAUDE.md
-- **智能检测**：使用 LLM 识别代码架构、功能和配置变更
+- **SessionStart 钩子**：在会话启动时注入 CLAUDE.md 更新意识
+- **重大变更提示**：在 git 仓库中完成代码架构、功能或配置方面的重大变更后，Claude 会主动询问是否更新 CLAUDE.md
 - **更新技能**：引导用户更新或创建 CLAUDE.md
 
 ### 重大更新判断标准

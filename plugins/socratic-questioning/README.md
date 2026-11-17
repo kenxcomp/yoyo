@@ -19,7 +19,7 @@ A plugin that guides Claude to use Socratic questioning methods for requirement 
 
 ```
 /plugin marketplace add kenxcomp/yoyo
-/plugin install socratic-questioning@kenxcomp-yoyo
+/plugin install socratic-questioning@yoyo
 ```
 
 ### Method 2: Local Development

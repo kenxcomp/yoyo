@@ -8,7 +8,7 @@ A plugin for managing CLAUDE.md configurations with automatic update detection.
 
 ```
 /plugin marketplace add kenxcomp/yoyo
-/plugin install project-memory-updater@kenxcomp-yoyo
+/plugin install project-memory-updater@yoyo
 ```
 
 ### Method 2: Local Development
@@ -24,7 +24,7 @@ claude --plugin-dir ./yoyo/plugins/project-memory-updater
 
 ### Auto-Update Detection (Hook)
 
-This plugin uses a **Stop hook** to automatically detect major updates during your work session. When significant changes are made, it will prompt you to update your project's `CLAUDE.md` file.
+This plugin uses a **SessionStart hook** to inject CLAUDE.md update awareness into each new session. After significant work in a git repository, Claude then asks whether you want to update your project's `CLAUDE.md` file.
 
 **Major updates include:**
 - **Code architecture changes**: New modules, refactoring, core logic changes
@@ -45,7 +45,9 @@ project-memory-updater/
 ├── .claude-plugin/
 │   └── plugin.json           # Plugin metadata
 ├── hooks/
-│   └── hooks.json            # Stop hook definition
+│   └── hooks.json            # SessionStart hook definition
+├── scripts/
+│   └── inject-skill.sh       # Emits the awareness prompt as additionalContext
 ├── skills/
 │   └── update-claude-md/SKILL.md   # CLAUDE.md update skill
 ├── commands/                 # Custom commands (reserved)
@@ -55,17 +57,17 @@ project-memory-updater/
 
 ## How It Works
 
-1. You complete work in Claude Code
-2. The Stop hook evaluates if changes constitute a "major update"
-3. If yes, Claude asks if you want to update `CLAUDE.md`
+1. A new session starts; the SessionStart hook (`matcher: startup`) runs `scripts/inject-skill.sh`
+2. The script adds the update-awareness instructions to the session as `additionalContext`
+3. After significant work in a git repository, Claude asks if you want to update `CLAUDE.md`
 4. If confirmed, the update skill guides the process
 
 ## Configuration
 
-The hook uses LLM-based judgment with the following criteria:
-- Timeout: 30 seconds for evaluation
-- Triggers on: Session stop
-- **Prerequisite**: Only activates in git repositories (non-git directories are skipped)
+- Hook type: `command` (shell script, no LLM call in the hook itself)
+- Triggers on: new session startup (not on resume or compaction)
+- Timeout: 5 seconds
+- Scope: the injected instructions tell Claude to ask only in git repositories and only for significant changes; Claude makes that judgment during the session
 
 ## License
 
