@@ -27,7 +27,8 @@ often ran for 9–16 rounds. The full protocol is in
 4. **Recurring classes are codified at the source.** A class that recurs gets a lint rule, a
    source-guard or regression test, or a `REVIEW.md` entry in the same fix commit, instead of
    being patched again PR by PR. Reviewers read `REVIEW.md`, `AGENTS.md`, and `CLAUDE.md`
-   every round.
+   every round **from the review base**, never from the branch under review (v1.8.0, see
+   [Rule source](#rule-source-v180)).
 
 The three commands share that protocol and the reviewer script
 [`scripts/cr-review.sh`](./scripts/cr-review.sh). They differ only in what happens *after*
@@ -134,7 +135,7 @@ class-format findings. It also failed with `spawnSync ENOBUFS` on diffs larger t
 The runner launches:
 
 ```text
-codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
+codex exec --sandbox read-only -C <repo> -c project_doc_max_bytes=0 -c model_reasoning_effort=high \
            --output-schema references/review-output.schema.json \
            --output-last-message <round>/result.json "<class-format prompt>" < /dev/null
 ```
@@ -172,12 +173,13 @@ codex exec --sandbox read-only -C <repo> -c model_reasoning_effort=high \
 | `next --clean-streak N` | Print the mode the next round must use: `full`, `incremental` (with `SINCE=`), `step-back`, or `stop`. |
 | `start --mode M --base REF [--since SHA]` | Launch one detached round. Prints `ROUND_DIR`, `PID`, and `REVIEWED_HEAD`. |
 | `status` / `wait [--timeout 540]` | Report whether a round is running or done, with elapsed time, log size, and log age. |
-| `finish` | Check for head drift (exit 3) and for errors or bad output format (exit 5). Then classify the round as `clean`, `p3-only`, or `dirty`, assign class ids, append to the ledger, and update the counters. |
+| `finish` | Check for head or tree drift (exit 3, `REASON=`) and for errors or bad output format (exit 5). Then classify the round as `clean`, `p3-only`, `needs-human` (unapproved rule-file removals or rewrites), or `dirty`, assign class ids, append to the ledger, and update the counters. |
 | `note TEXT` / `add Pn TITLE [DETAIL]` | Append an author note, or register an external finding (prints a new class id). |
+| `ack-rules FP [NOTE]` | Record a person's approval of the branch's flagged rule-file edits. `FP` must equal the pending `RULES_FP`. |
 | `tree-clean` | The one clean-tree check, shared by the preflight and the completion step. It ignores only untracked repo-root `.cr-loop-handoff-round-<N>.md` files. |
 | `mark-converged` / `cancel` / `reset` / `paths` | Housekeeping. |
 
-`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers structured-verdict classification and fail-closed validation, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, concurrent start/finish/add under the lock, and `cancel`. Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
+`scripts/test-cr-review.sh` is a self-contained regression test for the runner. It uses a fake `codex` in a temporary repo and covers structured-verdict classification and fail-closed validation, state paths from subdirectories and linked worktrees, `tree-clean`, the round-cap and step-back state machine, concurrent start/finish/add under the lock, `cancel`, base-sourced rules with rule-file edit classification and `ack-rules`, and head/tree drift (including HEAD moving away and back). Run it with `bash plugins/codex-cr-loop/scripts/test-cr-review.sh` after changing the script.
 
 Your permission settings may prompt on every script call. To stop that, add an allow rule
 that wildcards the version segment of the install path, for example
@@ -200,6 +202,30 @@ that wildcards the version segment of the install path, for example
 | `CR_PR_DRAFT` | `0` | `/cr-loop-pr` | Set `1` to open the PR as a draft. |
 | `CR_PR_TITLE` | (from commits) | `/cr-loop-pr` | PR title, truncated to 70 characters. |
 | `CR_PR_AUTO_REBASE` | `1` | `/cr-loop-pr` | Step 8.0 auto-rebase and confirmation round. Set `0` to defer instead. |
+
+## Rule source (v1.8.0)
+
+The change under review must not be able to edit the checks that review it.
+
+- **Rules come from the base commit.** The prompt pins `BASE_SHA`, lists the rule files there
+  (`REVIEW.md`, `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, any depth), and has the
+  reviewer read them with `git show <base_sha>:<path>`. `codex exec` runs with
+  `-c project_doc_max_bytes=0`, so Codex no longer auto-loads the branch's own `AGENTS.md`
+  (your user-level `~/.codex/AGENTS.md` still loads).
+- **The branch's rule-file edits are reviewed content.** [`scripts/review-rules.sh`](./scripts/review-rules.sh)
+  classifies them deterministically from the reviewed commit:
+  - **additive** (new file or added lines only): allowed, so codify-at-source keeps working,
+    but never used as a rule on this branch and never an exemption for its findings.
+  - **needs-human** (removed or rewritten lines, deleted file, binary, or undiffable): an
+    otherwise clean round returns `VERDICT=needs-human`, the edits are listed in their own
+    `review.md` section and in the ledger, and the loop asks you (protocol 4h). Approval
+    (`cr-review.sh ack-rules <RULES_FP>`) is bound to a hash of those edits; any further
+    removal or rewrite asks again.
+- The output schema is unchanged: the classification is computed by the script, not
+  reported by the reviewer, so it cannot be missed and is testable without Codex.
+- **Results are bound to what the reviewer read.** Besides HEAD, `finish` checks that the
+  HEAD reflog did not grow (HEAD moved and came back) and that tracked files were not edited
+  during the round. Rounds started by v1.7.0 still finish with the HEAD check only.
 
 ## Breaking changes in v1.7.0
 
@@ -329,8 +355,11 @@ Each command's final report **always** ends with a Chinese **business-impact sum
   `/cr-loop-pr`'s user-confirmed `--force-with-lease`, used in step 8.0 to update an existing
   PR after an auto-rebase.
 - **Hooks are never bypassed.** When a hook fails, the loop defers and shows the output.
-- **Head drift is caught.** `cr-review.sh finish` refuses to classify a round if HEAD moved
-  while the reviewer was running (exit 3, `head-drift-during-review`).
+- **Head and tree drift are caught.** `cr-review.sh finish` refuses to classify a round if HEAD
+  moved while the reviewer was running, even if it moved back, or if tracked files were edited
+  without committing (exit 3, `head-drift-during-review`).
+- **A branch cannot loosen the rules that review it.** Rules are read from the base commit;
+  removed or rewritten rule-file lines need a person's approval before a round counts clean.
 - **Bad reviews are never treated as clean.** An empty, failed, or badly formatted review is
   an `error`.
 - **Interaction contracts don't change without your consent** (interaction-logic guard).

@@ -169,6 +169,9 @@ This command adds:
         - **Clean** (or P3-only with `CR_LOOP_SKIP_P3=1`): set
           `LAST_REVIEWED_HEAD=$REVIEWED_HEAD` and `REBASED_IN_8_0=1`, then continue with
           (a)–(e). Preconditions (d) and (e) hold by construction.
+        - **Needs-human** (the branch removes or rewrites rule-file lines that no person has
+          approved): follow protocol 4h. After the user approves and `ack-rules` succeeds,
+          handle it as **Clean** above; (B) and (C) follow 4h.
         - **Dirty:** the new base exposed a real issue. Run protocol steps 5–6 (fix,
           including the 5a guard, then commit), reset `CLEAN_STREAK=0`, and go back to
           protocol step 3. The loop re-converges against the new base and comes back to

@@ -13,7 +13,8 @@
 #   status [ROUND_DIR]           running / done for a round (default: current)
 #   wait [ROUND_DIR] [--timeout S]
 #                                block up to S seconds (default 540) for a round
-#   finish [ROUND_DIR]           head-drift check, classify, append ledger, update counters
+#   finish [ROUND_DIR]           head/tree-drift check, classify, append ledger, update counters
+#   ack-rules FP [NOTE...]       record a person's approval of the branch's rule-file edits (fingerprint FP)
 #   note TEXT...                 append an author note (status, deferral, prevention) to the ledger
 #   add SEVERITY TITLE [DETAIL]  register an external finding (PR bot, human) as a new class id
 #   mark-converged               record convergence; reset round-cap counters
@@ -31,9 +32,10 @@
 
 set -u
 
-SELF_VERSION="1.7.0"
+SELF_VERSION="1.8.0"
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 SCHEMA="$HERE/../references/review-output.schema.json"
+RULES="$HERE/review-rules.sh"
 
 die() { printf 'cr-review: %s\n' "$*" >&2; exit 2; }
 
@@ -198,6 +200,12 @@ round_state() {
   if runner_pid "$1" >/dev/null; then printf 'running\n'; else printf 'dead\n'; fi
 }
 
+# Snapshot of what a round reads besides the commit: the number of HEAD reflog entries
+# (catches HEAD moving away and back during the round) and a hash of the tracked
+# working-tree diff (catches uncommitted edits the reviewer may have read).
+head_moves() { git reflog show --format=%H HEAD 2>/dev/null | wc -l | tr -d ' '; }
+tree_fp() { git diff HEAD --no-ext-diff --no-textconv --binary 2>/dev/null | git hash-object --stdin; }
+
 file_size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '0\n'; fi; }
 
 file_age() {
@@ -243,9 +251,8 @@ write_prompt() {
         printf -- '- If the ledger already lists classes, this is a confirmation pass after earlier fixes: also look for cross-cutting problems the fixes introduced together.\n'
         ;;
     esac
-    printf '\nPROJECT GUIDANCE\n'
-    printf -- '- Read REVIEW.md (repository root and any next to the changed files) if present: it lists codified bug classes. A violation is a finding; cite the section.\n'
-    printf -- '- Follow AGENTS.md / CLAUDE.md (root and nested next to changed files) if present.\n'
+    # Rules come from the base commit, never the branch's working tree (review-rules.sh).
+    bash "$RULES" prompt "$base_ref" "$base_sha" "$head" || return 1
     printf '\nLEDGER (no repeats)\n'
     printf -- '- Read the findings ledger first: %s\n' "$LEDGER"
     printf -- '- Never report a ledger class again. Exception: its fix is incomplete or regressed in the code under review — then set reopens to its id (e.g. "C3") and fill still_wrong.\n'
@@ -361,8 +368,11 @@ cmd_start() {
   {
     printf 'mode=%s\nbase_ref=%s\nbase_sha=%s\nsince=%s\nreviewed_head=%s\nround=%s\n' "$mode" "$base" "$base_sha" "$since" "$head" "$n"
     printf 'effort=%s\nmodel=%s\nroot=%s\nschema=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$SCHEMA" "$(now_utc)" "$(date +%s)"
+    printf 'head_moves=%s\ntree_fp=%s\n' "$(head_moves)" "$(tree_fp)"
   } > "$d/meta"
-  write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"
+  if ! write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"; then
+    rm -rf "$d"; die "start: could not build the reviewer prompt (rule-file scan failed) — nothing started"
+  fi
   sset rounds_started "$n"
   sset current_round_dir "$d"
   launch_detached "$(self_path)" "$d"
@@ -377,10 +387,10 @@ cmd__run() {
   root=$(mget "$d" root); effort=$(mget "$d" effort); model=$(mget "$d" model); schema=$(mget "$d" schema)
   prompt=$(cat "$d/prompt.md")
   if [ -n "$model" ]; then
-    codex exec --sandbox read-only -C "$root" -m "$model" -c "model_reasoning_effort=$effort" \
+    codex exec --sandbox read-only -C "$root" -c project_doc_max_bytes=0 -m "$model" -c "model_reasoning_effort=$effort" \
       --output-schema "$schema" --output-last-message "$d/result.json" "$prompt" </dev/null >"$d/log" 2>&1 &
   else
-    codex exec --sandbox read-only -C "$root" -c "model_reasoning_effort=$effort" \
+    codex exec --sandbox read-only -C "$root" -c project_doc_max_bytes=0 -c "model_reasoning_effort=$effort" \
       --output-schema "$schema" --output-last-message "$d/result.json" "$prompt" </dev/null >"$d/log" 2>&1 &
   fi
   cpid=$!
@@ -434,8 +444,15 @@ cmd_finish() {
   [ -f "$d/finished" ] && die "round already finished: $d (see $d/verdict)"
   mode=$(mget "$d" mode); reviewed=$(mget "$d" reviewed_head); n=$(mget "$d" round)
   head=$(git rev-parse HEAD)
-  if [ "$head" != "$reviewed" ]; then
-    printf 'VERDICT=head-drift\nREVIEWED_HEAD=%s\nHEAD=%s\n' "$reviewed" "$head"
+  # The result is bound to the exact commit + tracked tree the reviewer read. Rounds
+  # started before v1.8.0 have no head_moves / tree_fp in meta: only the HEAD check runs.
+  drift=""
+  if [ "$head" != "$reviewed" ]; then drift=head-moved
+  elif [ -n "$(mget "$d" head_moves)" ] && [ "$(mget "$d" head_moves)" != "$(head_moves)" ]; then drift=head-moved-and-returned
+  elif [ -n "$(mget "$d" tree_fp)" ] && [ "$(mget "$d" tree_fp)" != "$(tree_fp)" ]; then drift=tree-changed
+  fi
+  if [ -n "$drift" ]; then
+    printf 'VERDICT=head-drift\nREASON=%s\nREVIEWED_HEAD=%s\nHEAD=%s\n' "$drift" "$reviewed" "$head"
     exit 3
   fi
   rc=$(cat "$d/exit" 2>/dev/null || printf 'dead')
@@ -464,11 +481,30 @@ cmd_finish() {
   else
     verdict=dirty
   fi
+  # The branch's edits to rule files (review-rules.sh). Removed/rewritten rules that a
+  # person has not approved (ack-rules, bound to the edits' fingerprint) keep an otherwise
+  # clean round from counting as clean: VERDICT=needs-human.
+  rules=""; rules_fp=""; rules_open=0; rbase=$(mget "$d" base_sha)
+  if [ -n "$rbase" ]; then
+    # Fail closed: a failed scan is an error (retryable), never "no rule edits".
+    if ! rules=$(bash "$RULES" list "$rbase" "$reviewed") || ! rules_fp=$(bash "$RULES" fp "$rbase" "$reviewed"); then
+      printf 'VERDICT=error\nREASON=rule-file scan failed (review-rules.sh); the round is not finished — retry finish\nRESULT=%s\n' "$res"
+      exit 5
+    fi
+  fi
+  [ -n "$rules_fp" ] && [ "$rules_fp" != "$(sget rules_ack_fp)" ] && rules_open=1
+  [ "$rules_open" = 1 ] && case "$verdict" in clean|p3-only) verdict=needs-human ;; esac
+  [ -n "$rbase" ] && bash "$RULES" render "$rbase" "$reviewed" "$rules_fp" "$rules_open" >> "$md"
   {
     printf '\n## Round %s — %s — %s — %s (P0×%s P1×%s P2×%s P3×%s) — %s\n' \
       "$n" "$mode" "$(git rev-parse --short "$reviewed")" "$verdict" "$c0" "$c1" "$c2" "$c3" "$(now_utc)"
     [ -s "$frag" ] && cat "$frag"
+    if [ "$rules_open" = 1 ]; then
+      printf '#### Rule-file edits awaiting a person (fingerprint %s)\n' "$rules_fp"
+      printf '%s\n' "$rules" | awk -F '\t' '$1 == "needs-human" { printf "- %s %s %s\n", $2, $3, $4 }'
+    fi
   } >> "$LEDGER"
+  if [ "$rules_open" = 1 ]; then sset rules_pending_fp "$rules_fp"; else sset rules_pending_fp ""; fi
   is_uint "$nxt" && sset next_class_id "$nxt"
   sset rounds_total $(( $(snum rounds_total) + 1 ))
   sset last_reviewed_head "$reviewed"
@@ -487,8 +523,23 @@ cmd_finish() {
     printf 'NEW_CLASSES=%s\nREOPENED=%s\nRECURRING=%s\n' "$new" "$reo" "$recurring"
     printf 'DIRTY_SINCE_STEP_BACK=%s/%s\nSTEP_BACKS_DONE=%s/%s\n' "$(snum dirty_since_step_back)" "$ROUND_CAP" "$(snum step_backs_done)" "$MAX_STEP_BACKS"
     printf 'REVIEWED_HEAD=%s\nRESULT=%s\nRESULT_JSON=%s\nLEDGER=%s\n' "$reviewed" "$md" "$res" "$LEDGER"
+    printf 'RULE_CHANGES=%s\nRULES_NEED_HUMAN=%s\nRULES_FP=%s\n' "$(printf '%s' "$rules" | grep -c .)" \
+      "$( [ "$rules_open" = 1 ] && printf '%s' "$rules" | grep -c '^needs-human' || printf '0')" "$rules_fp"
+    [ -n "$rules" ] && printf '%s\n' "$rules" | awk -F '\t' '{ printf "RULE| [%s] %s %s %s\n", $1, $2, $3, $4 }'
   } | tee "$d/verdict"
   : > "$d/finished"
+}
+
+cmd_ack_rules() {
+  resolve_paths; ensure_state
+  fp="${1:-}"; [ $# -gt 0 ] && shift
+  pending=$(sget rules_pending_fp)
+  [ -n "$pending" ] || die "ack-rules: no rule-file edits are awaiting a person"
+  [ "$fp" = "$pending" ] || die "ack-rules: fingerprint '$fp' does not match the pending edits ($pending) — re-read the latest finish output"
+  sset rules_ack_fp "$fp"; sset rules_pending_fp ""
+  printf -- '- note %s @%s: rule-file edits approved by a person (fingerprint %s)%s\n' \
+    "$(now_utc)" "$(git rev-parse --short HEAD)" "$fp" "${*:+ — $*}" >> "$LEDGER"
+  printf 'ACKED=%s\n' "$fp"
 }
 
 cmd_note() {
@@ -555,7 +606,7 @@ cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STAT
 
 sub="${1:-}"
 case "$sub" in
-  init|next|start|finish|note|add|mark-converged|cancel|reset)
+  init|next|start|finish|note|add|ack-rules|mark-converged|cancel|reset)
     [ -n "${CR_REVIEW_LOCK_HELD:-}" ] || with_branch_lock "$@" ;;
 esac
 [ $# -gt 0 ] && shift
@@ -569,11 +620,12 @@ case "$sub" in
   finish) cmd_finish "$@" ;;
   note) cmd_note "$@" ;;
   add) cmd_add "$@" ;;
+  ack-rules) cmd_ack_rules "$@" ;;
   mark-converged) cmd_mark_converged "$@" ;;
   cancel) cmd_cancel "$@" ;;
   reset) cmd_reset "$@" ;;
   paths) cmd_paths "$@" ;;
   tree-clean) cmd_tree_clean "$@" ;;
-  ''|-h|--help|help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ''|-h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
 esac
