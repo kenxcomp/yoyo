@@ -278,6 +278,22 @@ grep -q '^## Rule-file additions' "$(printf '%s\n' "$out" | kv RESULT)" && ok ||
 new_branch rules/nested; git rm -q sub/AGENTS.md && git commit -qm "drop nested rules"
 expect "nested rule file deleted: listed for a person" "needs-human" "$(run_round "$F_CLEAN" full | kv VERDICT)"
 
+new_branch rules/newline-path; printf 'x\n' > "$(printf '0\nextra.txt')"
+sed -i.bak 's/^Never build SQL/Prefer not to build SQL/' REVIEW.md && rm REVIEW.md.bak && git add -A && git commit -qm "newline filename + relax"
+out=$(run_round "$F_CLEAN" full)
+expect "newline in another filename cannot hide a rule edit" "needs-human:1" "$(printf '%s\n' "$out" | kv VERDICT):$(printf '%s\n' "$out" | kv RULES_NEED_HUMAN)"
+mkdir -p "$(printf 'odd\ndir')" && printf 'r\n' > "$(printf 'odd\ndir')/AGENTS.md" && git add -A && git commit -qm "rule file under a newline dir"
+grep -qF 'odd\ndir/AGENTS.md' "$(run_round "$F_CLEAN" full | kv RESULT)" && ok || bad "a rule path with a newline is escaped onto one line"
+
+new_branch rules/textconv
+printf 'REVIEW.md diff=lossy\n' > "$(git rev-parse --git-dir)/info/attributes"; git config diff.lossy.textconv 'head -n 1'
+sed -i.bak 's/^Never build SQL/Sometimes build SQL/' REVIEW.md && rm REVIEW.md.bak && git commit -qam "rewrite 1"
+TC1=$(bash "$HERE/review-rules.sh" fp "$BASE_SHA" HEAD)
+sed -i.bak 's/^Sometimes build SQL/Always build SQL/' REVIEW.md && rm REVIEW.md.bak && git commit -qam "rewrite 2"
+[ -n "$TC1" ] && [ "$(bash "$HERE/review-rules.sh" fp "$BASE_SHA" HEAD)" != "$TC1" ] && ok || bad "a lossy textconv cannot make two rewrites share one fingerprint"
+expect "textconv does not hide a rewrite from classification" "needs-human" "$(bash "$HERE/review-rules.sh" list "$BASE_SHA" HEAD | cut -f1)"
+rm -f "$(git rev-parse --git-dir)/info/attributes"; git config --unset diff.lossy.textconv
+
 # --- v1.8.0: a result is bound to the commit + tracked tree the reviewer read
 new_branch drift/tree
 FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
