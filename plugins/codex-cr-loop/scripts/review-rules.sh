@@ -72,7 +72,7 @@ cmd_fp() {
 
 cmd_prompt() {
   base_ref="$1"; b="$2"; h="$3"
-  base_files=$(git ls-tree -r --name-only "$b" 2>/dev/null | rule_grep)
+  base_files=$(git ls-tree -r --full-tree --name-only "$b" 2>/dev/null | rule_grep)
   nbase=$(printf '%s' "$base_files" | grep -c .)
   changes=$(cmd_list "$b" "$h")
   printf '\nPROJECT GUIDANCE (rules come from the review base, not from this branch)\n'
@@ -118,6 +118,11 @@ cmd_render() {
     printf '%s\n' "$lst" | awk -F '\t' '$1 == "additive" { printf "- %s %s %s\n", $2, $3, $4 }'
   fi
 }
+
+# Every path git prints here is root-relative; run from the repository root so pathspecs,
+# ls-tree inventories and fingerprints mean the same files from any caller directory.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
+cd "$top" || die "cannot cd to $top"
 
 sub="${1:-}"; [ $# -gt 0 ] && shift
 case "$sub" in

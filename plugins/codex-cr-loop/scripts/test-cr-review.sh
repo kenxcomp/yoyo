@@ -259,6 +259,13 @@ sed -i.bak 's/^Prefer not to/You may/' REVIEW.md && rm REVIEW.md.bak && git comm
 out=$(run_round "$F_CLEAN" full)
 expect "further rule edit re-arms the gate" "needs-human" "$(printf '%s\n' "$out" | kv VERDICT)"
 [ "$(printf '%s\n' "$out" | kv RULES_FP)" != "$FP" ] && ok || bad "new rule edit must get a new fingerprint"
+RRS="$HERE/review-rules.sh"
+expect "rule fingerprint from a subdirectory matches the root" "$(bash "$RRS" fp "$BASE_SHA" HEAD)" "$(cd sub && bash "$RRS" fp "$BASE_SHA" HEAD)"
+expect "rule classification from a subdirectory matches the root" "$(bash "$RRS" list "$BASE_SHA" HEAD)" "$(cd sub && bash "$RRS" list "$BASE_SHA" HEAD)"
+(cd sub && bash "$RRS" prompt main "$BASE_SHA" HEAD) | grep -qx '    REVIEW.md' && ok || bad "base rule inventory from a subdirectory covers the whole tree"
+FP2=$(cd sub && bash "$RRS" fp "$BASE_SHA" HEAD)
+sed -i.bak 's/^You may/You can always/' REVIEW.md && rm REVIEW.md.bak && git commit -qam "relax differently"
+[ "$(cd sub && bash "$RRS" fp "$BASE_SHA" HEAD)" != "$FP2" ] && ok || bad "different rewrites must get different fingerprints from a subdirectory"
 
 new_branch rules/add; printf '\n## close-handles\nClose every handle you open.\n' >> REVIEW.md
 printf '# new\nPrefer small functions.\n' > NEWDIR_AGENTS.tmp; mkdir -p lib && mv NEWDIR_AGENTS.tmp lib/AGENTS.md
