@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh\"",
             "timeout": 5
           }
         ]

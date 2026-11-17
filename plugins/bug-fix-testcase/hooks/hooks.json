@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/inject-skill.sh\"",
             "timeout": 5
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/detect-bugfix.sh",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/detect-bugfix.sh\"",
             "timeout": 5
           }
         ]
