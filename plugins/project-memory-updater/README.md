@@ -1,4 +1,4 @@
-# Claude MD Plugin
+# Project Memory Updater Plugin
 
 A plugin for managing CLAUDE.md configurations with automatic update detection.
 
@@ -8,14 +8,14 @@ A plugin for managing CLAUDE.md configurations with automatic update detection.
 
 ```
 /plugin marketplace add kenxcomp/yoyo
-/plugin install claude-md@kenxcomp-yoyo
+/plugin install project-memory-updater@kenxcomp-yoyo
 ```
 
 ### Method 2: Local Development
 
 ```bash
 git clone https://github.com/kenxcomp/yoyo
-claude --plugin-dir ./yoyo/plugins/claude-md
+claude --plugin-dir ./yoyo/plugins/project-memory-updater
 ```
 
 > **Note**: Requires Claude Code version 1.0.33 or later.
@@ -41,7 +41,7 @@ When a major update is detected, the plugin can guide you through updating or cr
 ## Directory Structure
 
 ```
-claude-md/
+project-memory-updater/
 ├── .claude-plugin/
 │   └── plugin.json           # Plugin metadata
 ├── hooks/

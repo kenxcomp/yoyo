@@ -10,10 +10,10 @@
   },
   "plugins": [
     {
-      "name": "claude-md",
+      "name": "project-memory-updater",
       "description": "A plugin for managing CLAUDE.md configurations with auto-update detection",
-      "version": "1.1.0",
-      "source": "./plugins/claude-md",
+      "version": "2.0.0",
+      "source": "./plugins/project-memory-updater",
       "category": "productivity",
       "tags": ["configuration", "productivity", "hooks"]
     },
