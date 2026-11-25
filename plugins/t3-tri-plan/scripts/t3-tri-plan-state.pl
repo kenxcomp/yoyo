@@ -7,6 +7,7 @@ use warnings;
 use utf8;
 use Cwd qw(abs_path getcwd);
 use Digest::SHA qw(sha256_hex);
+use Encode qw(decode encode FB_CROAK LEAVE_SRC);
 use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
@@ -54,7 +55,7 @@ sub resolve_repo_root {
   open(my $ph, '-|', 'git', '-C', $probe, 'rev-parse', '--show-toplevel') or die_err("cannot run git rev-parse");
   my $out = <$ph>;
   close $ph;
-  if (($? >> 8) == 0 && defined $out) {
+  if (_decode_wait_status($?) == 0 && defined $out) {
     $out =~ s/\r?\n$//;
     return abs_path($out) // $out if length $out;
   }
@@ -65,7 +66,17 @@ sub task_rel_path {
   my ($repo_root, $real_task) = @_;
   my $rel = File::Spec->abs2rel($real_task, $repo_root);
   $rel =~ s{\\}{/}g;
-  return ($rel =~ m{\A\.\./}) ? '' : $rel;
+  return '' if $rel =~ m{\A\.\./};
+  my $dec = eval { decode('UTF-8', $rel, FB_CROAK | LEAVE_SRC) };
+  return $@ ? $rel : $dec;
+}
+
+sub _decode_cli_text {
+  my ($raw, $flag) = @_;
+  return undef unless defined $raw;
+  my $dec = eval { decode('UTF-8', $raw, FB_CROAK | LEAVE_SRC) };
+  die_err("invalid UTF-8 bytes in $flag") if $@;
+  return $dec;
 }
 
 sub _decode_wait_status {
@@ -151,6 +162,47 @@ sub load_state_or_undef {
   return load_json_file($sf);
 }
 
+sub _effective_ignore_project_config {
+  my ($st, $opt) = @_;
+  $opt ||= {};
+  return 0 if $opt->{use_project_config};
+  return 1 if $opt->{ignore_project_config};
+  return 1 if ($ENV{T3_TRI_PLAN_IGNORE_PROJECT_CONFIG} // '') eq '1';
+  return 1 if ref($st) eq 'HASH' && $st->{ignore_project_config};
+  return 0;
+}
+
+sub _with_activation_lock_guard {
+  my ($plans_dir, $op_name, $code) = @_;
+  my $act_fh = _try_activation_lock($plans_dir);
+  if (!$act_fh) {
+    print "ACTIVATION_IN_PROGRESS=1\nREASON=cannot run $op_name while Phase 6 activation holds .activation.lock\n";
+    exit 5;
+  }
+  my @res;
+  my $want = wantarray;
+  my $ok = eval {
+    if ($want) { @res = $code->(); }
+    else       { $res[0] = $code->(); }
+    1;
+  };
+  my $err = $@;
+  flock($act_fh, LOCK_UN);
+  close $act_fh;
+  die $err unless $ok;
+  return $want ? @res : $res[0];
+}
+
+sub _guard_phase6_not_in_flight {
+  my ($st, $op_name, %opts) = @_;
+  return unless ref($st) eq 'HASH' && ref($st->{phases}) eq 'HASH' && ref($st->{phases}{'6'}) eq 'HASH';
+  my $p6_st = $st->{phases}{'6'}{state} // 'none';
+  if ($p6_st eq 'activating' || $p6_st eq 'activation_uncertain') {
+    return if $opts{allow_uncertain} && $p6_st eq 'activation_uncertain';
+    die_err("cannot run $op_name while Phase 6 is '$p6_st' — run recover-activation, cancel-activating, or resolve-activation first", 3);
+  }
+}
+
 sub resolve_configured_knobs {
   my ($repo_root, $ignore_project) = @_;
   my %knobs = (
@@ -217,19 +269,20 @@ sub _init_fresh_review {
 }
 
 sub init_fresh_state {
-  my ($prd_sha, $auth, $knobs) = @_;
+  my ($prd_sha, $auth, $knobs, $ignore_proj) = @_;
   return {
-    pipeline           => 't3-tri-plan',
-    schema_version     => 2,
-    generation         => 1,
-    owner_generation   => 1,
-    last_tx_id         => '',
-    prd_lineage        => $prd_sha,
-    effective_prd_sha256 => $prd_sha,
-    prd_wording_updates => [],
+    pipeline              => 't3-tri-plan',
+    schema_version        => 2,
+    generation            => 1,
+    owner_generation      => 1,
+    last_tx_id            => '',
+    ignore_project_config => $ignore_proj ? JSON::PP::true : JSON::PP::false,
+    prd_lineage           => $prd_sha,
+    effective_prd_sha256  => $prd_sha,
+    prd_wording_updates   => [],
     wording_equivalent_prd_shas => [ $prd_sha ],
-    authorization      => ($auth // ''),
-    phases             => {
+    authorization         => ($auth // ''),
+    phases                => {
       '0' => {
         status         => 'completed',
         prd            => $prd_sha,
@@ -258,6 +311,10 @@ sub _validate_model_spec_typed {
   }
   for my $k (sort keys %$h) {
     push @$errs, "$ctx has unexpected property '$k'" unless $req{$k};
+  }
+  if (exists $h->{effortKey} && $h->{effortKey}[0] eq 'str' && !length($h->{effortKey}[1]) &&
+      exists $h->{effort} && $h->{effort}[0] eq 'str' && length($h->{effort}[1])) {
+    push @$errs, "$ctx.effort must be empty when effortKey is empty";
   }
 }
 
@@ -295,9 +352,14 @@ sub _validate_group_typed {
         my $pair = "$mh->{providerInstanceId}[1]/$mh->{model}[1]";
         push @$errs, "$ctx has duplicate model '$pair'" if $seen_pair{$pair}++;
       }
-      if ($emode eq 'unified' && length $ue && exists $mh->{effort} && $mh->{effort}[0] eq 'str') {
-        if (length($mh->{effort}[1]) && $mh->{effort}[1] ne $ue) {
-          push @$errs, "$ctx.members[$idx].effort '$mh->{effort}[1]' conflicts with unifiedEffort '$ue'";
+      if ($emode eq 'unified') {
+        if (exists $mh->{effortKey} && $mh->{effortKey}[0] eq 'str' && !length($mh->{effortKey}[1])) {
+          push @$errs, "$ctx.members[$idx].effortKey must be non-empty when effortMode is 'unified'";
+        }
+        if (length $ue && exists $mh->{effort} && $mh->{effort}[0] eq 'str') {
+          if (length($mh->{effort}[1]) && $mh->{effort}[1] ne $ue) {
+            push @$errs, "$ctx.members[$idx].effort '$mh->{effort}[1]' conflicts with unifiedEffort '$ue'";
+          }
         }
       }
     }
@@ -406,13 +468,14 @@ sub cmd_config_show {
   my $ucfg = user_config_path();
   my $repo = resolve_repo_root($opt{repo}, undef);
   my $pcfg_on_disk = (-f "$repo/.t3-tri-plan.json") ? "$repo/.t3-tri-plan.json" : '';
-  my $pcfg = ($opt{ignore_project_config} ? '' : $pcfg_on_disk);
+  my $ign_proj = _effective_ignore_project_config(undef, \%opt);
+  my $pcfg = ($ign_proj ? '' : $pcfg_on_disk);
 
   if (!-f $ucfg) {
     print "CONFIGURED=0\n";
     print "USER_CONFIG=$ucfg\n";
     print "PROJECT_CONFIG=$pcfg\n" if length $pcfg;
-    print "PROJECT_CONFIG_IGNORED=1\n" if $opt{ignore_project_config} && length $pcfg_on_disk;
+    print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj && length $pcfg_on_disk;
     return;
   }
 
@@ -498,12 +561,14 @@ sub cmd_config_show {
 
   # Build live capability lookup if supplied.
   my (%cap_prov, %cap_model);
+  my $caps_loaded = 0;
   my $inherited_pid = '';
   if (length($opt{caps} // '')) {
     my $caps = eval { load_json_file($opt{caps}) };
-    if ($@ || ref $caps ne 'HASH') {
+    if ($@ || ref $caps ne 'HASH' || (exists $caps->{providers} && ref $caps->{providers} ne 'ARRAY')) {
       push @errors, "cannot parse --capabilities JSON: $@";
     } else {
+      $caps_loaded = 1;
       $inherited_pid = $caps->{inheritedProviderInstanceId} // '';
       for my $pr (@{$caps->{providers} || []}) {
         my $pid = $pr->{providerInstanceId} // next;
@@ -675,8 +740,8 @@ sub cmd_config_show {
     }
   }
 
-  # Validate every actual dispatch target against live capabilities.
-  if (length($opt{caps} // '') && keys %cap_model) {
+  # Validate every actual dispatch target against live capabilities (even if providers/models list is empty!).
+  if ($caps_loaded) {
     my $check_one = sub {
       my ($rv, $label) = @_;
       my $key = "$rv->{providerInstanceId}/$rv->{model}";
@@ -748,7 +813,7 @@ sub cmd_config_show {
   print "CONFIGURED=1\nCONFIG_VALID=1\n";
   print "USER_CONFIG=$ucfg\n";
   print "PROJECT_CONFIG=$pcfg\n" if length $pcfg;
-  print "PROJECT_CONFIG_IGNORED=1\n" if $opt{ignore_project_config} && length $pcfg_on_disk;
+  print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj && length $pcfg_on_disk;
   print "PROJECT_OVERRIDDEN=$proj_overrode\n";
   print "NEEDS_PROVIDER_AUTH=" . (@unauth ? 1 : 0) . "\n";
   print "UNAUTHORIZED_PROVIDERS=" . join(',', @unauth) . "\n" if @unauth;
@@ -1162,41 +1227,86 @@ sub cmd_commit_phase0 {
   die_err("commit-phase0 requires --task <path>") unless defined $opt{task} && -d $opt{task};
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
+    _with_activation_lock_guard($plans_dir, 'commit-phase0', sub {
+      recover_tx($real_task, $plans_dir);
 
-    my $prd_path = "$real_task/prd.md";
-    die_err("missing $prd_path") unless -f $prd_path && !-l $prd_path;
-    my $prd_sha = sha256_file($prd_path);
-    my $repo    = resolve_repo_root($opt{repo}, $real_task);
-    my $knobs   = resolve_configured_knobs($repo, 0);
+      my $prd_path = "$real_task/prd.md";
+      die_err("missing $prd_path") unless -f $prd_path && !-l $prd_path;
+      my $prd_sha = sha256_file($prd_path);
+      my $repo    = resolve_repo_root($opt{repo}, $real_task);
 
-    my $st = load_state_or_undef($plans_dir);
-    if (!$st) {
-      my $new_st = init_fresh_state($prd_sha, $opt{authorization} // '', $knobs);
-      my $tx_id  = "tx-p0-" . time() . "-$$";
-      $new_st->{last_tx_id} = $tx_id;
-      execute_tx($real_task, $plans_dir, {
-        tx_id               => $tx_id,
-        expected_generation => 0,
-        next_generation     => 1,
-        writes              => [
-          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($new_st), is_state_file => 1 },
-        ],
-      });
-      print "PHASE0_COMMITTED=1\nCHANGE_KIND=initial\nPRD_SHA256=$prd_sha\nGENERATION=1\n";
-      return;
-    }
+      my $st = load_state_or_undef($plans_dir);
+      my $ign_proj = _effective_ignore_project_config($st, \%opt);
+      my $knobs    = resolve_configured_knobs($repo, $ign_proj);
+      if (!$st) {
+        my $new_st = init_fresh_state($prd_sha, $opt{authorization} // '', $knobs, $ign_proj);
+        my $tx_id  = "tx-p0-" . time() . "-$$";
+        $new_st->{last_tx_id} = $tx_id;
+        execute_tx($real_task, $plans_dir, {
+          tx_id               => $tx_id,
+          expected_generation => 0,
+          next_generation     => 1,
+          writes              => [
+            { dst => 'research/plans/planning-state.json', bytes => encode_canonical($new_st), is_state_file => 1 },
+          ],
+        });
+        print "PHASE0_COMMITTED=1\nCHANGE_KIND=initial\nPRD_SHA256=$prd_sha\nGENERATION=1\n";
+        print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj;
+        return;
+      }
 
-    die_err("legacy dual-plan task detected — run migrate-legacy --confirm or use /trellis:dual-plan")
-      unless ($st->{pipeline} // '') eq 't3-tri-plan';
+      die_err("legacy dual-plan task detected — run migrate-legacy --confirm or use /trellis:dual-plan")
+        unless ($st->{pipeline} // '') eq 't3-tri-plan';
 
-    my $cur_eff_prd = $st->{effective_prd_sha256} // '';
-    if ($cur_eff_prd eq $prd_sha) {
-      if (defined $opt{authorization} && length $opt{authorization} && $opt{authorization} ne ($st->{authorization} // '')) {
-        my $old_gen = $st->{generation} // 1;
-        my $tx_id = "tx-p0-auth-" . time() . "-$$";
-        $st->{authorization} = $opt{authorization};
-        $st->{last_tx_id}    = $tx_id;
+      my $cur_eff_prd = $st->{effective_prd_sha256} // '';
+      if ($cur_eff_prd eq $prd_sha) {
+        my $auth_chg = (defined $opt{authorization} && length $opt{authorization} && $opt{authorization} ne ($st->{authorization} // '')) ? 1 : 0;
+        my $ign_toggled = (($opt{ignore_project_config} || $opt{use_project_config}) && (($st->{ignore_project_config} ? 1 : 0) != $ign_proj)) ? 1 : 0;
+        if ($auth_chg || $ign_toggled) {
+          _guard_phase6_not_in_flight($st, 'commit-phase0');
+          my $old_gen = $st->{generation} // 1;
+          my $tx_id = "tx-p0-auth-" . time() . "-$$";
+          $st->{authorization}         = $opt{authorization} if $auth_chg;
+          $st->{ignore_project_config} = $ign_proj ? JSON::PP::true : JSON::PP::false if $ign_toggled;
+          $st->{last_tx_id}            = $tx_id;
+          execute_tx($real_task, $plans_dir, {
+            tx_id               => $tx_id,
+            expected_generation => $old_gen,
+            next_generation     => $old_gen,
+            writes              => [
+              { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+            ],
+          });
+        }
+        print "PHASE0_COMMITTED=1\nCHANGE_KIND=unchanged\nPRD_SHA256=$prd_sha\nGENERATION=$st->{generation}\n";
+        print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj;
+        return;
+      }
+
+      my $kind = $opt{change_kind} // '';
+      die_err("prd.md SHA-256 changed ($cur_eff_prd -> $prd_sha); explicit --change-kind material|wording is required")
+        unless $kind eq 'material' || $kind eq 'wording';
+
+      my $old_gen = $st->{generation} // 1;
+      if ($kind eq 'wording') {
+        _guard_phase6_not_in_flight($st, 'commit-phase0 --change-kind wording');
+        die_err("--change-kind wording requires --evidence <why contract/acceptance unchanged>")
+          unless defined $opt{evidence} && $opt{evidence} =~ /\S/;
+        my $tx_id = "tx-p0-word-" . time() . "-$$";
+        push @{$st->{prd_wording_updates}}, {
+          old_prd_sha256 => $cur_eff_prd,
+          new_prd_sha256 => $prd_sha,
+          evidence       => $opt{evidence},
+          recorded_at    => now_iso(),
+        };
+        my %eq = map { $_ => 1 } @{$st->{wording_equivalent_prd_shas} || [$st->{prd_lineage}]};
+        $eq{$prd_sha} = 1;
+        $st->{wording_equivalent_prd_shas} = [ sort keys %eq ];
+        $st->{effective_prd_sha256}        = $prd_sha;
+        $st->{ignore_project_config}       = $ign_proj ? JSON::PP::true : JSON::PP::false;
+        $st->{phases}{'0'}{effective_prd_sha256} = $prd_sha;
+        $st->{phases}{'0'}{prd}            = $prd_sha;
+        $st->{last_tx_id}                  = $tx_id;
         execute_tx($real_task, $plans_dir, {
           tx_id               => $tx_id,
           expected_generation => $old_gen,
@@ -1205,115 +1315,73 @@ sub cmd_commit_phase0 {
             { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
           ],
         });
+        print "PHASE0_COMMITTED=1\nCHANGE_KIND=wording\nOLD_PRD_SHA256=$cur_eff_prd\nPRD_SHA256=$prd_sha\nGENERATION=$old_gen\n";
+        print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj;
+        return;
       }
-      print "PHASE0_COMMITTED=1\nCHANGE_KIND=unchanged\nPRD_SHA256=$prd_sha\nGENERATION=$st->{generation}\n";
-      return;
-    }
 
-    my $kind = $opt{change_kind} // '';
-    die_err("prd.md SHA-256 changed ($cur_eff_prd -> $prd_sha); explicit --change-kind material|wording is required")
-      unless $kind eq 'material' || $kind eq 'wording';
-
-    my $old_gen = $st->{generation} // 1;
-    if ($kind eq 'wording') {
-      die_err("--change-kind wording requires --evidence <why contract/acceptance unchanged>")
-        unless defined $opt{evidence} && $opt{evidence} =~ /\S/;
-      my $tx_id = "tx-p0-word-" . time() . "-$$";
-      push @{$st->{prd_wording_updates}}, {
-        old_prd_sha256 => $cur_eff_prd,
-        new_prd_sha256 => $prd_sha,
-        evidence       => $opt{evidence},
-        recorded_at    => now_iso(),
-      };
-      my %eq = map { $_ => 1 } @{$st->{wording_equivalent_prd_shas} || [$st->{prd_lineage}]};
-      $eq{$prd_sha} = 1;
-      $st->{wording_equivalent_prd_shas} = [ sort keys %eq ];
-      $st->{effective_prd_sha256}        = $prd_sha;
-      $st->{phases}{'0'}{effective_prd_sha256} = $prd_sha;
-      $st->{phases}{'0'}{prd}            = $prd_sha;
-      $st->{last_tx_id}                  = $tx_id;
-      # Historical phases[*].prd_sha256 and review.rounds[*].reviewed_prd_sha256 stay IMMUTABLE!
-      # Note: existing clean_streak / converged / user_decision keep their original bound prd_sha256
-      # so check-freshness/next-review will require explicit ack-wording-closure or confirmation review!
-      execute_tx($real_task, $plans_dir, {
-        tx_id               => $tx_id,
-        expected_generation => $old_gen,
-        next_generation     => $old_gen,
-        writes              => [
-          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-        ],
-      });
-      print "PHASE0_COMMITTED=1\nCHANGE_KIND=wording\nOLD_PRD_SHA256=$cur_eff_prd\nPRD_SHA256=$prd_sha\nGENERATION=$old_gen\n";
-      return;
-    }
-
-    # Material PRD change: state-first tx (persist invalidation + next_generation FIRST, then move old downstream into unique superseded-<8hex>-<txid>/).
-    die_err("--change-kind material requires --reason <summary>")
-      unless defined $opt{reason} && $opt{reason} =~ /\S/;
-    my $act_guard_fh = _try_activation_lock($plans_dir);
-    if (!$act_guard_fh) {
-      print "ACTIVATION_IN_PROGRESS=1\nREASON=cannot supersede PRD while Phase 6 activation holds .activation.lock\n";
-      exit 5;
-    }
-    my $next_gen = $old_gen + 1;
-    my $tx_id    = "tx-p0-mat-" . time() . "-$$-" . int(rand(10000));
-    my $short8   = substr($cur_eff_prd, 0, 8);
-    my $sup_rel  = "research/plans/superseded-${short8}-${tx_id}";
-    while (-e "$real_task/$sup_rel") {
-      $sup_rel .= "-" . int(rand(1000));
-    }
-
-    my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "prd material change: $opt{reason}"));
-    my $old_run_id;
-    if (-f "$plans_dir/active-run.json") {
-      my $r = eval { load_json_file("$plans_dir/active-run.json") };
-      $old_run_id = $r->{run_id} if !$@ && ref $r eq 'HASH';
-    }
-
-    my @moves;
-    my @archive_candidates = (
-      'research/plans/candidates',
-      'research/plans/blind-eval.json',
-      'research/plans/synthesis-body-locked.md',
-      'research/plans/synthesis.md',
-      'research/plans/initial-design.md',
-      'research/plans/review-ledger.md',
-      'research/plans/review-rounds',
-      'research/plans/active-run.json',
-      'design.md',
-      'implement.md',
-      'implement.jsonl',
-      'check.jsonl',
-    );
-    for my $rel (@archive_candidates) {
-      if (-e "$real_task/$rel") {
-        my $dst_name = $rel;
-        $dst_name =~ s{\Aresearch/plans/}{};
-        push @moves, { src => $rel, dst => "$sup_rel/$dst_name" };
+      # Material PRD change: state-first tx (block uninspected 'activating', allow explicit supersede from 'activation_uncertain').
+      _guard_phase6_not_in_flight($st, 'commit-phase0 --change-kind material', allow_uncertain => 1);
+      die_err("--change-kind material requires --reason <summary>")
+        unless defined $opt{reason} && $opt{reason} =~ /\S/;
+      my $next_gen = $old_gen + 1;
+      my $tx_id    = "tx-p0-mat-" . time() . "-$$-" . int(rand(10000));
+      my $short8   = substr($cur_eff_prd, 0, 8);
+      my $sup_rel  = "research/plans/superseded-${short8}-${tx_id}";
+      while (-e "$real_task/$sup_rel") {
+        $sup_rel .= "-" . int(rand(1000));
       }
-    }
 
-    # Save a snapshot of old planning-state.json into superseded dir via write_file.
-    my $old_state_bytes = read_raw_file(state_path($plans_dir));
-
-    my $new_st = init_fresh_state($prd_sha, length($opt{authorization} // '') ? $opt{authorization} : ($st->{authorization} // ''), $knobs);
-    $new_st->{generation}        = $next_gen;
-    $new_st->{owner_generation}  = $st->{owner_generation} // 1;
-    $new_st->{last_tx_id}        = $tx_id;
-    $new_st->{orphaned_attempts} = \@orphans;
-    $new_st->{superseded_history} = [
-      @{$st->{superseded_history} || []},
-      {
-        old_prd_sha256 => $cur_eff_prd,
-        new_prd_sha256 => $prd_sha,
-        archive_dir    => $sup_rel,
-        reason         => $opt{reason},
-        generation     => $next_gen,
-        at             => now_iso(),
+      my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "prd material change: $opt{reason}"));
+      my $old_run_id;
+      if (-f "$plans_dir/active-run.json") {
+        my $r = eval { load_json_file("$plans_dir/active-run.json") };
+        $old_run_id = $r->{run_id} if !$@ && ref $r eq 'HASH';
       }
-    ];
 
-    eval {
+      my @moves;
+      my @archive_candidates = (
+        'research/plans/candidates',
+        'research/plans/blind-eval.json',
+        'research/plans/synthesis-body-locked.md',
+        'research/plans/synthesis.md',
+        'research/plans/initial-design.md',
+        'research/plans/review-ledger.md',
+        'research/plans/review-rounds',
+        'research/plans/active-run.json',
+        'design.md',
+        'implement.md',
+        'implement.jsonl',
+        'check.jsonl',
+      );
+      for my $rel (@archive_candidates) {
+        if (-e "$real_task/$rel") {
+          my $dst_name = $rel;
+          $dst_name =~ s{\Aresearch/plans/}{};
+          push @moves, { src => $rel, dst => "$sup_rel/$dst_name" };
+        }
+      }
+
+      # Save a snapshot of old planning-state.json into superseded dir via write_file.
+      my $old_state_bytes = read_raw_file(state_path($plans_dir));
+
+      my $new_st = init_fresh_state($prd_sha, length($opt{authorization} // '') ? $opt{authorization} : ($st->{authorization} // ''), $knobs, $ign_proj);
+      $new_st->{generation}        = $next_gen;
+      $new_st->{owner_generation}  = $st->{owner_generation} // 1;
+      $new_st->{last_tx_id}        = $tx_id;
+      $new_st->{orphaned_attempts} = \@orphans;
+      $new_st->{superseded_history} = [
+        @{$st->{superseded_history} || []},
+        {
+          old_prd_sha256 => $cur_eff_prd,
+          new_prd_sha256 => $prd_sha,
+          archive_dir    => $sup_rel,
+          reason         => $opt{reason},
+          generation     => $next_gen,
+          at             => now_iso(),
+        }
+      ];
+
       execute_tx($real_task, $plans_dir, {
         tx_id               => $tx_id,
         expected_generation => $old_gen,
@@ -1326,13 +1394,10 @@ sub cmd_commit_phase0 {
           { dst => 'research/plans/planning-state.json', bytes => encode_canonical($new_st), is_state_file => 1 },
         ],
       });
-    };
-    my $tx_err = $@;
-    flock($act_guard_fh, LOCK_UN);
-    close $act_guard_fh;
-    die $tx_err if $tx_err;
 
-    print "PHASE0_COMMITTED=1\nCHANGE_KIND=material\nOLD_PRD_SHA256=$cur_eff_prd\nPRD_SHA256=$prd_sha\nGENERATION=$next_gen\nSUPERSEDED_DIR=$sup_rel\n";
+      print "PHASE0_COMMITTED=1\nCHANGE_KIND=material\nOLD_PRD_SHA256=$cur_eff_prd\nPRD_SHA256=$prd_sha\nGENERATION=$next_gen\nSUPERSEDED_DIR=$sup_rel\n";
+      print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj;
+    });
   });
 }
 
@@ -1343,8 +1408,10 @@ sub cmd_ack_wording_closure {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+    _with_activation_lock_guard($plans_dir, 'ack-wording-closure', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'ack-wording-closure');
     my $repo = resolve_repo_root($opt{repo}, $real_task);
     my $trel = task_rel_path($repo, $real_task);
 
@@ -1430,7 +1497,8 @@ sub cmd_ack_wording_closure {
         { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
       ],
     });
-    print "WORDING_CLOSURE_ACKED=1\nREBOUND=$rebound\nREVIEW_BASELINE_SHA256=$new_baseline\n";
+      print "WORDING_CLOSURE_ACKED=1\nREBOUND=$rebound\nREVIEW_BASELINE_SHA256=$new_baseline\n";
+    });
   });
 }
 
@@ -1471,10 +1539,17 @@ sub cmd_prepare_design {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("commit-phase0 first");
-    my $repo = resolve_repo_root($opt{repo}, $real_task);
-    my $trel = task_rel_path($repo, $real_task);
+    _with_activation_lock_guard($plans_dir, 'prepare-design', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("commit-phase0 first");
+      _guard_phase6_not_in_flight($st, 'prepare-design');
+      if (ref($st->{review}) eq 'HASH' &&
+          ref($st->{review}{user_decision}) eq 'HASH' &&
+          ($st->{review}{user_decision}{choice} // '') eq 'manual_redesign') {
+        die_err("manual_redesign is active — run clear-manual-redesign or commit-phase0 --change-kind material before re-running Phase 1", 3);
+      }
+      my $repo = resolve_repo_root($opt{repo}, $real_task);
+      my $trel = task_rel_path($repo, $real_task);
 
     my $prd_sha = sha256_file("$real_task/prd.md");
     die_err("prd.md modified since Phase 0 commit — run commit-phase0 first")
@@ -1528,7 +1603,8 @@ sub cmd_prepare_design {
 
     _create_active_run($real_task, $plans_dir, $st, $run_obj);
     print "RUN_ID=$run_id\nPHASE=phase1-design\nGENERATION=$st->{generation}\nOWNER_GENERATION=$st->{owner_generation}\n";
-    print "SLOTS=" . join(',', @slot_names) . "\n";
+      print "SLOTS=" . join(',', @slot_names) . "\n";
+    });
   });
 }
 
@@ -1539,8 +1615,10 @@ sub cmd_prepare_judge {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+    _with_activation_lock_guard($plans_dir, 'prepare-judge', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'prepare-judge');
     my $repo = resolve_repo_root($opt{repo}, $real_task);
     my $trel = task_rel_path($repo, $real_task);
 
@@ -1618,7 +1696,8 @@ sub cmd_prepare_judge {
     });
 
     print "RUN_ID=$run_id\nPHASE=phase2-judge\nGENERATION=$gen\nOWNER_GENERATION=$st->{owner_generation}\n";
-    print "CANDIDATES_MANIFEST=$real_task/$cand_manifest_rel\n";
+      print "CANDIDATES_MANIFEST=$real_task/$cand_manifest_rel\n";
+    });
   });
 }
 
@@ -1630,8 +1709,10 @@ sub cmd_prepare_review {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+    _with_activation_lock_guard($plans_dir, 'prepare-review', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'prepare-review');
     my $repo = resolve_repo_root($opt{repo}, $real_task);
     my $trel = task_rel_path($repo, $real_task);
 
@@ -1789,7 +1870,8 @@ sub cmd_prepare_review {
     print "FROZEN_LEDGER=$real_task/$frozen_led_rel\nLEDGER_MANIFEST=$real_task/$led_man_rel\n";
     print "REVIEW_BASELINE_SHA256=$baseline_sha\n";
     print "PREV_SNAPSHOT=$real_task/$round_inputs{prev_snapshot_rel}\n" if length($round_inputs{prev_snapshot_rel} // '');
-    print "SLOTS=" . join(',', sort keys %slots) . "\n";
+      print "SLOTS=" . join(',', sort keys %slots) . "\n";
+    });
   });
 }
 
@@ -1804,6 +1886,7 @@ sub cmd_claim_slot {
     if ($stale) { print "STALE_CALLBACK=1\nREASON=$why\n"; exit 4; }
     recover_tx($real_task, $plans_dir);
     my $st  = load_state_or_undef($plans_dir) // die_err("missing state");
+    _guard_phase6_not_in_flight($st, 'claim-slot');
     my $rf  = "$plans_dir/active-run.json";
     die_err("no active-run.json") unless -f $rf;
     my $run = load_json_file($rf);
@@ -2246,48 +2329,51 @@ sub cmd_takeover_run {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $old_gen = $st->{generation} // 1;
-    my $next_gen = $old_gen + 1;
-    my $old_og  = $st->{owner_generation} // 1;
-    my $next_og = $old_og + 1;
+    _with_activation_lock_guard($plans_dir, 'takeover-run', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'takeover-run');
+      my $old_gen = $st->{generation} // 1;
+      my $next_gen = $old_gen + 1;
+      my $old_og  = $st->{owner_generation} // 1;
+      my $next_og = $old_og + 1;
 
-    my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "takeover by $opt{new_owner}: $opt{reason}"));
-    my $old_run_id;
-    my @removes;
-    if (-f "$plans_dir/active-run.json") {
-      my $r = load_json_file("$plans_dir/active-run.json");
-      $old_run_id = $r->{run_id};
-      push @removes, 'research/plans/active-run.json';
-    }
+      my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "takeover by $opt{new_owner}: $opt{reason}"));
+      my $old_run_id;
+      my @removes;
+      if (-f "$plans_dir/active-run.json") {
+        my $r = load_json_file("$plans_dir/active-run.json");
+        $old_run_id = $r->{run_id};
+        push @removes, 'research/plans/active-run.json';
+      }
 
-    my $tx_id = "tx-takeover-" . time() . "-$$";
-    $st->{generation}        = $next_gen;
-    $st->{owner_generation}  = $next_og;
-    $st->{last_tx_id}        = $tx_id;
-    $st->{orphaned_attempts} = \@orphans;
-    $st->{last_takeover}     = {
-      new_owner        => $opt{new_owner},
-      reason           => $opt{reason},
-      generation       => $next_gen,
-      owner_generation => $next_og,
-      at               => now_iso(),
-    };
+      my $tx_id = "tx-takeover-" . time() . "-$$";
+      $st->{generation}        = $next_gen;
+      $st->{owner_generation}  = $next_og;
+      $st->{last_tx_id}        = $tx_id;
+      $st->{orphaned_attempts} = \@orphans;
+      $st->{last_takeover}     = {
+        new_owner        => $opt{new_owner},
+        reason           => $opt{reason},
+        generation       => $next_gen,
+        owner_generation => $next_og,
+        at               => now_iso(),
+      };
 
-    execute_tx($real_task, $plans_dir, {
-      tx_id                 => $tx_id,
-      expected_generation   => $old_gen,
-      next_generation       => $next_gen,
-      next_owner_generation => $next_og,
-      closes_run_id         => $old_run_id,
-      state_first           => 1,
-      removes               => \@removes,
-      writes                => [
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+      execute_tx($real_task, $plans_dir, {
+        tx_id                 => $tx_id,
+        expected_generation   => $old_gen,
+        next_generation       => $next_gen,
+        next_owner_generation => $next_og,
+        closes_run_id         => $old_run_id,
+        state_first           => 1,
+        removes               => \@removes,
+        writes                => [
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "TAKEOVER_COMPLETE=1\nGENERATION=$next_gen\nOWNER_GENERATION=$next_og\nORPHANED_COUNT=" . scalar(@orphans) . "\n";
     });
-    print "TAKEOVER_COMPLETE=1\nGENERATION=$next_gen\nOWNER_GENERATION=$next_og\nORPHANED_COUNT=" . scalar(@orphans) . "\n";
   });
 }
 
@@ -2296,27 +2382,30 @@ sub cmd_abort_run {
   die_err("abort-run requires --task and --reason") unless defined $opt{task} && defined $opt{reason};
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $rf = "$plans_dir/active-run.json";
-    if (!-f $rf) { print "ABORTED=0\nREASON=no active run\n"; return; }
-    my $r = load_json_file($rf);
-    my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "abort: $opt{reason}"));
-    my $gen = $st->{generation};
-    my $tx_id = "tx-abort-" . time() . "-$$";
-    $st->{last_tx_id}        = $tx_id;
-    $st->{orphaned_attempts} = \@orphans;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      closes_run_id       => $r->{run_id},
-      removes             => ['research/plans/active-run.json'],
-      writes              => [
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+    _with_activation_lock_guard($plans_dir, 'abort-run', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'abort-run');
+      my $rf = "$plans_dir/active-run.json";
+      if (!-f $rf) { print "ABORTED=0\nREASON=no active run\n"; return; }
+      my $r = load_json_file($rf);
+      my @orphans = (@{$st->{orphaned_attempts} || []}, _collect_orphaned_attempts($plans_dir, "abort: $opt{reason}"));
+      my $gen = $st->{generation};
+      my $tx_id = "tx-abort-" . time() . "-$$";
+      $st->{last_tx_id}        = $tx_id;
+      $st->{orphaned_attempts} = \@orphans;
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        closes_run_id       => $r->{run_id},
+        removes             => ['research/plans/active-run.json'],
+        writes              => [
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "ABORTED=1\nCLOSED_RUN_ID=$r->{run_id}\n";
     });
-    print "ABORTED=1\nCLOSED_RUN_ID=$r->{run_id}\n";
   });
 }
 
@@ -2359,92 +2448,101 @@ sub cmd_commit_phase1 {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $rf  = "$plans_dir/active-run.json";
-    die_err("no active phase1-design run") unless -f $rf;
-    my $run = load_json_file($rf);
-    die_err("active run is '$run->{phase}', expected 'phase1-design'") unless $run->{phase} eq 'phase1-design';
+    _with_activation_lock_guard($plans_dir, 'commit-phase1', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'commit-phase1');
+      if (ref($st->{review}) eq 'HASH' &&
+          ref($st->{review}{user_decision}) eq 'HASH' &&
+          ($st->{review}{user_decision}{choice} // '') eq 'manual_redesign') {
+        die_err("manual_redesign is active — run clear-manual-redesign or commit-phase0 --change-kind material before committing Phase 1", 3);
+      }
+      my $rf  = "$plans_dir/active-run.json";
+      die_err("no active phase1-design run") unless -f $rf;
+      my $run = load_json_file($rf);
+      die_err("active run is '$run->{phase}', expected 'phase1-design'") unless $run->{phase} eq 'phase1-design';
 
-    my $repo = resolve_repo_root($opt{repo}, $real_task);
-    my $trel = task_rel_path($repo, $real_task);
+      my $repo = resolve_repo_root($opt{repo}, $real_task);
+      my $trel = task_rel_path($repo, $real_task);
 
-    # Check worktree_fp v3 for unexplained drift (catches re-edits to existing M / ?? files!).
-    my $cur_fp = compute_worktree_fp($repo, $trel);
-    my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, {});
-    if (@$drifts) {
-      print "UNEXPLAINED_DRIFT=1\n";
-      print "DRIFT=$_\n" for @$drifts;
-      exit 3;
-    }
+      # Check worktree_fp v3 for unexplained drift (catches re-edits to existing M / ?? files!).
+      my $cur_fp = compute_worktree_fp($repo, $trel);
+      my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, {});
+      if (@$drifts) {
+        print "UNEXPLAINED_DRIFT=1\n";
+        print "DRIFT=$_\n" for @$drifts;
+        exit 3;
+      }
 
-    my (@valid_slots, @non_valid_slots);
-    for my $sn (sort keys %{$run->{slots}}) {
-      my $s = $run->{slots}{$sn};
-      if ($s->{state} eq 'completed_valid') { push @valid_slots, $sn; }
-      else                                 { push @non_valid_slots, "$sn($s->{state})"; }
-    }
-    die_err("zero valid design candidates") unless @valid_slots >= 1;
-    if (@non_valid_slots && !length($opt{degraded_approval} // '')) {
-      die_err("incomplete Phase 1 slots: " . join(', ', @non_valid_slots) . " — complete/retry them or pass explicit --degraded-approval");
-    }
+      my (@valid_slots, @non_valid_slots);
+      for my $sn (sort keys %{$run->{slots}}) {
+        my $s = $run->{slots}{$sn};
+        if ($s->{state} eq 'completed_valid') { push @valid_slots, $sn; }
+        else                                 { push @non_valid_slots, "$sn($s->{state})"; }
+      }
+      die_err("zero valid design candidates") unless @valid_slots >= 1;
+      if (@non_valid_slots && !length($opt{degraded_approval} // '')) {
+        die_err("incomplete Phase 1 slots: " . join(', ', @non_valid_slots) . " — complete/retry them or pass explicit --degraded-approval");
+      }
 
-    my (@writes, %cand_shas, %blind_map);
-    for my $sn (@valid_slots) {
-      my $s = $run->{slots}{$sn};
-      my $src_res = "$real_task/$s->{result_file}";
-      die_err("missing recorded result file $src_res") unless -f $src_res;
-      my $bytes = read_raw_file($src_res);
-      my $sha   = sha256_bytes($bytes);
-      die_err("result digest mismatch for $sn") unless $sha eq $s->{result_sha256};
-      push @writes, { dst => "research/plans/candidates/$sn.md", bytes => $bytes, is_state_file => 0 };
-      $cand_shas{$sn} = $sha;
-      $blind_map{$sn} = {
-        providerInstanceId => $s->{target}{providerInstanceId},
-        model              => $s->{target}{model},
-        effortKey          => $s->{target}{effortKey} // '',
-        effort             => $s->{target}{effort}    // '',
-        task_id            => $s->{task_id},
-        child_thread_id    => $s->{child_thread_id},
-        child_run_id       => $s->{child_run_id},
-        candidate_sha256   => $sha,
+      my (@writes, %cand_shas, %blind_map);
+      for my $sn (@valid_slots) {
+        my $s = $run->{slots}{$sn};
+        my $src_res = "$real_task/$s->{result_file}";
+        die_err("missing recorded result file $src_res") unless -f $src_res;
+        my $bytes = read_raw_file($src_res);
+        my $sha   = sha256_bytes($bytes);
+        die_err("result digest mismatch for $sn") unless $sha eq $s->{result_sha256};
+        push @writes, { dst => "research/plans/candidates/$sn.md", bytes => $bytes, is_state_file => 0 };
+        $cand_shas{$sn} = $sha;
+        $blind_map{$sn} = {
+          providerInstanceId => $s->{target}{providerInstanceId},
+          model              => $s->{target}{model},
+          effortKey          => $s->{target}{effortKey} // '',
+          effort             => $s->{target}{effort}    // '',
+          task_id            => $s->{task_id},
+          child_thread_id    => $s->{child_thread_id},
+          child_run_id       => $s->{child_run_id},
+          candidate_sha256   => $sha,
+        };
+      }
+
+      my $gen = $st->{generation};
+      my $tx_id = "tx-p1-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      $st->{blind_map}  = \%blind_map;
+      $st->{phases}{'1'} = {
+        status            => 'completed',
+        prd_sha256        => $run->{input_manifest}{prd_sha256},
+        candidates        => \%cand_shas,
+        degraded_approval => length($opt{degraded_approval} // '')
+          ? { reason => $opt{degraded_approval}, missing_slots => \@non_valid_slots, approved_at => now_iso() }
+          : undef,
+        completed_at      => now_iso(),
       };
-    }
+      # Invalidate downstream Phase 2+ metadata AND review state if re-running Phase 1.
+      delete $st->{phases}{'2'};
+      delete $st->{phases}{'5'};
+      delete $st->{phases}{'6'};
+      $st->{design_revisions} = [];
+      my $ign_proj = _effective_ignore_project_config($st, \%opt);
+      $st->{review}           = _init_fresh_review(resolve_configured_knobs($repo, $ign_proj));
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-p1-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    $st->{blind_map}  = \%blind_map;
-    $st->{phases}{'1'} = {
-      status            => 'completed',
-      prd_sha256        => $run->{input_manifest}{prd_sha256},
-      candidates        => \%cand_shas,
-      degraded_approval => length($opt{degraded_approval} // '')
-        ? { reason => $opt{degraded_approval}, missing_slots => \@non_valid_slots, approved_at => now_iso() }
-        : undef,
-      completed_at      => now_iso(),
-    };
-    # Invalidate downstream Phase 2+ metadata AND review state if re-running Phase 1.
-    delete $st->{phases}{'2'};
-    delete $st->{phases}{'5'};
-    delete $st->{phases}{'6'};
-    $st->{design_revisions} = [];
-    $st->{review}           = _init_fresh_review(resolve_configured_knobs($repo, 0));
+      my @p1_removes = ('research/plans/active-run.json');
+      push @p1_removes, 'research/plans/review-ledger.md' if -f "$plans_dir/review-ledger.md" && !-l "$plans_dir/review-ledger.md";
 
-    my @p1_removes = ('research/plans/active-run.json');
-    push @p1_removes, 'research/plans/review-ledger.md' if -f "$plans_dir/review-ledger.md" && !-l "$plans_dir/review-ledger.md";
+      push @writes, { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 };
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        closes_run_id       => $run->{run_id},
+        removes             => \@p1_removes,
+        writes              => \@writes,
+      });
 
-    push @writes, { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 };
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      closes_run_id       => $run->{run_id},
-      removes             => \@p1_removes,
-      writes              => \@writes,
+      print "PHASE1_COMMITTED=1\nCANDIDATES=" . join(',', @valid_slots) . "\n";
     });
-
-    print "PHASE1_COMMITTED=1\nCANDIDATES=" . join(',', @valid_slots) . "\n";
   });
 }
 
@@ -2454,129 +2552,144 @@ sub cmd_commit_phase2a {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $p1 = $st->{phases}{'1'};
-    die_err("Phase 1 must be completed before commit-phase2a")
-      unless ref $p1 eq 'HASH' && ($p1->{status} // '') eq 'completed';
+    _with_activation_lock_guard($plans_dir, 'commit-phase2a', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'commit-phase2a');
+      my $p1 = $st->{phases}{'1'};
+      die_err("Phase 1 must be completed before commit-phase2a")
+        unless ref $p1 eq 'HASH' && ($p1->{status} // '') eq 'completed';
 
-    my $prd_path = "$real_task/prd.md";
-    die_err("missing prd.md", 3) unless -f $prd_path && !-l $prd_path;
-    die_err("prd.md modified since Phase 0 commit — run commit-phase0 first", 3)
-      unless sha256_file($prd_path) eq ($st->{effective_prd_sha256} // '');
-    for my $slot (sort keys %{$p1->{candidates} || {}}) {
-      my $cp = "$plans_dir/candidates/$slot.md";
-      die_err("candidate file missing or modified: $slot.md", 3)
-        unless -f $cp && !-l $cp && sha256_file($cp) eq $p1->{candidates}{$slot};
-    }
-
-    my $repo = resolve_repo_root($opt{repo}, $real_task);
-    my $trel = task_rel_path($repo, $real_task);
-
-    my $input_file = $opt{input};
-    my $closes_run_id;
-    my @removes;
-    if (-f "$plans_dir/active-run.json") {
-      my $run = load_json_file("$plans_dir/active-run.json");
-      die_err("active run is '$run->{phase}', expected 'phase2-judge'") unless $run->{phase} eq 'phase2-judge';
-      my $cur_fp = compute_worktree_fp($repo, $trel);
-      my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, {});
-      if (@$drifts) {
-        print "UNEXPLAINED_DRIFT=1\n";
-        print "DRIFT=$_\n" for @$drifts;
-        exit 3;
+      my $prd_path = "$real_task/prd.md";
+      die_err("missing prd.md", 3) unless -f $prd_path && !-l $prd_path;
+      die_err("prd.md modified since Phase 0 commit — run commit-phase0 first", 3)
+        unless sha256_file($prd_path) eq ($st->{effective_prd_sha256} // '');
+      for my $slot (sort keys %{$p1->{candidates} || {}}) {
+        my $cp = "$plans_dir/candidates/$slot.md";
+        die_err("candidate file missing or modified: $slot.md", 3)
+          unless -f $cp && !-l $cp && sha256_file($cp) eq $p1->{candidates}{$slot};
       }
-      my $js = $run->{slots}{judge};
-      die_err("judge slot is '$js->{state}', expected 'completed_valid'", 3) unless ($js->{state} // '') eq 'completed_valid';
-      my $slot_res = "$real_task/$js->{result_file}";
-      die_err("missing judge result file $slot_res", 3) unless -f $slot_res && !-l $slot_res;
-      if (defined $input_file && length $input_file) {
-        die_err("--input does not match recorded phase2-judge slot result", 3)
-          unless -f $input_file && sha256_file($input_file) eq ($js->{result_sha256} // '');
+
+      my $repo = resolve_repo_root($opt{repo}, $real_task);
+      my $trel = task_rel_path($repo, $real_task);
+
+      my $input_file = $opt{input};
+      my $raw_judge_bytes;
+      my $closes_run_id;
+      my @removes;
+      if (-f "$plans_dir/active-run.json") {
+        my $run = load_json_file("$plans_dir/active-run.json");
+        die_err("active run is '$run->{phase}', expected 'phase2-judge'") unless $run->{phase} eq 'phase2-judge';
+        my $cur_fp = compute_worktree_fp($repo, $trel);
+        my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, {});
+        if (@$drifts) {
+          print "UNEXPLAINED_DRIFT=1\n";
+          print "DRIFT=$_\n" for @$drifts;
+          exit 3;
+        }
+        my $js = $run->{slots}{judge};
+        die_err("judge slot is '$js->{state}', expected 'completed_valid'", 3) unless ($js->{state} // '') eq 'completed_valid';
+        my $expected_sha = $js->{result_sha256} // '';
+        die_err("missing recorded judge result_sha256", 3) unless $expected_sha =~ /\A[0-9a-f]{64}\z/;
+        my $slot_res = "$real_task/$js->{result_file}";
+        die_err("missing judge result file $slot_res", 3) unless -f $slot_res && !-l $slot_res;
+        my $slot_bytes = read_raw_file($slot_res);
+        die_err("recorded judge result digest mismatch (tampered on disk: $slot_res)", 3)
+          unless sha256_bytes($slot_bytes) eq $expected_sha;
+        if (defined $input_file && length $input_file) {
+          die_err("--input missing or symlink: $input_file", 3) unless -f $input_file && !-l $input_file;
+          my $in_bytes = read_raw_file($input_file);
+          die_err("--input does not match recorded phase2-judge slot result", 3)
+            unless sha256_bytes($in_bytes) eq $expected_sha && $in_bytes eq $slot_bytes;
+        }
+        $raw_judge_bytes = $slot_bytes;
+        $closes_run_id = $run->{run_id};
+        push @removes, 'research/plans/active-run.json';
       } else {
-        $input_file = $slot_res;
+        die_err("commit-phase2a requires --input or active completed phase2-judge run")
+          unless defined $input_file && -f $input_file && !-l $input_file;
+        $raw_judge_bytes = read_raw_file($input_file);
       }
-      $closes_run_id = $run->{run_id};
-      push @removes, 'research/plans/active-run.json';
-    }
-    die_err("commit-phase2a requires --input or active completed phase2-judge run") unless defined $input_file && -f $input_file;
 
-    # Write temporary expected candidates manifest and validate strictly (NO --allow-forks -> zero unresolved product_forks!).
-    my $tmp_dir   = tempdir('t3-tri-p2a-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-    my $cm_tmp    = "$tmp_dir/cm.json";
-    my $canon_tmp = "$tmp_dir/be.json";
-    write_atomic_bytes($cm_tmp, encode_canonical($p1->{candidates}));
-    my ($rc, $vout) = run_cmd_capture(
-      'perl', $VALIDATE_JUDGE,
-      '--input', $input_file,
-      '--candidates-manifest', $cm_tmp,
-      '--write-canonical', $canon_tmp
-    );
-    my $vkv = parse_kv_lines($vout);
-    if ($rc != 0 || ($vkv->{VALID} // '0') ne '1') {
-      die_err("blind-eval validation failed: " . ($vkv->{ERROR} // $vout), 3);
-    }
-
-    my $be_bytes = read_raw_file($canon_tmp);
-    my $be = decode_strict($be_bytes);
-    my $be_sha = sha256_bytes($be_bytes);
-
-    # Freeze synthesis-body-locked.md AND initial-design.md BEFORE attribution can ever be revealed!
-    my $synth_body_bytes = $be->{synthesis_body_markdown};
-    $synth_body_bytes .= "\n" unless $synth_body_bytes =~ /\n\z/;
-    utf8::encode($synth_body_bytes) if utf8::is_utf8($synth_body_bytes);
-    my $synth_body_sha = sha256_bytes($synth_body_bytes);
-
-    my $init_design_bytes = $be->{initial_design_markdown};
-    $init_design_bytes .= "\n" unless $init_design_bytes =~ /\n\z/;
-    utf8::encode($init_design_bytes) if utf8::is_utf8($init_design_bytes);
-    my $init_design_sha = sha256_bytes($init_design_bytes);
-
-    # One-time unlocked -> locked CAS: refuse overwriting an already-locked Phase 2a!
-    my $existing_p2 = $st->{phases}{'2'};
-    if (ref($existing_p2) eq 'HASH' && $existing_p2->{phase2a_locked}) {
-      if (($existing_p2->{blind_eval_sha256} // '') eq $be_sha &&
-          ($existing_p2->{synthesis_body_locked_sha256} // '') eq $synth_body_sha &&
-          ($existing_p2->{initial_design_sha256} // '') eq $init_design_sha &&
-          !defined($closes_run_id)) {
-        print "PHASE2A_ALREADY_LOCKED=1\nPHASE2A_LOCKED=1\nPRIMARY_WINNER=$existing_p2->{primary_winner}\n";
-        print "BLIND_EVAL_SHA256=$be_sha\nSYNTHESIS_BODY_LOCKED_SHA256=$synth_body_sha\nINITIAL_DESIGN_SHA256=$init_design_sha\n";
-        return;
+      # Validate the exact verified byte buffer (single read -> zero TOCTOU; NO --allow-forks -> zero unresolved product_forks!).
+      my $tmp_dir   = tempdir('t3-tri-p2a-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+      my $in_tmp    = "$tmp_dir/judge-in.json";
+      my $cm_tmp    = "$tmp_dir/cm.json";
+      my $canon_tmp = "$tmp_dir/be.json";
+      write_atomic_bytes($in_tmp, $raw_judge_bytes);
+      write_atomic_bytes($cm_tmp, encode_canonical($p1->{candidates}));
+      my ($rc, $vout) = run_cmd_capture(
+        'perl', $VALIDATE_JUDGE,
+        '--input', $in_tmp,
+        '--candidates-manifest', $cm_tmp,
+        '--write-canonical', $canon_tmp
+      );
+      my $vkv = parse_kv_lines($vout);
+      if ($rc != 0 || ($vkv->{VALID} // '0') ne '1') {
+        die_err("blind-eval validation failed: " . ($vkv->{ERROR} // $vout), 3);
       }
-      die_err("FORBIDDEN: Phase 2a is already locked (blind_eval_sha256=$existing_p2->{blind_eval_sha256}) — refusing to overwrite locked blind judge outcome", 3);
-    }
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-p2a-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    $st->{phases}{'2'} = {
-      status                       => 'phase2a_locked',
-      phase2a_locked               => JSON::PP::true,
-      prd_sha256                   => $st->{effective_prd_sha256},
-      candidates                   => $p1->{candidates},
-      primary_winner               => $be->{primary_winner},
-      blind_eval_sha256            => $be_sha,
-      synthesis_body_locked_sha256 => $synth_body_sha,
-      initial_design_sha256        => $init_design_sha,
-      phase2a_locked_at            => now_iso(),
-    };
+      my $be_bytes = read_raw_file($canon_tmp);
+      my $be = decode_strict($be_bytes);
+      my $be_sha = sha256_bytes($be_bytes);
 
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      closes_run_id       => $closes_run_id,
-      removes             => \@removes,
-      writes              => [
-        { dst => 'research/plans/blind-eval.json',          bytes => $be_bytes,          is_state_file => 0 },
-        { dst => 'research/plans/synthesis-body-locked.md', bytes => $synth_body_bytes,  is_state_file => 0 },
-        { dst => 'research/plans/initial-design.md',        bytes => $init_design_bytes, is_state_file => 0 },
-        { dst => 'research/plans/planning-state.json',      bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+      # Freeze synthesis-body-locked.md AND initial-design.md BEFORE attribution can ever be revealed!
+      my $synth_body_text = $be->{synthesis_body_markdown};
+      $synth_body_text .= "\n" unless $synth_body_text =~ /\n\z/;
+      my $synth_body_bytes = encode('UTF-8', $synth_body_text);
+      my $synth_body_sha = sha256_bytes($synth_body_bytes);
+
+      my $init_design_text = $be->{initial_design_markdown};
+      $init_design_text .= "\n" unless $init_design_text =~ /\n\z/;
+      my $init_design_bytes = encode('UTF-8', $init_design_text);
+      my $init_design_sha = sha256_bytes($init_design_bytes);
+
+      # One-time unlocked -> locked CAS: refuse overwriting an already-locked Phase 2a!
+      my $existing_p2 = $st->{phases}{'2'};
+      if (ref($existing_p2) eq 'HASH' && $existing_p2->{phase2a_locked}) {
+        if (($existing_p2->{blind_eval_sha256} // '') eq $be_sha &&
+            ($existing_p2->{synthesis_body_locked_sha256} // '') eq $synth_body_sha &&
+            ($existing_p2->{initial_design_sha256} // '') eq $init_design_sha &&
+            !defined($closes_run_id)) {
+          print "PHASE2A_ALREADY_LOCKED=1\nPHASE2A_LOCKED=1\nPRIMARY_WINNER=$existing_p2->{primary_winner}\n";
+          print "BLIND_EVAL_SHA256=$be_sha\nSYNTHESIS_BODY_LOCKED_SHA256=$synth_body_sha\nINITIAL_DESIGN_SHA256=$init_design_sha\n";
+          return;
+        }
+        die_err("FORBIDDEN: Phase 2a is already locked (blind_eval_sha256=$existing_p2->{blind_eval_sha256}) — refusing to overwrite locked blind judge outcome", 3);
+      }
+
+      my $gen = $st->{generation};
+      my $tx_id = "tx-p2a-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      $st->{phases}{'2'} = {
+        status                       => 'phase2a_locked',
+        phase2a_locked               => JSON::PP::true,
+        prd_sha256                   => $st->{effective_prd_sha256},
+        candidates                   => $p1->{candidates},
+        primary_winner               => $be->{primary_winner},
+        blind_eval_sha256            => $be_sha,
+        synthesis_body_locked_sha256 => $synth_body_sha,
+        initial_design_sha256        => $init_design_sha,
+        phase2a_locked_at            => now_iso(),
+      };
+
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        closes_run_id       => $closes_run_id,
+        removes             => \@removes,
+        writes              => [
+          { dst => 'research/plans/blind-eval.json',          bytes => $be_bytes,          is_state_file => 0 },
+          { dst => 'research/plans/synthesis-body-locked.md', bytes => $synth_body_bytes,  is_state_file => 0 },
+          { dst => 'research/plans/initial-design.md',        bytes => $init_design_bytes, is_state_file => 0 },
+          { dst => 'research/plans/planning-state.json',      bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+
+      print "PHASE2A_LOCKED=1\nPRIMARY_WINNER=$be->{primary_winner}\n";
+      print "BLIND_EVAL_SHA256=$be_sha\nSYNTHESIS_BODY_LOCKED_SHA256=$synth_body_sha\nINITIAL_DESIGN_SHA256=$init_design_sha\n";
     });
-
-    print "PHASE2A_LOCKED=1\nPRIMARY_WINNER=$be->{primary_winner}\n";
-    print "BLIND_EVAL_SHA256=$be_sha\nSYNTHESIS_BODY_LOCKED_SHA256=$synth_body_sha\nINITIAL_DESIGN_SHA256=$init_design_sha\n";
   });
 }
 
@@ -2628,65 +2741,85 @@ sub cmd_commit_phase2b {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $p2 = $st->{phases}{'2'};
-    die_err("Phase 2a must be locked before commit-phase2b", 3)
-      unless ref $p2 eq 'HASH' && $p2->{phase2a_locked};
+    _with_activation_lock_guard($plans_dir, 'commit-phase2b', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'commit-phase2b');
+      my $p2 = $st->{phases}{'2'};
+      die_err("Phase 2a must be locked before commit-phase2b", 3)
+        unless ref $p2 eq 'HASH' && $p2->{phase2a_locked};
 
-    # Verify locked artifacts are untouched.
-    die_err("blind-eval.json modified since Phase 2a lock", 3)
-      unless -f "$plans_dir/blind-eval.json" && sha256_file("$plans_dir/blind-eval.json") eq $p2->{blind_eval_sha256};
-    die_err("synthesis-body-locked.md modified since Phase 2a lock", 3)
-      unless -f "$plans_dir/synthesis-body-locked.md" && sha256_file("$plans_dir/synthesis-body-locked.md") eq $p2->{synthesis_body_locked_sha256};
-    die_err("initial-design.md modified since Phase 2a lock", 3)
-      unless -f "$plans_dir/initial-design.md" && sha256_file("$plans_dir/initial-design.md") eq $p2->{initial_design_sha256};
+      # Verify locked artifacts are untouched.
+      die_err("blind-eval.json modified since Phase 2a lock", 3)
+        unless -f "$plans_dir/blind-eval.json" && sha256_file("$plans_dir/blind-eval.json") eq $p2->{blind_eval_sha256};
+      die_err("synthesis-body-locked.md modified since Phase 2a lock", 3)
+        unless -f "$plans_dir/synthesis-body-locked.md" && sha256_file("$plans_dir/synthesis-body-locked.md") eq $p2->{synthesis_body_locked_sha256};
+      die_err("initial-design.md modified since Phase 2a lock", 3)
+        unless -f "$plans_dir/initial-design.md" && sha256_file("$plans_dir/initial-design.md") eq $p2->{initial_design_sha256};
 
-    my $locked_synth  = read_raw_file("$plans_dir/synthesis-body-locked.md");
-    my $locked_design = read_raw_file("$plans_dir/initial-design.md");
-    my @writes;
-    my ($synth_sha, $design_sha);
+      # Strictly enforce first-time commit from phase2a_locked ONLY; once completed, permit ONLY write-free idempotent retry!
+      if (($p2->{status} // '') eq 'completed') {
+        my $has_revs   = (ref($st->{design_revisions}) eq 'ARRAY' && @{$st->{design_revisions}} > 0) ? 1 : 0;
+        my $has_rounds = (ref($st->{review}) eq 'HASH' && ref($st->{review}{rounds}) eq 'ARRAY' && @{$st->{review}{rounds}} > 0) ? 1 : 0;
+        my $same_design = (-f "$real_task/design.md" && !-l "$real_task/design.md" &&
+                           sha256_file("$real_task/design.md") eq ($p2->{design_sha256} // '') &&
+                           ($p2->{design_sha256} // '') eq ($p2->{initial_design_sha256} // '')) ? 1 : 0;
+        my $same_synth  = (-f "$plans_dir/synthesis.md" && !-l "$plans_dir/synthesis.md" &&
+                           sha256_file("$plans_dir/synthesis.md") eq ($p2->{synthesis_sha256} // '')) ? 1 : 0;
+        if (!$has_revs && !$has_rounds && $same_design && $same_synth) {
+          print "PHASE2B_COMMITTED=1\nPHASE2B_IDEMPOTENT=1\nSYNTHESIS_SHA256=$p2->{synthesis_sha256}\nDESIGN_SHA256=$p2->{design_sha256}\n";
+          return;
+        }
+        die_err("FORBIDDEN: Phase 2b is already completed and downstream design revisions/reviews exist — refusing to overwrite design.md or clear design_revisions[]", 3);
+      }
+      die_err("commit-phase2b requires Phase 2 status 'phase2a_locked' (got '" . ($p2->{status} // 'unset') . "')", 3)
+        unless ($p2->{status} // '') eq 'phase2a_locked';
 
-    if ($opt{assemble}) {
-      my $attr = _render_attribution_section($st->{blind_map} || {}, $p2->{primary_winner});
-      utf8::encode($attr) if utf8::is_utf8($attr);
-      my $full_synth = $locked_synth . $attr;
-      $synth_sha  = sha256_bytes($full_synth);
-      $design_sha = $p2->{initial_design_sha256};
-      push @writes, { dst => 'research/plans/synthesis.md', bytes => $full_synth,   is_state_file => 0 };
-      push @writes, { dst => 'design.md',                   bytes => $locked_design, is_state_file => 0 };
-    } else {
-      # Mechanical anti-swap verification when parent wrote synthesis.md / design.md directly!
-      die_err("missing design.md", 3) unless -f "$real_task/design.md" && !-l "$real_task/design.md";
-      die_err("missing research/plans/synthesis.md", 3) unless -f "$plans_dir/synthesis.md" && !-l "$plans_dir/synthesis.md";
-      $design_sha = sha256_file("$real_task/design.md");
-      die_err("POST_REVEAL_TAMPER: design.md differs from pre-reveal locked initial-design.md ($design_sha != $p2->{initial_design_sha256})", 3)
-        unless $design_sha eq $p2->{initial_design_sha256};
-      my $live_synth = read_raw_file("$plans_dir/synthesis.md");
-      die_err("POST_REVEAL_TAMPER: synthesis.md does not begin verbatim with locked synthesis-body-locked.md", 3)
-        unless index($live_synth, $locked_synth) == 0;
-      $synth_sha = sha256_bytes($live_synth);
-    }
+      my $locked_synth  = read_raw_file("$plans_dir/synthesis-body-locked.md");
+      my $locked_design = read_raw_file("$plans_dir/initial-design.md");
+      my @writes;
+      my ($synth_sha, $design_sha);
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-p2b-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    $p2->{status}            = 'completed';
-    $p2->{synthesis}         = $synth_sha;
-    $p2->{synthesis_sha256}  = $synth_sha;
-    $p2->{design_sha256}     = $design_sha;
-    $p2->{completed_at}      = now_iso();
-    $st->{design_revisions}  = [];
+      if ($opt{assemble}) {
+        my $attr = encode('UTF-8', _render_attribution_section($st->{blind_map} || {}, $p2->{primary_winner}));
+        my $full_synth = $locked_synth . $attr;
+        $synth_sha  = sha256_bytes($full_synth);
+        $design_sha = $p2->{initial_design_sha256};
+        push @writes, { dst => 'research/plans/synthesis.md', bytes => $full_synth,   is_state_file => 0 };
+        push @writes, { dst => 'design.md',                   bytes => $locked_design, is_state_file => 0 };
+      } else {
+        # Mechanical anti-swap verification when parent wrote synthesis.md / design.md directly!
+        die_err("missing design.md", 3) unless -f "$real_task/design.md" && !-l "$real_task/design.md";
+        die_err("missing research/plans/synthesis.md", 3) unless -f "$plans_dir/synthesis.md" && !-l "$plans_dir/synthesis.md";
+        $design_sha = sha256_file("$real_task/design.md");
+        die_err("POST_REVEAL_TAMPER: design.md differs from pre-reveal locked initial-design.md ($design_sha != $p2->{initial_design_sha256})", 3)
+          unless $design_sha eq $p2->{initial_design_sha256};
+        my $live_synth = read_raw_file("$plans_dir/synthesis.md");
+        die_err("POST_REVEAL_TAMPER: synthesis.md does not begin verbatim with locked synthesis-body-locked.md", 3)
+          unless index($live_synth, $locked_synth) == 0;
+        $synth_sha = sha256_bytes($live_synth);
+      }
 
-    push @writes, { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 };
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      writes              => \@writes,
+      my $gen = $st->{generation};
+      my $tx_id = "tx-p2b-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      $p2->{status}            = 'completed';
+      $p2->{synthesis}         = $synth_sha;
+      $p2->{synthesis_sha256}  = $synth_sha;
+      $p2->{design_sha256}     = $design_sha;
+      $p2->{completed_at}      = now_iso();
+      $st->{design_revisions}  = [];
+
+      push @writes, { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 };
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        writes              => \@writes,
+      });
+
+      print "PHASE2B_COMMITTED=1\nSYNTHESIS_SHA256=$synth_sha\nDESIGN_SHA256=$design_sha\n";
     });
-
-    print "PHASE2B_COMMITTED=1\nSYNTHESIS_SHA256=$synth_sha\nDESIGN_SHA256=$design_sha\n";
   });
 }
 
@@ -2710,7 +2843,8 @@ sub _count_open_blocking {
 }
 
 sub _compute_next_review {
-  my ($real_task, $plans_dir, $repo, $trel, $st) = @_;
+  my ($real_task, $plans_dir, $repo, $trel, $st, $ignore_proj) = @_;
+  $ignore_proj = _effective_ignore_project_config($st, {}) unless defined $ignore_proj;
   my $rev = $st->{review};
 
   # 1. Active Phase 3 run -> resume
@@ -2772,8 +2906,8 @@ sub _compute_next_review {
     }
   }
 
-  # 6. roundCap -> step-back or stop (honoring configured knobs + any extra step-back grants)
-  my $live_knobs = resolve_configured_knobs($repo, 0);
+  # 6. roundCap -> step-back or stop (honoring configured knobs + persisted ignore_project_config + any extra step-back grants)
+  my $live_knobs = resolve_configured_knobs($repo, $ignore_proj);
   my $cap        = $live_knobs->{has_round_cap} ? $live_knobs->{roundCap} : ($rev->{round_cap} // 3);
   my $dirty      = $rev->{dirty_since_step_back} // 0;
   my $sb_done    = $rev->{step_backs_done} // 0;
@@ -2824,7 +2958,7 @@ sub cmd_next_review {
     my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
     my $repo = resolve_repo_root($opt{repo}, $real_task);
     my $trel = task_rel_path($repo, $real_task);
-    my $r = _compute_next_review($real_task, $plans_dir, $repo, $trel, $st);
+    my $r = _compute_next_review($real_task, $plans_dir, $repo, $trel, $st, _effective_ignore_project_config($st, \%opt));
     print "PURPOSE=$r->{purpose}\nMODE=$r->{mode}\nPROFILE=$r->{profile}\n";
     print "REASON=$r->{reason}\n" if defined $r->{reason} && length $r->{reason};
     print "WARN=$r->{warn}\n" if defined $r->{warn} && length $r->{warn};
@@ -2872,106 +3006,268 @@ sub _render_ledger_md {
   return join("\n", @lines) . "\n";
 }
 
+sub _verify_review_slot_binding {
+  my ($real_task, $run, $valid_slots_ref, $merged_obj, $dismissed_path) = @_;
+  my %rank = (BLOCKER => 3, SHOULD_FIX => 2, OPTIONAL => 1);
+  my $is_blocking = sub { my ($s) = @_; return ($s eq 'BLOCKER' || $s eq 'SHOULD_FIX') ? 1 : 0; };
+  my $run_dir_real = abs_path("$real_task/research/plans/runs/$run->{run_id}");
+  my @slot_objs;
+
+  for my $sn (@$valid_slots_ref) {
+    my $s = $run->{slots}{$sn};
+    my $rf = $s->{result_file} // '';
+    my $rsha = $s->{result_sha256} // '';
+    die_err("valid slot $sn missing recorded result_file or result_sha256", 3)
+      unless length($rf) && $rsha =~ /\A[0-9a-f]{64}\z/;
+    my $abs_rf = "$real_task/$rf";
+    die_err("missing or symlink slot result file for $sn: $abs_rf", 3) unless -f $abs_rf && !-l $abs_rf;
+    my $real_rf = abs_path($abs_rf) // die_err("cannot resolve slot result file $abs_rf", 3);
+    die_err("slot $sn result_file escapes run dir", 3)
+      unless defined($run_dir_real) && index($real_rf, "$run_dir_real/") == 0;
+    my $sbytes = read_raw_file($abs_rf);
+    die_err("slot $sn result_file digest mismatch (tampered on disk)", 3)
+      unless sha256_bytes($sbytes) eq $rsha;
+    my $sobj = eval { decode_strict($sbytes) };
+    die_err("slot $sn canonical result_file invalid JSON: $@", 3) if $@ || ref $sobj ne 'HASH';
+    push @slot_objs, { slot => $sn, meta => $s, obj => $sobj };
+  }
+
+  my $strip_merged_meta = sub {
+    my ($o) = @_;
+    return encode_compact({
+      summary                => $o->{summary},
+      mode                   => $o->{mode},
+      reviewed_design_sha256 => $o->{reviewed_design_sha256},
+      verdict                => $o->{verdict},
+      findings               => [ map { my %x = %$_; delete $x{sources}; delete $x{dispute_note}; \%x } @{$o->{findings} || []} ],
+      verified               => [ map { my %x = %$_; delete $x{sources}; delete $x{dispute_note}; \%x } @{$o->{verified} || []} ],
+      step_back              => $o->{step_back} || [],
+      out_of_scope           => $o->{out_of_scope} || [],
+    });
+  };
+
+  if (@slot_objs == 1) {
+    my $so = $slot_objs[0];
+    if (ref($merged_obj->{disputes}) eq 'ARRAY' && @{$merged_obj->{disputes}} > 0) {
+      die_err("single-reviewer merged result cannot contain disputes[]", 3);
+    }
+    if ($strip_merged_meta->($merged_obj) ne $strip_merged_meta->($so->{obj})) {
+      die_err("single-reviewer merged JSON diverges from recorded canonical slot result ($so->{slot})", 3);
+    }
+    return;
+  }
+
+  # Multi-reviewer council: load optional evidenced --dismissed-findings.
+  my @dismissed;
+  if (defined $dismissed_path && length $dismissed_path) {
+    die_err("--dismissed-findings not found or symlink: $dismissed_path", 3)
+      unless -f $dismissed_path && !-l $dismissed_path;
+    my $darr = eval { load_json_file($dismissed_path) };
+    die_err("--dismissed-findings must be a JSON array: $@", 3) if $@ || ref $darr ne 'ARRAY';
+    my $idx = 0;
+    for my $d (@$darr) {
+      $idx++;
+      die_err("--dismissed-findings[$idx] must be an object", 3) unless ref $d eq 'HASH';
+      for my $req (qw(slot title severity code_evidence)) {
+        die_err("--dismissed-findings[$idx].$req must be a non-empty string", 3)
+          unless defined $d->{$req} && !ref($d->{$req}) && $d->{$req} =~ /\S/;
+      }
+      die_err("--dismissed-findings[$idx].severity invalid", 3) unless exists $rank{$d->{severity}};
+      push @dismissed, $d;
+    }
+  }
+
+  my $is_dismissed = sub {
+    my ($sn, $mtag, $f) = @_;
+    for my $d (@dismissed) {
+      next unless $d->{slot} eq $sn || $d->{slot} eq $mtag;
+      next unless $d->{severity} eq $f->{severity};
+      next unless $d->{title} eq $f->{title};
+      if (defined $d->{reopens} && length $d->{reopens}) {
+        next unless $d->{reopens} eq ($f->{reopens} // '');
+      }
+      return 1;
+    }
+    return 0;
+  };
+
+  my %disputed_classes;
+  for my $dp (@{$merged_obj->{disputes} || []}) {
+    $disputed_classes{$dp->{class_id}} = $dp->{resolution} if defined $dp->{class_id};
+  }
+
+  my (%merged_reopen_max, %merged_source_max);
+  for my $mf (@{$merged_obj->{findings} || []}) {
+    my $rk = $rank{$mf->{severity}} // 0;
+    if (length($mf->{reopens} // '')) {
+      my $cid = $mf->{reopens};
+      $merged_reopen_max{$cid} = $rk if ($merged_reopen_max{$cid} // 0) < $rk;
+    }
+    if ($is_blocking->($mf->{severity})) {
+      for my $src (@{$mf->{sources} || []}) {
+        $merged_source_max{$src} = $rk if ($merged_source_max{$src} // 0) < $rk;
+      }
+    }
+  }
+
+  my @unaccounted;
+  my $any_slot_sb = 0;
+  for my $so (@slot_objs) {
+    my $sn = $so->{slot};
+    my $t  = $so->{meta}{target} || {};
+    my $mtag = ($t->{providerInstanceId} // '') . '/' . ($t->{model} // '');
+    $any_slot_sb = 1 if @{$so->{obj}{step_back} || []} > 0;
+
+    my $max_new_undism_rank = 0;
+    my @new_undism_titles;
+    for my $f (@{$so->{obj}{findings} || []}) {
+      next unless $is_blocking->($f->{severity});
+      next if $is_dismissed->($sn, $mtag, $f);
+      my $rk = $rank{$f->{severity}} // 0;
+      if (length($f->{reopens} // '')) {
+        my $cid = $f->{reopens};
+        my $in_merged = (($merged_reopen_max{$cid} // 0) >= $rk) ? 1 : 0;
+        my $in_dispute = exists $disputed_classes{$cid} ? 1 : 0;
+        if (!$in_merged && !$in_dispute) {
+          push @unaccounted, "slot $sn ($mtag) reopened blocking $cid ($f->{severity}) missing/downgraded without dispute or --dismissed-findings";
+        }
+      } else {
+        $max_new_undism_rank = $rk if $rk > $max_new_undism_rank;
+        push @new_undism_titles, "$f->{severity}:$f->{title}";
+      }
+    }
+    if ($max_new_undism_rank > 0) {
+      my $got_rk = $merged_source_max{$mtag} // 0;
+      $got_rk = $merged_source_max{$sn} if ($merged_source_max{$sn} // 0) > $got_rk;
+      if ($got_rk < $max_new_undism_rank) {
+        push @unaccounted, "slot $sn ($mtag) blocking finding(s) [" . join(', ', @new_undism_titles) . "] not traced in merged findings[].sources at >= severity without evidenced --dismissed-findings";
+      }
+    }
+  }
+
+  if (($run->{mode} // '') eq 'step-back' && $any_slot_sb && @{$merged_obj->{step_back} || []} == 0) {
+    push @unaccounted, "council slot(s) reported step_back[] items that were dropped from merged output";
+  }
+
+  if (@unaccounted) {
+    die_err("council blocking finding traceability failed: " . join('; ', @unaccounted), 3);
+  }
+}
+
 sub cmd_finish_review_round {
   my %opt = @_;
-  die_err("finish-review-round requires --task and --merged-input")
-    unless defined $opt{task} && defined $opt{merged_input} && -f $opt{merged_input};
+  die_err("finish-review-round requires --task") unless defined $opt{task} && -d $opt{task};
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $rf  = "$plans_dir/active-run.json";
-    die_err("no active phase3-review run") unless -f $rf;
-    my $run = load_json_file($rf);
-    die_err("active run is '$run->{phase}', expected 'phase3-review'") unless $run->{phase} eq 'phase3-review';
+    _with_activation_lock_guard($plans_dir, 'finish-review-round', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'finish-review-round');
+      my $rf  = "$plans_dir/active-run.json";
+      die_err("no active phase3-review run") unless -f $rf;
+      my $run = load_json_file($rf);
+      die_err("active run is '$run->{phase}', expected 'phase3-review'") unless $run->{phase} eq 'phase3-review';
 
-    my $repo = resolve_repo_root($opt{repo}, $real_task);
-    my $trel = task_rel_path($repo, $real_task);
+      my $repo = resolve_repo_root($opt{repo}, $real_task);
+      my $trel = task_rel_path($repo, $real_task);
 
-    # Verify at least one valid reviewer slot completed; require explicit degraded approval if any slot non-valid.
-    my (@valid_slots, @bad_slots);
-    for my $sn (sort keys %{$run->{slots}}) {
-      if ($run->{slots}{$sn}{state} eq 'completed_valid') { push @valid_slots, $sn; }
-      else                                               { push @bad_slots, "$sn($run->{slots}{$sn}{state})"; }
-    }
-    die_err("cannot finish review round with zero valid reviewers", 3) unless @valid_slots >= 1;
-    if (@bad_slots && !length($opt{degraded_approval} // '')) {
-      die_err("incomplete council slots: " . join(', ', @bad_slots) . " — retry or pass explicit --degraded-approval", 3);
-    }
-
-    # Check mid-round drift across design.md, prd.md, frozen round artifacts, worktree_fp v3, and review_baseline_sha256!
-    my $cur_fp = compute_worktree_fp($repo, $trel);
-    my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, $run->{allowed_setup_writes} || {});
-    my $live_design_sha = (-f "$real_task/design.md" && !-l "$real_task/design.md") ? sha256_file("$real_task/design.md") : '';
-    push @$drifts, "design.md changed mid-round ($run->{reviewed_design_sha256} -> $live_design_sha)"
-      if $live_design_sha ne $run->{reviewed_design_sha256};
-    my $live_prd_sha = (-f "$real_task/prd.md" && !-l "$real_task/prd.md") ? sha256_file("$real_task/prd.md") : '';
-    push @$drifts, "prd.md changed mid-round ($run->{effective_prd_sha256} -> $live_prd_sha)"
-      if $live_prd_sha ne $run->{effective_prd_sha256};
-    for my $fcheck (
-      [ $run->{design_snapshot_rel},      $run->{reviewed_design_sha256}, 'frozen design snapshot' ],
-      [ $run->{frozen_ledger_rel},        ($run->{frozen_ledger_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{frozen_ledger_rel}"} : undef)), 'frozen ledger' ],
-      [ $run->{ledger_manifest_rel},      ($run->{ledger_manifest_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{ledger_manifest_rel}"} : undef)), 'ledger manifest' ],
-      [ $run->{round_input_manifest_rel}, ($run->{round_input_manifest_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{round_input_manifest_rel}"} : undef)), 'round input manifest' ],
-    ) {
-      my ($rel, $want, $label) = @$fcheck;
-      next unless defined $rel && length $rel && defined $want && length $want;
-      my $p = "$real_task/$rel";
-      if (!-f $p || -l $p) {
-        push @$drifts, "$label missing or symlink ($rel)";
-      } else {
-        my $got = sha256_file($p);
-        push @$drifts, "$label modified mid-round ($rel: $want -> $got)" if $got ne $want;
+      # Verify at least one valid reviewer slot completed; require explicit degraded approval if any slot non-valid.
+      my (@valid_slots, @bad_slots);
+      for my $sn (sort keys %{$run->{slots}}) {
+        if ($run->{slots}{$sn}{state} eq 'completed_valid') { push @valid_slots, $sn; }
+        else                                               { push @bad_slots, "$sn($run->{slots}{$sn}{state})"; }
       }
-    }
-    my ($live_non_prd) = compute_non_prd_baseline($repo, $real_task, $trel, $st);
-    my $live_baseline  = compute_review_baseline($live_prd_sha, $live_non_prd);
-    push @$drifts, "review_baseline_sha256 drifted mid-round ($run->{review_baseline_sha256} -> $live_baseline)"
-      if $live_baseline ne $run->{review_baseline_sha256};
+      die_err("cannot finish review round with zero valid reviewers", 3) unless @valid_slots >= 1;
+      if (@bad_slots && !length($opt{degraded_approval} // '')) {
+        die_err("incomplete council slots: " . join(', ', @bad_slots) . " — retry or pass explicit --degraded-approval", 3);
+      }
 
-    if (@$drifts) {
-      # Discard drifted round WITHOUT touching ledger or counters!
-      my $gen = $st->{generation};
-      my $tx_id = "tx-drift-r$run->{round_num}-" . time() . "-$$";
-      $st->{last_tx_id} = $tx_id;
-      execute_tx($real_task, $plans_dir, {
-        tx_id               => $tx_id,
-        expected_generation => $gen,
-        next_generation     => $gen,
-        closes_run_id       => $run->{run_id},
-        removes             => ['research/plans/active-run.json'],
-        writes              => [
-          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-        ],
-      });
-      print "DRIFTED=1\nROUND_DISCARDED=1\n";
-      print "DRIFT=$_\n" for @$drifts;
-      exit 3;
-    }
+      my $merged_input_path = $opt{merged_input};
+      if (!defined($merged_input_path) || !length($merged_input_path)) {
+        if (@valid_slots == 1) {
+          my $s1 = $run->{slots}{$valid_slots[0]};
+          $merged_input_path = "$real_task/$s1->{result_file}" if defined $s1->{result_file};
+        }
+      }
+      die_err("finish-review-round requires --merged-input <path> (or single valid reviewer slot)")
+        unless defined $merged_input_path && -f $merged_input_path && !-l $merged_input_path;
 
-    # Strictly re-validate merged result JSON (with --merged + frozen ledger manifest)!
-    my $tmp_dir   = tempdir('t3-tri-fin-XXXXXX', TMPDIR => 1, CLEANUP => 1);
-    my $canon_tmp = "$tmp_dir/result.json";
-    my $md_tmp    = "$tmp_dir/review.md";
-    my ($rc, $vout) = run_cmd_capture(
-      'perl', $PARSE_REVIEW,
-      '--input', $opt{merged_input},
-      '--expected-mode', $run->{mode},
-      '--expected-design-sha', $run->{reviewed_design_sha256},
-      '--ledger-manifest', "$real_task/$run->{ledger_manifest_rel}",
-      '--merged',
-      '--write-canonical', $canon_tmp,
-      '--render-md', $md_tmp
-    );
-    my $vkv = parse_kv_lines($vout);
-    if ($rc != 0 || ($vkv->{VALID} // '0') ne '1') {
-      die_err("merged review validation failed: " . ($vkv->{ERROR} // $vout), 3);
-    }
+      # Check mid-round drift across design.md, prd.md, frozen round artifacts, worktree_fp v3, and review_baseline_sha256!
+      my $cur_fp = compute_worktree_fp($repo, $trel);
+      my $drifts = compare_worktree_fp($run->{worktree_fp_start}, $cur_fp, $run->{allowed_setup_writes} || {});
+      my $live_design_sha = (-f "$real_task/design.md" && !-l "$real_task/design.md") ? sha256_file("$real_task/design.md") : '';
+      push @$drifts, "design.md changed mid-round ($run->{reviewed_design_sha256} -> $live_design_sha)"
+        if $live_design_sha ne $run->{reviewed_design_sha256};
+      my $live_prd_sha = (-f "$real_task/prd.md" && !-l "$real_task/prd.md") ? sha256_file("$real_task/prd.md") : '';
+      push @$drifts, "prd.md changed mid-round ($run->{effective_prd_sha256} -> $live_prd_sha)"
+        if $live_prd_sha ne $run->{effective_prd_sha256};
+      for my $fcheck (
+        [ $run->{design_snapshot_rel},      $run->{reviewed_design_sha256}, 'frozen design snapshot' ],
+        [ $run->{frozen_ledger_rel},        ($run->{frozen_ledger_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{frozen_ledger_rel}"} : undef)), 'frozen ledger' ],
+        [ $run->{ledger_manifest_rel},      ($run->{ledger_manifest_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{ledger_manifest_rel}"} : undef)), 'ledger manifest' ],
+        [ $run->{round_input_manifest_rel}, ($run->{round_input_manifest_sha256} // (length($trel) ? $run->{allowed_setup_writes}{"$trel/$run->{round_input_manifest_rel}"} : undef)), 'round input manifest' ],
+      ) {
+        my ($rel, $want, $label) = @$fcheck;
+        next unless defined $rel && length $rel && defined $want && length $want;
+        my $p = "$real_task/$rel";
+        if (!-f $p || -l $p) {
+          push @$drifts, "$label missing or symlink ($rel)";
+        } else {
+          my $got = sha256_file($p);
+          push @$drifts, "$label modified mid-round ($rel: $want -> $got)" if $got ne $want;
+        }
+      }
+      my ($live_non_prd) = compute_non_prd_baseline($repo, $real_task, $trel, $st);
+      my $live_baseline  = compute_review_baseline($live_prd_sha, $live_non_prd);
+      push @$drifts, "review_baseline_sha256 drifted mid-round ($run->{review_baseline_sha256} -> $live_baseline)"
+        if $live_baseline ne $run->{review_baseline_sha256};
 
-    my $m_bytes  = read_raw_file($canon_tmp);
-    my $md_bytes = read_raw_file($md_tmp);
-    my $m = decode_strict($m_bytes);
+      if (@$drifts) {
+        # Discard drifted round WITHOUT touching ledger or counters!
+        my $gen = $st->{generation};
+        my $tx_id = "tx-drift-r$run->{round_num}-" . time() . "-$$";
+        $st->{last_tx_id} = $tx_id;
+        execute_tx($real_task, $plans_dir, {
+          tx_id               => $tx_id,
+          expected_generation => $gen,
+          next_generation     => $gen,
+          closes_run_id       => $run->{run_id},
+          removes             => ['research/plans/active-run.json'],
+          writes              => [
+            { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+          ],
+        });
+        print "DRIFTED=1\nROUND_DISCARDED=1\n";
+        print "DRIFT=$_\n" for @$drifts;
+        exit 3;
+      }
+
+      # Strictly re-validate merged result JSON (with --merged + frozen ledger manifest)!
+      my $tmp_dir   = tempdir('t3-tri-fin-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+      my $canon_tmp = "$tmp_dir/result.json";
+      my $md_tmp    = "$tmp_dir/review.md";
+      my ($rc, $vout) = run_cmd_capture(
+        'perl', $PARSE_REVIEW,
+        '--input', $merged_input_path,
+        '--expected-mode', $run->{mode},
+        '--expected-design-sha', $run->{reviewed_design_sha256},
+        '--ledger-manifest', "$real_task/$run->{ledger_manifest_rel}",
+        '--merged',
+        '--write-canonical', $canon_tmp,
+        '--render-md', $md_tmp
+      );
+      my $vkv = parse_kv_lines($vout);
+      if ($rc != 0 || ($vkv->{VALID} // '0') ne '1') {
+        die_err("merged review validation failed: " . ($vkv->{ERROR} // $vout), 3);
+      }
+
+      my $m_bytes  = read_raw_file($canon_tmp);
+      my $md_bytes = read_raw_file($md_tmp);
+      my $m = decode_strict($m_bytes);
+
+      # Enforce strict slot-to-merged binding (single reviewer exact match; council blocking finding traceability)!
+      _verify_review_slot_binding($real_task, $run, \@valid_slots, $m, $opt{dismissed_findings});
 
     my $eff_verdict = $vkv->{EFFECTIVE_VERDICT}; # clean | dirty
     my $rev = $st->{review};
@@ -3094,43 +3390,52 @@ sub cmd_finish_review_round {
       committed_at            => now_iso(),
     };
 
-    my $ledger_bytes = _render_ledger_md($st);
-    utf8::encode($ledger_bytes) if utf8::is_utf8($ledger_bytes);
-    my $ledger_sha = sha256_bytes($ledger_bytes);
+      my $ledger_bytes = encode('UTF-8', _render_ledger_md($st));
+      my $ledger_sha = sha256_bytes($ledger_bytes);
 
-    # Check convergence proof AFTER ledger update!
-    my @open_blk = _count_open_blocking($rev);
-    if ($run->{mode} ne 'step-back' && $eff_verdict eq 'clean' &&
-        $rev->{clean_streak} >= 2 && $rev->{last_clean_mode} eq 'full' && !@open_blk) {
-      $rev->{converged_at_round}       = $rn;
-      $rev->{converged_baseline_sha256} = $run->{review_baseline_sha256};
-      $rev->{converged_prd_sha256}     = $run->{effective_prd_sha256};
-      $rev->{converged_non_prd_sha256} = $run->{non_prd_baseline_sha256};
-      $rev->{converged_ledger_sha256}  = $ledger_sha;
-      # Re-render ledger with converged state? Ledger text doesn't depend on converged_at_round, so ledger_sha stays exact!
-    }
+      # Check convergence proof AFTER ledger update!
+      my @open_blk = _count_open_blocking($rev);
+      if ($run->{mode} ne 'step-back' && $eff_verdict eq 'clean' &&
+          $rev->{clean_streak} >= 2 && $rev->{last_clean_mode} eq 'full' && !@open_blk) {
+        $rev->{converged_at_round}       = $rn;
+        $rev->{converged_baseline_sha256} = $run->{review_baseline_sha256};
+        $rev->{converged_prd_sha256}     = $run->{effective_prd_sha256};
+        $rev->{converged_non_prd_sha256} = $run->{non_prd_baseline_sha256};
+        $rev->{converged_ledger_sha256}  = $ledger_sha;
+      }
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-fin-r$rn-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      closes_run_id       => $run->{run_id},
-      removes             => ['research/plans/active-run.json'],
-      writes              => [
+      my @fin_writes = (
         { dst => "$run->{round_dir_rel}/result.json",  bytes => $m_bytes,      is_state_file => 0 },
         { dst => "$run->{round_dir_rel}/review.md",    bytes => $md_bytes,     is_state_file => 0 },
         { dst => 'research/plans/review-ledger.md',    bytes => $ledger_bytes, is_state_file => 0 },
         { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
-    });
+      );
+      if (defined $opt{dismissed_findings} && length $opt{dismissed_findings}) {
+        push @fin_writes, {
+          dst           => "$run->{round_dir_rel}/dismissed-findings.json",
+          bytes         => read_raw_file($opt{dismissed_findings}),
+          is_state_file => 0,
+        };
+      }
 
-    print "ROUND_COMMITTED=1\nROUND_NUM=$rn\nVERDICT=$eff_verdict\n";
-    print "CLEAN_STREAK=$rev->{clean_streak}\nDIRTY_SINCE_STEP_BACK=$rev->{dirty_since_step_back}\n";
-    print "STEP_BACKS_DONE=$rev->{step_backs_done}\n";
-    print "CONVERGED=" . (defined($rev->{converged_at_round}) ? 1 : 0) . "\n";
+      my $gen = $st->{generation};
+      my $tx_id = "tx-fin-r$rn-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      $fin_writes[3]{bytes} = encode_canonical($st);
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        closes_run_id       => $run->{run_id},
+        removes             => ['research/plans/active-run.json'],
+        writes              => \@fin_writes,
+      });
+
+      print "ROUND_COMMITTED=1\nROUND_NUM=$rn\nVERDICT=$eff_verdict\n";
+      print "CLEAN_STREAK=$rev->{clean_streak}\nDIRTY_SINCE_STEP_BACK=$rev->{dirty_since_step_back}\n";
+      print "STEP_BACKS_DONE=$rev->{step_backs_done}\n";
+      print "CONVERGED=" . (defined($rev->{converged_at_round}) ? 1 : 0) . "\n";
+    });
   });
 }
 
@@ -3140,83 +3445,94 @@ sub cmd_commit_phase4_revision {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $rev = $st->{review};
+    _with_activation_lock_guard($plans_dir, 'commit-phase4-revision', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st  = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'commit-phase4-revision');
+      my $rev = $st->{review};
 
-    if (defined $opt{dispositions_json} && length $opt{dispositions_json}) {
-      my $disp = load_json_file($opt{dispositions_json});
-      die_err("--dispositions-json must be an array") unless ref $disp eq 'ARRAY';
-      my %valid_d = map { $_ => 1 } qw(adopted rejected moved-to-implement out-of-scope);
-      for my $item (@$disp) {
-        my $cid  = $item->{id} // die_err("disposition missing id");
-        my $kind = $item->{disposition} // die_err("disposition for $cid missing disposition");
-        die_err("unknown class $cid in disposition") unless exists $rev->{classes}{$cid};
-        die_err("invalid disposition '$kind' for $cid") unless $valid_d{$kind};
-        my $c = $rev->{classes}{$cid};
-        $c->{disposition}      = $kind;
-        $c->{disposition_note} = $item->{note} // '';
-        $c->{status}           = 'disposed';
-        if ($c->{recurring}) {
-          my $co = $item->{codified};
-          die_err("recurring class $cid MUST provide codified.{invariant_id, guard_test}")
-            unless ref $co eq 'HASH' && length($co->{invariant_id} // '') && length($co->{guard_test} // '');
-          $c->{codified} = {
-            invariant_id    => $co->{invariant_id},
-            guard_test      => $co->{guard_test},
-            review_md_entry => $co->{review_md_entry} // '',
-          };
+      if (defined $opt{dispositions_json} && length $opt{dispositions_json}) {
+        my $disp = load_json_file($opt{dispositions_json});
+        die_err("--dispositions-json must be an array") unless ref $disp eq 'ARRAY';
+        my %valid_d = map { $_ => 1 } qw(adopted rejected moved-to-implement out-of-scope);
+        for my $item (@$disp) {
+          die_err("disposition entry must be an object") unless ref $item eq 'HASH';
+          my $cid  = $item->{id};
+          my $kind = $item->{disposition};
+          die_err("disposition missing non-empty string id") unless defined $cid && !ref($cid) && $cid =~ /\S/;
+          die_err("disposition for $cid missing string disposition") unless defined $kind && !ref($kind);
+          die_err("unknown class $cid in disposition") unless exists $rev->{classes}{$cid};
+          die_err("invalid disposition '$kind' for $cid") unless $valid_d{$kind};
+          my $note = $item->{note} // '';
+          die_err("disposition note for $cid must be a string") if ref($note);
+          my $c = $rev->{classes}{$cid};
+          $c->{disposition}      = $kind;
+          $c->{disposition_note} = $note;
+          $c->{status}           = 'disposed';
+          if ($c->{recurring}) {
+            my $co = $item->{codified};
+            die_err("recurring class $cid MUST provide codified.{invariant_id, guard_test} (non-blank strings)")
+              unless ref $co eq 'HASH' &&
+                     defined($co->{invariant_id}) && !ref($co->{invariant_id}) && $co->{invariant_id} =~ /\S/ &&
+                     defined($co->{guard_test})   && !ref($co->{guard_test})   && $co->{guard_test}   =~ /\S/;
+            my $rme = $co->{review_md_entry} // '';
+            die_err("recurring class $cid codified.review_md_entry must be a string") if ref($rme);
+            $c->{codified} = {
+              invariant_id    => $co->{invariant_id},
+              guard_test      => $co->{guard_test},
+              review_md_entry => $rme,
+            };
+          }
         }
       }
-    }
 
-    die_err("cannot pass both --mark-scope-fork and --clear-scope-fork")
-      if $opt{mark_scope_fork} && $opt{clear_scope_fork};
-    $rev->{step_back_assessment_status} = 'completed'     if $opt{step_back_assessment_done};
-    $rev->{pending_scope_decision}      = JSON::PP::true  if $opt{mark_scope_fork};
-    $rev->{pending_scope_decision}      = JSON::PP::false if $opt{clear_scope_fork};
+      die_err("cannot pass both --mark-scope-fork and --clear-scope-fork")
+        if $opt{mark_scope_fork} && $opt{clear_scope_fork};
+      $rev->{step_back_assessment_status} = 'completed'     if $opt{step_back_assessment_done};
+      $rev->{pending_scope_decision}      = JSON::PP::true  if $opt{mark_scope_fork};
+      $rev->{pending_scope_decision}      = JSON::PP::false if $opt{clear_scope_fork};
 
-    # Controlled design.md revision chain update (keeps Phase 2 valid!).
-    my $p2 = $st->{phases}{'2'};
-    die_err("Phase 2 must be completed before Phase 4 revision")
-      unless ref $p2 eq 'HASH' && ($p2->{status} // '') eq 'completed';
-    my $live_design_sha = sha256_file("$real_task/design.md");
-    my $revs = $st->{design_revisions} || [];
-    my $expected_parent = @$revs ? $revs->[-1]{new_sha256} : $p2->{initial_design_sha256};
+      # Controlled design.md revision chain update (keeps Phase 2 valid!).
+      my $p2 = $st->{phases}{'2'};
+      die_err("Phase 2 must be completed before Phase 4 revision")
+        unless ref $p2 eq 'HASH' && ($p2->{status} // '') eq 'completed';
+      my $live_design_sha = sha256_file("$real_task/design.md");
+      my $revs = $st->{design_revisions} || [];
+      my $expected_parent = @$revs ? $revs->[-1]{new_sha256} : $p2->{initial_design_sha256};
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-p4-" . time() . "-$$";
-    my $design_changed = ($live_design_sha ne $expected_parent) ? 1 : 0;
-    if ($design_changed) {
-      push @$revs, {
-        seq               => scalar(@$revs) + 1,
-        round             => scalar(@{$rev->{rounds} || []}),
-        generation        => $gen,
-        prd_lineage       => $st->{prd_lineage},
-        disposition_tx_id => $tx_id,
-        parent_sha256     => $expected_parent,
-        new_sha256        => $live_design_sha,
-        at                => now_iso(),
-      };
-      $st->{design_revisions} = $revs;
-      # Editing design invalidates prior clean streak & convergence!
-      $rev->{clean_streak}       = 0;
-      $rev->{converged_at_round} = undef;
-    }
+      my $gen = $st->{generation};
+      my $tx_id = "tx-p4-" . time() . "-$$";
+      my $design_changed = ($live_design_sha ne $expected_parent) ? 1 : 0;
+      if ($design_changed) {
+        push @$revs, {
+          seq               => scalar(@$revs) + 1,
+          round             => scalar(@{$rev->{rounds} || []}),
+          generation        => $gen,
+          prd_lineage       => $st->{prd_lineage},
+          disposition_tx_id => $tx_id,
+          parent_sha256     => $expected_parent,
+          new_sha256        => $live_design_sha,
+          at                => now_iso(),
+        };
+        $st->{design_revisions} = $revs;
+        # Editing design invalidates prior clean streak & convergence!
+        $rev->{clean_streak}       = 0;
+        $rev->{converged_at_round} = undef;
+      }
 
-    my $ledger_bytes = _render_ledger_md($st);
-    utf8::encode($ledger_bytes) if utf8::is_utf8($ledger_bytes);
-    $st->{last_tx_id} = $tx_id;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      writes              => [
-        { dst => 'research/plans/review-ledger.md',    bytes => $ledger_bytes, is_state_file => 0 },
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+      my $ledger_bytes = encode('UTF-8', _render_ledger_md($st));
+      $st->{last_tx_id} = $tx_id;
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        writes              => [
+          { dst => 'research/plans/review-ledger.md',    bytes => $ledger_bytes, is_state_file => 0 },
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "PHASE4_COMMITTED=1\nDESIGN_CHANGED=$design_changed\nCURRENT_DESIGN_SHA256=$live_design_sha\n";
     });
-    print "PHASE4_COMMITTED=1\nDESIGN_CHANGED=$design_changed\nCURRENT_DESIGN_SHA256=$live_design_sha\n";
   });
 }
 
@@ -3225,23 +3541,26 @@ sub cmd_authorize_step_back {
   die_err("authorize-step-back requires --task and --reason") unless defined $opt{task} && defined $opt{reason};
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    $st->{review}{max_step_backs_allowed}   = ($st->{review}{max_step_backs_allowed} // 1) + 1;
-    $st->{review}{extra_step_backs_granted} = ($st->{review}{extra_step_backs_granted} // 0) + 1;
-    push @{$st->{review}{extra_step_back_authorizations}}, { reason => $opt{reason}, at => now_iso() };
-    my $gen = $st->{generation};
-    my $tx_id = "tx-auth-sb-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      writes              => [
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+    _with_activation_lock_guard($plans_dir, 'authorize-step-back', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'authorize-step-back');
+      $st->{review}{max_step_backs_allowed}   = ($st->{review}{max_step_backs_allowed} // 1) + 1;
+      $st->{review}{extra_step_backs_granted} = ($st->{review}{extra_step_backs_granted} // 0) + 1;
+      push @{$st->{review}{extra_step_back_authorizations}}, { reason => $opt{reason}, at => now_iso() };
+      my $gen = $st->{generation};
+      my $tx_id = "tx-auth-sb-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        writes              => [
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "STEP_BACK_AUTHORIZED=1\nMAX_STEP_BACKS_ALLOWED=$st->{review}{max_step_backs_allowed}\n";
     });
-    print "STEP_BACK_AUTHORIZED=1\nMAX_STEP_BACKS_ALLOWED=$st->{review}{max_step_backs_allowed}\n";
   });
 }
 
@@ -3254,63 +3573,66 @@ sub cmd_record_user_decision {
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    my $repo = resolve_repo_root($opt{repo}, $real_task);
-    my $trel = task_rel_path($repo, $real_task);
-    my $rev = $st->{review};
+    _with_activation_lock_guard($plans_dir, 'record-user-decision', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'record-user-decision');
+      my $repo = resolve_repo_root($opt{repo}, $real_task);
+      my $trel = task_rel_path($repo, $real_task);
+      my $rev = $st->{review};
 
-    if (ref($rev->{user_decision}) eq 'HASH' && ($rev->{user_decision}{choice} // '') eq 'manual_redesign') {
-      die_err("manual_redesign is active — run clear-manual-redesign or commit-phase0 --change-kind material first", 3);
-    }
+      if (ref($rev->{user_decision}) eq 'HASH' && ($rev->{user_decision}{choice} // '') eq 'manual_redesign') {
+        die_err("manual_redesign is active — run clear-manual-redesign or commit-phase0 --change-kind material first", 3);
+      }
 
-    my $eff_prd  = $st->{effective_prd_sha256} // '';
-    my $prd_path = "$real_task/prd.md";
-    die_err("missing prd.md", 3) unless -f $prd_path && !-l $prd_path;
-    die_err("prd.md modified since Phase 0 commit — run commit-phase0 first", 3)
-      unless sha256_file($prd_path) eq $eff_prd;
+      my $eff_prd  = $st->{effective_prd_sha256} // '';
+      my $prd_path = "$real_task/prd.md";
+      die_err("missing prd.md", 3) unless -f $prd_path && !-l $prd_path;
+      die_err("prd.md modified since Phase 0 commit — run commit-phase0 first", 3)
+        unless sha256_file($prd_path) eq $eff_prd;
 
-    if ($opt{choice} eq 'authorize_extra_step_back') {
-      $rev->{max_step_backs_allowed}   = ($rev->{max_step_backs_allowed} // 1) + 1;
-      $rev->{extra_step_backs_granted} = ($rev->{extra_step_backs_granted} // 0) + 1;
-      push @{$rev->{extra_step_back_authorizations}}, { reason => $opt{reason}, at => now_iso() };
-    }
-    if ($opt{choice} eq 'narrow_scope_and_proceed' || $opt{choice} eq 'dispose_and_close_review') {
-      my @open_blk = _count_open_blocking($rev);
-      die_err("cannot record '$opt{choice}' while blocking classes remain open: " . join(',', @open_blk), 3)
-        if @open_blk;
-      die_err("cannot record '$opt{choice}' while step-back assessment is pending", 3)
-        if ($rev->{step_back_assessment_status} // 'none') eq 'pending';
-    }
+      if ($opt{choice} eq 'authorize_extra_step_back') {
+        $rev->{max_step_backs_allowed}   = ($rev->{max_step_backs_allowed} // 1) + 1;
+        $rev->{extra_step_backs_granted} = ($rev->{extra_step_backs_granted} // 0) + 1;
+        push @{$rev->{extra_step_back_authorizations}}, { reason => $opt{reason}, at => now_iso() };
+      }
+      if ($opt{choice} eq 'narrow_scope_and_proceed' || $opt{choice} eq 'dispose_and_close_review') {
+        my @open_blk = _count_open_blocking($rev);
+        die_err("cannot record '$opt{choice}' while blocking classes remain open: " . join(',', @open_blk), 3)
+          if @open_blk;
+        die_err("cannot record '$opt{choice}' while step-back assessment is pending", 3)
+          if ($rev->{step_back_assessment_status} // 'none') eq 'pending';
+      }
 
-    my $design_sha  = sha256_file("$real_task/design.md");
-    my $ledger_sha  = (-f "$plans_dir/review-ledger.md") ? sha256_file("$plans_dir/review-ledger.md") : '';
-    my ($non_prd)   = compute_non_prd_baseline($repo, $real_task, $trel, $st);
-    my $base_sha    = compute_review_baseline($eff_prd, $non_prd);
+      my $design_sha  = sha256_file("$real_task/design.md");
+      my $ledger_sha  = (-f "$plans_dir/review-ledger.md") ? sha256_file("$plans_dir/review-ledger.md") : '';
+      my ($non_prd)   = compute_non_prd_baseline($repo, $real_task, $trel, $st);
+      my $base_sha    = compute_review_baseline($eff_prd, $non_prd);
 
-    $rev->{user_decision} = {
-      choice                  => $opt{choice},
-      reason                  => $opt{reason},
-      effective_prd_sha256    => $eff_prd,
-      non_prd_baseline_sha256 => $non_prd,
-      review_baseline_sha256  => $base_sha,
-      design_sha256           => $design_sha,
-      ledger_sha256           => $ledger_sha,
-      at                      => now_iso(),
-    };
+      $rev->{user_decision} = {
+        choice                  => $opt{choice},
+        reason                  => $opt{reason},
+        effective_prd_sha256    => $eff_prd,
+        non_prd_baseline_sha256 => $non_prd,
+        review_baseline_sha256  => $base_sha,
+        design_sha256           => $design_sha,
+        ledger_sha256           => $ledger_sha,
+        at                      => now_iso(),
+      };
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-ud-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      writes              => [
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+      my $gen = $st->{generation};
+      my $tx_id = "tx-ud-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        writes              => [
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "USER_DECISION_RECORDED=1\nCHOICE=$opt{choice}\nREVIEW_BASELINE_SHA256=$base_sha\n";
     });
-    print "USER_DECISION_RECORDED=1\nCHOICE=$opt{choice}\nREVIEW_BASELINE_SHA256=$base_sha\n";
   });
 }
 
@@ -3319,28 +3641,31 @@ sub cmd_clear_manual_redesign {
   die_err("clear-manual-redesign requires --task and --reason") unless defined $opt{task} && defined $opt{reason};
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
-    recover_tx($real_task, $plans_dir);
-    my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
-    die_err("manual_redesign is not active")
-      unless ref($st->{review}{user_decision}) eq 'HASH' && ($st->{review}{user_decision}{choice} // '') eq 'manual_redesign';
-    $st->{review}{cleared_manual_redesigns} ||= [];
-    push @{$st->{review}{cleared_manual_redesigns}}, { %{$st->{review}{user_decision}}, cleared_reason => $opt{reason}, cleared_at => now_iso() };
-    $st->{review}{user_decision} = undef;
-    $st->{review}{clean_streak}  = 0;
-    $st->{review}{converged_at_round} = undef;
+    _with_activation_lock_guard($plans_dir, 'clear-manual-redesign', sub {
+      recover_tx($real_task, $plans_dir);
+      my $st = load_state_or_undef($plans_dir) // die_err("missing planning-state.json");
+      _guard_phase6_not_in_flight($st, 'clear-manual-redesign');
+      die_err("manual_redesign is not active")
+        unless ref($st->{review}{user_decision}) eq 'HASH' && ($st->{review}{user_decision}{choice} // '') eq 'manual_redesign';
+      $st->{review}{cleared_manual_redesigns} ||= [];
+      push @{$st->{review}{cleared_manual_redesigns}}, { %{$st->{review}{user_decision}}, cleared_reason => $opt{reason}, cleared_at => now_iso() };
+      $st->{review}{user_decision} = undef;
+      $st->{review}{clean_streak}  = 0;
+      $st->{review}{converged_at_round} = undef;
 
-    my $gen = $st->{generation};
-    my $tx_id = "tx-clrmr-" . time() . "-$$";
-    $st->{last_tx_id} = $tx_id;
-    execute_tx($real_task, $plans_dir, {
-      tx_id               => $tx_id,
-      expected_generation => $gen,
-      next_generation     => $gen,
-      writes              => [
-        { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
-      ],
+      my $gen = $st->{generation};
+      my $tx_id = "tx-clrmr-" . time() . "-$$";
+      $st->{last_tx_id} = $tx_id;
+      execute_tx($real_task, $plans_dir, {
+        tx_id               => $tx_id,
+        expected_generation => $gen,
+        next_generation     => $gen,
+        writes              => [
+          { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
+        ],
+      });
+      print "MANUAL_REDESIGN_CLEARED=1\n";
     });
-    print "MANUAL_REDESIGN_CLEARED=1\n";
   });
 }
 
@@ -3366,7 +3691,8 @@ sub _validate_jsonl_non_seed {
     next unless length $rel;
     return (0, "$jsonl_path:$line_no absolute or traversal path forbidden: $rel")
       if $rel =~ m{\A/} || $rel =~ /\0/ || $rel =~ m{(?:\A|/)\.\.(?:/|\z)} || $rel eq '.' || $rel =~ m{\A\./?\z};
-    my $target = File::Spec->catfile($real_repo, $rel);
+    my $rel_bytes = encode('UTF-8', $rel);
+    my $target = File::Spec->catfile($real_repo, $rel_bytes);
     return (0, "$jsonl_path:$line_no referenced path not found: $rel") unless -e $target;
     my $real_target = abs_path($target);
     return (0, "$jsonl_path:$line_no referenced path escapes repo root: $rel")
@@ -3381,8 +3707,13 @@ sub _validate_implement_codification {
   my ($real_task, $st) = @_;
   my $imp_path = "$real_task/implement.md";
   return (0, "missing implement.md") unless -f $imp_path && !-l $imp_path;
-  my $imp_txt = read_raw_file($imp_path);
-  my $des_txt = (-f "$real_task/design.md") ? read_raw_file("$real_task/design.md") : '';
+  my $imp_txt = eval { decode('UTF-8', read_raw_file($imp_path), FB_CROAK | LEAVE_SRC) };
+  return (0, "implement.md is not valid UTF-8") if $@ || !defined $imp_txt;
+  my $des_txt = '';
+  if (-f "$real_task/design.md" && !-l "$real_task/design.md") {
+    $des_txt = eval { decode('UTF-8', read_raw_file("$real_task/design.md"), FB_CROAK | LEAVE_SRC) };
+    return (0, "design.md is not valid UTF-8") if $@ || !defined $des_txt;
+  }
   my @missing;
   for my $cid (sort keys %{$st->{review}{classes} || {}}) {
     my $c = $st->{review}{classes}{$cid};
@@ -3392,8 +3723,10 @@ sub _validate_implement_codification {
     }
     if ($c->{recurring}) {
       my $co = $c->{codified};
-      if (ref $co ne 'HASH' || !length($co->{invariant_id} // '') || !length($co->{guard_test} // '')) {
-        push @missing, "recurring class $cid lacks codified invariant/guard_test";
+      if (ref $co ne 'HASH' ||
+          !defined($co->{invariant_id}) || ref($co->{invariant_id}) || $co->{invariant_id} !~ /\S/ ||
+          !defined($co->{guard_test})   || ref($co->{guard_test})   || $co->{guard_test}   !~ /\S/) {
+        push @missing, "recurring class $cid lacks non-blank codified invariant/guard_test";
       } else {
         push @missing, "recurring invariant $co->{invariant_id} ($cid) not found in design.md"
           unless index($des_txt, $co->{invariant_id}) >= 0;
@@ -3401,7 +3734,7 @@ sub _validate_implement_codification {
           unless index($imp_txt, $co->{invariant_id}) >= 0;
         push @missing, "recurring guard test '$co->{guard_test}' ($cid) not referenced in implement.md"
           unless index($imp_txt, $co->{guard_test}) >= 0;
-        if (length($co->{review_md_entry} // '')) {
+        if (defined($co->{review_md_entry}) && !ref($co->{review_md_entry}) && $co->{review_md_entry} =~ /\S/) {
           push @missing, "recurring REVIEW.md entry '$co->{review_md_entry}' ($cid) not referenced in implement.md"
             unless index($imp_txt, $co->{review_md_entry}) >= 0;
         }
@@ -3413,7 +3746,7 @@ sub _validate_implement_codification {
 
 # Validate upstream DAG from Phase 0 -> Phase 4 (shared by _evaluate_freshness AND commit-phase5).
 sub _evaluate_upstream_freshness {
-  my ($real_task, $plans_dir, $repo, $trel, $st) = @_;
+  my ($real_task, $plans_dir, $repo, $trel, $st, $ignore_proj) = @_;
 
   if (!$st) {
     return { ok => 0, next_stage => 'phase0', reasons => ['missing planning-state.json'] };
@@ -3496,7 +3829,7 @@ sub _evaluate_upstream_freshness {
   }
 
   # Phase 3 & 4 review closure check.
-  my $nr = _compute_next_review($real_task, $plans_dir, $repo, $trel, $st);
+  my $nr = _compute_next_review($real_task, $plans_dir, $repo, $trel, $st, $ignore_proj);
   if ($nr->{purpose} eq 'blocked-manual-redesign') {
     return { ok => 0, next_stage => 'blocked-manual-redesign', reasons => ['manual_redesign decision blocks Phase 5/6'] };
   }
@@ -3520,8 +3853,8 @@ sub _evaluate_upstream_freshness {
 
 # Validate entire DAG from Phase 0 -> Phase 6. Returns hashref { ok, next_stage, reasons[], live_baseline }.
 sub _evaluate_freshness {
-  my ($real_task, $plans_dir, $repo, $trel, $st) = @_;
-  my $up = _evaluate_upstream_freshness($real_task, $plans_dir, $repo, $trel, $st);
+  my ($real_task, $plans_dir, $repo, $trel, $st, $ignore_proj) = @_;
+  my $up = _evaluate_upstream_freshness($real_task, $plans_dir, $repo, $trel, $st, $ignore_proj);
   return $up unless $up->{ok};
 
   my $live_prd        = $up->{live_prd};
@@ -3582,7 +3915,7 @@ sub cmd_check_freshness {
     }
     my $repo = resolve_repo_root($opt{repo}, $real_task);
     my $trel = task_rel_path($repo, $real_task);
-    my $res = _evaluate_freshness($real_task, $plans_dir, $repo, $trel, $st);
+    my $res = _evaluate_freshness($real_task, $plans_dir, $repo, $trel, $st, _effective_ignore_project_config($st, \%opt));
     print "FRESH=" . ($res->{ok} ? 1 : 0) . "\n";
     print "NEXT_STAGE=$res->{next_stage}\n";
     print "PHASE6_STATE=$res->{phase6_state}\n" if defined $res->{phase6_state};
@@ -3614,7 +3947,8 @@ sub cmd_commit_phase5 {
         if $p6_cur eq 'activating' || $p6_cur eq 'activation_uncertain';
 
       # Verify ALL upstream Phases 0..4 freshness (PRD, candidates, Phase 2 lock, design_revisions[], review closure)!
-      my $up = _evaluate_upstream_freshness($real_task, $plans_dir, $repo, $trel, $st);
+      my $ign_proj = _effective_ignore_project_config($st, \%opt);
+      my $up = _evaluate_upstream_freshness($real_task, $plans_dir, $repo, $trel, $st, $ign_proj);
       die_err("cannot commit Phase 5: upstream freshness failed ($up->{next_stage}: " . join('; ', @{$up->{reasons} || []}) . ")", 3)
         unless $up->{ok};
 
@@ -3638,6 +3972,34 @@ sub cmd_commit_phase5 {
       my $cj_sha    = sha256_file("$real_task/check.jsonl");
       my $des_sha   = $up->{live_design_sha};
       my $led_sha   = $up->{live_ledger_sha};
+
+      # Idempotent retry when all Phase 5 inputs & outputs are unchanged: preserve existing Phase 6 record (including activated)!
+      my $old_p5 = $st->{phases}{'5'};
+      if (ref($old_p5) eq 'HASH' &&
+          ($old_p5->{status}                 // '') eq 'completed' &&
+          ($old_p5->{effective_prd_sha256}   // '') eq ($st->{effective_prd_sha256} // '') &&
+          ($old_p5->{final_design_sha256}    // '') eq $des_sha &&
+          ($old_p5->{review_closure_kind}    // '') eq ($up->{review_closure} // '') &&
+          ($old_p5->{review_baseline_sha256} // '') eq ($up->{live_baseline} // '') &&
+          ($old_p5->{ledger_sha256}          // '') eq $led_sha &&
+          ($old_p5->{implement_md_sha256}    // '') eq $imp_sha &&
+          ($old_p5->{implement_jsonl_sha256} // '') eq $ij_sha &&
+          ($old_p5->{check_jsonl_sha256}     // '') eq $cj_sha) {
+        print "PHASE5_COMMITTED=1\nPHASE5_IDEMPOTENT=1\nIMPLEMENT_MD_SHA256=$imp_sha\nREVIEW_BASELINE_SHA256=$up->{live_baseline}\n";
+        print "PHASE6_STATE=$p6_cur\n" if $p6_cur ne 'none';
+        return;
+      }
+
+      # If Phase 6 is already activated, refuse silently wiping it while task.json is still active (prevents re-running after_start)!
+      if ($p6_cur eq 'activated') {
+        my $tstat = 'unknown';
+        if (-f "$real_task/task.json" && !-l "$real_task/task.json") {
+          my $tj = eval { load_json_file("$real_task/task.json") };
+          $tstat = $tj->{status} // 'unknown' if !$@ && ref $tj eq 'HASH';
+        }
+        die_err("cannot wipe activated Phase 6 via commit-phase5 while task.json.status is '$tstat' (must be planning)", 3)
+          unless $tstat eq 'planning';
+      }
 
       my $gen = $st->{generation};
       my $tx_id = "tx-p5-" . time() . "-$$";
@@ -3695,7 +4057,7 @@ sub cmd_commit_phase6_ready {
       die_err("cannot overwrite Phase 6 state '$p6_st' — use recover-activation or resolve-activation", 3)
         if $p6_st eq 'activating' || $p6_st eq 'activation_uncertain';
 
-      my $res = _evaluate_freshness($real_task, $plans_dir, $repo, $trel, $st);
+      my $res = _evaluate_freshness($real_task, $plans_dir, $repo, $trel, $st, _effective_ignore_project_config($st, \%opt));
       die_err("cannot mark Phase 6 ready: freshness gate failed ($res->{next_stage}: " . join('; ', @{$res->{reasons}}) . ")", 3)
         unless $res->{ok};
 
@@ -3735,13 +4097,18 @@ sub cmd_commit_phase6_ready {
 }
 
 # Query task.py current --json under the EXACT original trellis_context_key!
+# Enforces Trellis exit-code convention: rc=0 (task present or valid ok), rc=1 ONLY when current_task is null;
+# ANY other exit code (e.g. 2, 7, 127, signals) or missing current_task key fails closed!
 sub _probe_trellis_current {
   my ($repo_root, $task_py, $context_key) = @_;
   my %env_ov = (TRELLIS_CONTEXT_ID => ($context_key eq 'degraded-no-context' ? undef : $context_key));
   my ($rc, $out, $err) = run_cmd_capture_split($repo_root, \%env_ov, 'python3', $task_py, 'current', '--json');
   my $data = eval { decode_strict($out) };
-  if ($@ || ref $data ne 'HASH') {
+  if ($@ || ref $data ne 'HASH' || !exists $data->{current_task}) {
     return (0, undef, "task.py current --json failed (rc=$rc): $out $err");
+  }
+  if ($rc != 0 && !($rc == 1 && !defined $data->{current_task})) {
+    return (0, undef, "task.py current --json exited unexpectedly (rc=$rc): $out $err");
   }
   return (1, $data, '');
 }
@@ -3850,10 +4217,12 @@ sub cmd_activate_task {
     $act_gen = $st->{generation};
 
     my $pre_status = 'unknown';
-    if (-f "$real_task/task.json") {
+    if (-f "$real_task/task.json" && !-l "$real_task/task.json") {
       my $tj = eval { load_json_file("$real_task/task.json") };
       $pre_status = $tj->{status} // 'unknown' if !$@ && ref $tj eq 'HASH';
     }
+    die_err("cannot activate task: task.json.status is '$pre_status' (expected 'planning' — refusing duplicate start/after_start)", 3)
+      unless $pre_status eq 'planning';
 
     my $gen = $act_gen;
     my $tx_id = "tx-act-begin-" . time() . "-$$";
@@ -4215,50 +4584,52 @@ while (@ARGV) {
   elsif ($a eq '--repo')                         { $opt{repo}                       = shift @ARGV; }
   elsif ($a eq '--file')                         { $opt{file}                       = shift @ARGV; }
   elsif ($a eq '--capabilities')                 { $opt{caps}                       = shift @ARGV; }
-  elsif ($a eq '--override-designers')           { $opt{ov_designers}               = shift @ARGV; }
-  elsif ($a eq '--override-judge')               { $opt{ov_judge}                   = shift @ARGV; }
-  elsif ($a eq '--override-model')               { $opt{ov_model}                   = shift @ARGV; }
-  elsif ($a eq '--override-effort')              { $opt{ov_effort}                  = shift @ARGV; }
-  elsif ($a eq '--override-council')             { $opt{ov_council}                 = shift @ARGV; }
-  elsif ($a eq '--single')                       { $opt{single}                     = shift @ARGV; }
+  elsif ($a eq '--override-designers')           { $opt{ov_designers}               = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--override-judge')               { $opt{ov_judge}                   = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--override-model')               { $opt{ov_model}                   = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--override-effort')              { $opt{ov_effort}                  = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--override-council')             { $opt{ov_council}                 = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--single')                       { $opt{single}                     = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--allow-non-tri')                { $opt{allow_non_tri}              = 1; }
   elsif ($a eq '--ignore-project-config')        { $opt{ignore_project_config}      = 1; }
+  elsif ($a eq '--use-project-config')           { $opt{use_project_config}         = 1; }
   elsif ($a eq '--confirm')                      { $opt{confirm}                    = 1; }
-  elsif ($a eq '--change-kind')                  { $opt{change_kind}                = shift @ARGV; }
-  elsif ($a eq '--reason')                       { $opt{reason}                     = shift @ARGV; }
-  elsif ($a eq '--evidence')                     { $opt{evidence}                   = shift @ARGV; }
-  elsif ($a eq '--authorization')                { $opt{authorization}              = shift @ARGV; }
+  elsif ($a eq '--change-kind')                  { $opt{change_kind}                = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--reason')                       { $opt{reason}                     = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--evidence')                     { $opt{evidence}                   = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--authorization')                { $opt{authorization}              = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--slots-json')                   { $opt{slots_json}                 = shift @ARGV; }
   elsif ($a eq '--target-json')                  { $opt{target_json}                = shift @ARGV; }
-  elsif ($a eq '--owner')                        { $opt{owner}                      = shift @ARGV; }
+  elsif ($a eq '--owner')                        { $opt{owner}                      = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--owner-gen')                    { $opt{owner_gen}                  = shift @ARGV; }
-  elsif ($a eq '--new-owner')                    { $opt{new_owner}                  = shift @ARGV; }
+  elsif ($a eq '--new-owner')                    { $opt{new_owner}                  = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--degraded-allowed')             { $opt{degraded_allowed}           = 1; }
-  elsif ($a eq '--degraded-approval')            { $opt{degraded_approval}          = shift @ARGV; }
-  elsif ($a eq '--purpose')                      { $opt{purpose}                    = shift @ARGV; }
-  elsif ($a eq '--mode')                         { $opt{mode}                       = shift @ARGV; }
-  elsif ($a eq '--run-id')                       { $opt{run_id}                     = shift @ARGV; }
+  elsif ($a eq '--degraded-approval')            { $opt{degraded_approval}          = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--purpose')                      { $opt{purpose}                    = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--mode')                         { $opt{mode}                       = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--run-id')                       { $opt{run_id}                     = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--generation')                   { $opt{generation}                 = shift @ARGV; }
-  elsif ($a eq '--slot')                         { $opt{slot}                       = shift @ARGV; }
+  elsif ($a eq '--slot')                         { $opt{slot}                       = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--attempt')                      { $opt{attempt}                    = shift @ARGV; }
-  elsif ($a eq '--task-id')                      { $opt{task_id}                    = shift @ARGV; }
-  elsif ($a eq '--child-thread-id')              { $opt{child_thread_id}            = shift @ARGV; }
-  elsif ($a eq '--child-run-id')                 { $opt{child_run_id}               = shift @ARGV; }
-  elsif ($a eq '--state')                        { $opt{state}                      = shift @ARGV; }
-  elsif ($a eq '--reconciled-child-thread-id')   { $opt{reconciled_child_thread_id} = shift @ARGV; }
+  elsif ($a eq '--task-id')                      { $opt{task_id}                    = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--child-thread-id')              { $opt{child_thread_id}            = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--child-run-id')                 { $opt{child_run_id}               = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--state')                        { $opt{state}                      = _decode_cli_text(shift @ARGV, $a); }
+  elsif ($a eq '--reconciled-child-thread-id')   { $opt{reconciled_child_thread_id} = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--input')                        { $opt{input}                      = shift @ARGV; }
   elsif ($a eq '--merged-input')                 { $opt{merged_input}               = shift @ARGV; }
+  elsif ($a eq '--dismissed-findings')           { $opt{dismissed_findings}         = shift @ARGV; }
   elsif ($a eq '--inherit-wording-confirmation') { $opt{inherit_wording_confirmation} = 1; }
   elsif ($a eq '--assemble')                     { $opt{assemble}                   = 1; }
   elsif ($a eq '--dispositions-json')            { $opt{dispositions_json}          = shift @ARGV; }
   elsif ($a eq '--step-back-assessment-done')    { $opt{step_back_assessment_done}  = 1; }
   elsif ($a eq '--mark-scope-fork')              { $opt{mark_scope_fork}            = 1; }
   elsif ($a eq '--clear-scope-fork')             { $opt{clear_scope_fork}           = 1; }
-  elsif ($a eq '--choice')                       { $opt{choice}                     = shift @ARGV; }
+  elsif ($a eq '--choice')                       { $opt{choice}                     = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--task-py')                      { $opt{task_py}                    = shift @ARGV; }
-  elsif ($a eq '--resolution')                   { $opt{resolution}                 = shift @ARGV; }
+  elsif ($a eq '--resolution')                   { $opt{resolution}                 = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a =~ /^--/)                            { die_err("unknown option: $a"); }
-  else                                           { push @pos, $a; }
+  else                                           { push @pos, _decode_cli_text($a, 'arg'); }
 }
 
 if    ($cmd eq 'config-set')                  { cmd_config_set($opt{file}); }

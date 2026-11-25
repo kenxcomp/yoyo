@@ -154,6 +154,15 @@ def main():
         if os.environ.get("MOCK_CURRENT_MODE", "") == "broken":
             print("not-valid-json")
             return 2
+        if os.environ.get("MOCK_CURRENT_MODE", "") == "exit7_null":
+            print(json.dumps({"current_task": None, "source": "session", "stale": False}))
+            return 7
+        if os.environ.get("MOCK_CURRENT_MODE", "") == "exit2_error":
+            print(json.dumps({"error": "trellis state corrupted"}))
+            return 2
+        if os.environ.get("MOCK_CURRENT_MODE", "") == "exit0_missing_key":
+            print(json.dumps({"error": "missing current_task key"}))
+            return 0
         pf = ptr_file()
         tdir = pf.read_text().strip() if (pf and pf.is_file()) else None
         if "--json" in args:
@@ -1438,6 +1447,402 @@ while kill -0 "$CHILD_PY_PID" 2>/dev/null; do sleep 0.2; done
 out=$(MOCK_CURRENT_MODE=broken bash "$STATE" recover-activation --task "$TASK_I" --repo "$REPO_I" 2>&1); rc=$?
 assert_rc "recover-activation fails closed (activation_uncertain) when pointer probe fails" "$rc" 3
 assert_contains "RECOVERY_CASE=probe_failed" "$out" "RECOVERY_CASE=probe_failed"
+
+# =============================================================================
+printf '\n=== Group J: Round 2 Hardening Regressions (All 19 Consolidated Findings) ===\n'
+# =============================================================================
+
+# J1. config-show with empty --capabilities (0 models) MUST fail closed (exit 3, CONFIG_VALID=0)!
+CAPS_EMPTY="$TMP/caps-empty-tri.json"
+printf '{"providers":[]}\n' > "$CAPS_EMPTY"
+out=$(bash "$STATE" config-show --repo "$REPO_I" --capabilities "$CAPS_EMPTY" 2>&1); rc=$?
+assert_rc "empty capabilities JSON fails closed (exit 3)" "$rc" 3
+assert_contains "CONFIG_VALID=0 on empty capabilities" "$out" "CONFIG_VALID=0"
+
+# J2. config-set rejects unified effortMode with empty effortKey member!
+cat > "$TMP/cfg-tri-unif-emptykey.json" <<'EOF'
+{
+  "version": 1,
+  "authorizedProviders": ["antigravity", "codex"],
+  "designers": {
+    "effortMode": "unified",
+    "unifiedEffort": "high",
+    "members": [
+      { "providerInstanceId": "antigravity", "model": "no-effort", "effortKey": "", "effort": "" },
+      { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "" }
+    ]
+  },
+  "defaultReviewer": { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "high" },
+  "reviewCouncil": {
+    "effortMode": "per-model",
+    "members": [
+      { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "high" }
+    ]
+  }
+}
+EOF
+out=$(bash "$STATE" config-set --file "$TMP/cfg-tri-unif-emptykey.json" 2>&1); rc=$?
+assert_rc "config-set rejects unified group with empty effortKey member" "$rc" 3
+
+# J3. Fresh repo with non-ASCII Git path (中文/REVIEW.md), project knobs, --ignore-project-config persistence,
+#     Latin-1 \u00a7/\u00e9 judge output, Phase 2a default-path SHA check, Phase 2b no-overwrite of Phase 4,
+#     single/council blocking finding traceability, Chinese codification, UTF-8 CLI args, Phase 5 idempotency,
+#     Phase 6 activation lock blocking takeover-run, _probe_trellis_current exit 7/2, and TriTx::_git SIGTERM!
+REPO_J="$TMP/repo-j"
+make_repo "$REPO_J"
+mkdir -p "$REPO_J/中文"
+cat > "$REPO_J/中文/REVIEW.md" <<'EOF'
+# 中文审查规则
+
+## 禁止裸写SQL
+严禁拼接原始 SQL。
+EOF
+git -C "$REPO_J" add -A && git -C "$REPO_J" commit -q -m "add non-ascii REVIEW.md"
+
+cat > "$REPO_J/.t3-tri-plan.json" <<'EOF'
+{
+  "version": 1,
+  "knobs": { "roundCap": 1, "maxStepBacks": 0 }
+}
+EOF
+
+TASK_J="$REPO_J/.trellis/tasks/01-r2"
+mkdir -p "$TASK_J"
+printf '# PRD R2\nSupport Chinese codification & full hardening.\n' > "$TASK_J/prd.md"
+cat > "$TASK_J/task.json" <<'EOF'
+{ "id": "01-r2", "title": "R2 Hardening", "status": "planning" }
+EOF
+
+# Persist --ignore-project-config in Phase 0 so commit-phase1 and next-review ignore project roundCap=1!
+out=$(bash "$STATE" commit-phase0 --task "$TASK_J" --repo "$REPO_J" --ignore-project-config 2>&1); rc=$?
+assert_rc "commit-phase0 --ignore-project-config succeeds" "$rc" 0
+assert_contains "PROJECT_CONFIG_IGNORED=1 persisted" "$out" "PROJECT_CONFIG_IGNORED=1"
+
+# Phase 1 -> commit-phase1
+p1j=$(bash "$STATE" prepare-design --task "$TASK_J" --repo "$REPO_J" --slots-json "$TMP/designers.json" --owner "owner-j1")
+P1J_RUN=$(printf '%s\n' "$p1j" | sed -n 's/^RUN_ID=//p')
+for pair in "candidate-a:$TMP/cand-zh.md" "candidate-b:$TMP/cand-b.md" "candidate-c:$TMP/cand-c.md"; do
+  sl="${pair%%:*}"; cf="${pair#*:}"
+  bash "$STATE" claim-slot --task "$TASK_J" --run-id "$P1J_RUN" --slot "$sl" --owner "owner-j1" --owner-gen 1 --generation 1 >/dev/null
+  bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$P1J_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot "$sl" --attempt 1 --task-id "tj-$sl" --child-thread-id "ctj-$sl" --child-run-id "crj-$sl" >/dev/null
+  bash "$STATE" record-result --task "$TASK_J" --run-id "$P1J_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot "$sl" --attempt 1 --task-id "tj-$sl" --child-run-id "crj-$sl" --input "$cf" >/dev/null
+done
+bash "$STATE" commit-phase1 --task "$TASK_J" --repo "$REPO_J" >/dev/null
+
+# Phase 2a: Latin-1 \u00a7/\u00e9 escape in synthesis/design + default-path tampered result_sha256 rejection!
+pjj=$(bash "$STATE" prepare-judge --task "$TASK_J" --repo "$REPO_J" --target-json "$TMP/judge-target.json" --owner "owner-j1")
+PJJ_RUN=$(printf '%s\n' "$pjj" | sed -n 's/^RUN_ID=//p')
+JSHA_A=$(shasum -a 256 "$TASK_J/research/plans/candidates/candidate-a.md" | awk '{print $1}')
+JSHA_B=$(shasum -a 256 "$TASK_J/research/plans/candidates/candidate-b.md" | awk '{print $1}')
+JSHA_C=$(shasum -a 256 "$TASK_J/research/plans/candidates/candidate-c.md" | awk '{print $1}')
+cat > "$TMP/be-latin1.json" <<EOF
+{
+  "candidate_set": [
+    { "slot": "candidate-a", "sha256": "$JSHA_A" },
+    { "slot": "candidate-b", "sha256": "$JSHA_B" },
+    { "slot": "candidate-c", "sha256": "$JSHA_C" }
+  ],
+  "fact_checks": [
+    { "id": "F1", "candidate_slot": "candidate-c", "claim": "src/app.py:1 ok", "status": "CONFIRMED", "file_line_evidence": "src/app.py:1" }
+  ],
+  "axis_matrix": {
+    "architecture_fit": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "ssot_invariants": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "hidden_callers": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "migration_compat": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "real_entrypoint_tests": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "abstraction_restraint": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "prd_scope_fidelity": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "rollback_viability": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "unique_risks": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "key_assumptions": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "dependency_order": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "failure_recovery_acceptance": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}}
+  },
+  "primary_winner": "candidate-a",
+  "winner_rationale": "Cleanest invariants.",
+  "eliminated": [
+    { "slot": "candidate-b", "rationale": "Extra layer." },
+    { "slot": "candidate-c", "rationale": "Missing rollback." }
+  ],
+  "cherry_picks": [
+    { "source_slot": "candidate-c", "gap_description": "Check", "evidence_fact_check_id": "F1", "evidence_quote": "src/app.py:1", "compatible_with_winner_architecture": true }
+  ],
+  "rejected_ideas": [],
+  "product_forks": [],
+  "product_decisions": [],
+  "synthesis_body_markdown": "# Synthesis \\u00a71 R\\u00e9sum\\u00e9\\nWinner: candidate-a.",
+  "initial_design_markdown": "# Design \\u00a71 R\\u00e9sum\\u00e9\\nBackbone: candidate-a.\\n"
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_J" --run-id "$PJJ_RUN" --slot judge --owner "owner-j1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$PJJ_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot judge --attempt 1 --task-id "tjj-1" --child-thread-id "ctjj-1" --child-run-id "crjj-1" >/dev/null
+rr_j=$(bash "$STATE" record-result --task "$TASK_J" --run-id "$PJJ_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot judge --attempt 1 --task-id "tjj-1" --child-run-id "crjj-1" --input "$TMP/be-latin1.json")
+J_RES_FILE=$(printf '%s\n' "$rr_j" | sed -n 's/^RESULT_FILE=//p')
+cp "$J_RES_FILE" "$TMP/j-res.bak"
+# Tamper recorded judge slot file on disk and invoke commit-phase2a WITHOUT --input!
+python3 -c '
+import json
+p = "'"$J_RES_FILE"'"
+d = json.load(open(p))
+d["winner_rationale"] = "TAMPERED ON DISK"
+json.dump(d, open(p, "w"))
+'
+out=$(bash "$STATE" commit-phase2a --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "commit-phase2a default path (no --input) catches tampered result_sha256" "$rc" 3
+assert_contains "tampered digest message" "$out" "digest mismatch"
+cp "$TMP/j-res.bak" "$J_RES_FILE"
+
+out=$(bash "$STATE" commit-phase2a --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "commit-phase2a locks valid Latin-1 escaped judge payload" "$rc" 0
+# Verify Latin-1 \u00a7 and \u00e9 were properly UTF-8 encoded (valid UTF-8 file)!
+python3 -c '
+t = open("'"$TASK_J/research/plans/initial-design.md"'", "r", encoding="utf-8").read()
+assert "\u00a71 R\u00e9sum\u00e9" in t, f"bad utf8 text: {t!r}"
+' && ok "Latin-1 U+0080..U+00FF JSON strings encoded as valid UTF-8 (no utf8::is_utf8 skip)" || fail "Latin-1 UTF-8 encoding failed!"
+
+bash "$STATE" commit-phase2b --task "$TASK_J" --repo "$REPO_J" --assemble >/dev/null
+# Write-free idempotent retry BEFORE any Phase 4 revision succeeds!
+out=$(bash "$STATE" commit-phase2b --task "$TASK_J" --repo "$REPO_J" --assemble 2>&1); rc=$?
+assert_rc "commit-phase2b immediate retry is idempotent" "$rc" 0
+assert_contains "PHASE2B_IDEMPOTENT=1" "$out" "PHASE2B_IDEMPOTENT=1"
+
+# Phase 3 Round 1: non-ASCII Git path 中文/REVIEW.md#禁止裸写sql in rules_index + single-reviewer BLOCKER cannot settle clean!
+pr_j1=$(bash "$STATE" prepare-review --task "$TASK_J" --repo "$REPO_J" --purpose initial-full --mode full --slots-json "$TMP/single-rev.json" --owner "owner-j1")
+PRJ1_RUN=$(printf '%s\n' "$pr_j1" | sed -n 's/^RUN_ID=//p')
+PRJ1_DSHA=$(printf '%s\n' "$pr_j1" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+PRJ1_LM=$(printf '%s\n' "$pr_j1" | sed -n 's/^LEDGER_MANIFEST=//p')
+python3 -c '
+import json
+lm = json.load(open("'"$PRJ1_LM"'", "r", encoding="utf-8"))
+rf = lm["rule_files"]
+ri = lm["rules_index"]
+assert "中文/REVIEW.md" in rf, f"missing non-ascii rule_files: {rf}"
+assert "中文/REVIEW.md#禁止裸写sql" in ri, f"missing non-ascii rules_index: {ri}"
+' && ok "non-ASCII Git path 中文/REVIEW.md decoded cleanly in rules_index (zero mojibake)" || fail "non-ASCII Git path mojibaked in rules_index!"
+
+cat > "$TMP/rev-j1-blocker.json" <<EOF
+{
+  "summary": "命中中文路径规则", "mode": "full", "reviewed_design_sha256": "$PRJ1_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "中文规则冲突", "location": "design.md:1",
+    "pattern": "裸写 SQL", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "使用参数化", "prevent": "并发锁测试", "evidence": "src/app.py:1",
+    "violates_review_md_rule": "中文/REVIEW.md#禁止裸写sql"
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-j1-clean-fake.json" <<EOF
+{
+  "summary": "Fake clean", "mode": "full", "reviewed_design_sha256": "$PRJ1_DSHA", "verdict": "clean",
+  "findings": [], "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_J" --run-id "$PRJ1_RUN" --slot slot1 --owner "owner-j1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$PRJ1_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tj-r1" --child-thread-id "ctj-r1" --child-run-id "crj-r1" >/dev/null
+out=$(bash "$STATE" record-result --task "$TASK_J" --run-id "$PRJ1_RUN" --generation 1 --owner "owner-j1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tj-r1" --child-run-id "crj-r1" --input "$TMP/rev-j1-blocker.json" 2>&1); rc=$?
+assert_rc "non-ASCII path 中文/REVIEW.md#禁止裸写sql accepted by parse-design-review" "$rc" 0
+
+# Attempting to settle single-reviewer BLOCKER as clean MUST fail closed!
+out=$(bash "$STATE" finish-review-round --task "$TASK_J" --repo "$REPO_J" --merged-input "$TMP/rev-j1-clean-fake.json" 2>&1); rc=$?
+assert_rc "single-reviewer BLOCKER cannot be settled as clean (exit 3)" "$rc" 3
+assert_contains "divergence error reported" "$out" "diverges from recorded canonical slot result"
+
+# Auto-consuming single slot without --merged-input succeeds and records dirty!
+out=$(bash "$STATE" finish-review-round --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "finish-review-round auto-consumes single valid slot -> dirty" "$rc" 0
+assert_contains "VERDICT=dirty" "$out" "VERDICT=dirty"
+
+# Phase 4: whitespace-only codified MUST fail; Chinese codified MUST pass!
+cat > "$TMP/disp-j-blank.json" <<'EOF'
+[{ "id": "D1", "disposition": "adopted", "note": "x", "codified": { "invariant_id": "   ", "guard_test": " " } }]
+EOF
+out=$(bash "$STATE" commit-phase4-revision --task "$TASK_J" --repo "$REPO_J" --dispositions-json "$TMP/disp-j-blank.json" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "commit-phase4-revision rejects whitespace-only codified.{invariant_id,guard_test}" || fail "accepted whitespace codified!"
+
+printf '\n## 不变量-1\n确保不变量-1 与 回归测试-并发锁 落地。\n' >> "$TASK_J/design.md"
+cat > "$TMP/disp-j-zh.json" <<'EOF'
+[{ "id": "D1", "disposition": "adopted", "note": "已固化", "codified": { "invariant_id": "不变量-1", "guard_test": "回归测试-并发锁", "review_md_entry": "中文/REVIEW.md#禁止裸写sql" } }]
+EOF
+out=$(bash "$STATE" commit-phase4-revision --task "$TASK_J" --repo "$REPO_J" --dispositions-json "$TMP/disp-j-zh.json" 2>&1); rc=$?
+assert_rc "Phase 4 Chinese codified recorded cleanly" "$rc" 0
+
+# Re-running commit-phase2b --assemble AFTER Phase 4 revision MUST fail closed (never overwrite design.md or clear design_revisions[])!
+DES_SHA_P4=$(shasum -a 256 "$TASK_J/design.md" | awk '{print $1}')
+out=$(bash "$STATE" commit-phase2b --task "$TASK_J" --repo "$REPO_J" --assemble 2>&1); rc=$?
+assert_rc "commit-phase2b refuses overwriting Phase 4 design_revisions[] (exit 3)" "$rc" 3
+assert_eq "design.md untouched after refused Phase 2b re-run" "$(shasum -a 256 "$TASK_J/design.md" | awk '{print $1}')" "$DES_SHA_P4"
+
+# Persisted --ignore-project-config ignores project roundCap=1,maxStepBacks=0 -> next-review does NOT stop after 1 dirty round!
+out=$(bash "$STATE" next-review --task "$TASK_J" --repo "$REPO_J" 2>&1)
+if printf '%s\n' "$out" | grep -Fq "PURPOSE=stop"; then
+  fail "persisted --ignore-project-config was ignored by next-review (stopped at project roundCap=1)!"
+else
+  ok "persisted --ignore-project-config propagates to next-review (ignores project roundCap=1)"
+fi
+
+# UTF-8 CLI arg decoding: takeover-run --reason "中文接管原因" writes real UTF-8 (ZERO double-encoding)!
+out=$(bash "$STATE" takeover-run --task "$TASK_J" --new-owner "owner-j2" --reason "中文接管原因" 2>&1); rc=$?
+assert_rc "takeover-run with Chinese --reason succeeds" "$rc" 0
+python3 -c '
+import json
+st = json.load(open("'"$TASK_J/research/plans/planning-state.json"'", "r", encoding="utf-8"))
+got = st["last_takeover"]["reason"]
+assert got == "中文接管原因", f"double-encoded or corrupted reason: {got!r}"
+' && ok "CLI UTF-8 --reason stored verbatim without double-encoding" || fail "CLI UTF-8 --reason was double-encoded!"
+
+# manual_redesign MUST NOT be silently cleared by prepare-design or commit-phase1!
+bash "$STATE" record-user-decision --task "$TASK_J" --repo "$REPO_J" --choice manual_redesign --reason "人工接管" >/dev/null
+out=$(bash "$STATE" prepare-design --task "$TASK_J" --repo "$REPO_J" --slots-json "$TMP/designers.json" --owner "owner-j2" 2>&1); rc=$?
+assert_rc "prepare-design blocked while manual_redesign is active (exit 3)" "$rc" 3
+bash "$STATE" clear-manual-redesign --task "$TASK_J" --reason "恢复" >/dev/null
+
+# Council 2-reviewer traceability check + convergence!
+cat > "$TMP/two-rev.json" <<'EOF'
+[
+  { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "high" },
+  { "providerInstanceId": "antigravity", "model": "gemini-4-neon", "effortKey": "thought_level", "effort": "high" }
+]
+EOF
+pr_jc=$(bash "$STATE" prepare-review --task "$TASK_J" --repo "$REPO_J" --purpose full --mode full --slots-json "$TMP/two-rev.json" --owner "owner-j2")
+PRJC_RUN=$(printf '%s\n' "$pr_jc" | sed -n 's/^RUN_ID=//p')
+PRJC_DSHA=$(printf '%s\n' "$pr_jc" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+cat > "$TMP/rev-jc-blk.json" <<EOF
+{
+  "summary": "Blocker", "mode": "full", "reviewed_design_sha256": "$PRJC_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Council blocker", "location": "design.md:1",
+    "pattern": "p", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "f", "prevent": "t", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-jc-clean.json" <<EOF
+{
+  "summary": "Clean", "mode": "full", "reviewed_design_sha256": "$PRJC_DSHA", "verdict": "clean",
+  "findings": [], "verified": [{ "id": "D1", "note": "ok" }], "step_back": [], "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_J" --run-id "$PRJC_RUN" --slot slot1 --owner "owner-j2" --owner-gen 2 --generation 2 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$PRJC_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot1 --attempt 1 --task-id "tjc-1" --child-thread-id "ctjc-1" --child-run-id "crjc-1" >/dev/null
+bash "$STATE" record-result --task "$TASK_J" --run-id "$PRJC_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot1 --attempt 1 --task-id "tjc-1" --child-run-id "crjc-1" --input "$TMP/rev-jc-blk.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_J" --run-id "$PRJC_RUN" --slot slot2 --owner "owner-j2" --owner-gen 2 --generation 2 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$PRJC_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot2 --attempt 1 --task-id "tjc-2" --child-thread-id "ctjc-2" --child-run-id "crjc-2" >/dev/null
+bash "$STATE" record-result --task "$TASK_J" --run-id "$PRJC_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot2 --attempt 1 --task-id "tjc-2" --child-run-id "crjc-2" --input "$TMP/rev-jc-clean.json" >/dev/null
+out=$(bash "$STATE" finish-review-round --task "$TASK_J" --repo "$REPO_J" --merged-input "$TMP/rev-jc-clean.json" 2>&1); rc=$?
+assert_rc "council finish-review-round rejects dropping BLOCKER without --dismissed-findings" "$rc" 3
+cat > "$TMP/dism-jc.json" <<'EOF'
+[{ "slot": "slot1", "title": "Council blocker", "severity": "BLOCKER", "code_evidence": "src/app.py:1 verified safe" }]
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_J" --repo "$REPO_J" --merged-input "$TMP/rev-jc-clean.json" --dismissed-findings "$TMP/dism-jc.json" 2>&1); rc=$?
+assert_rc "council finish-review-round accepts evidenced --dismissed-findings (clean round 1)" "$rc" 0
+
+# Confirmation full clean round 2 -> converged!
+pr_jc2=$(bash "$STATE" prepare-review --task "$TASK_J" --repo "$REPO_J" --purpose confirmation-full --mode full --slots-json "$TMP/single-rev.json" --owner "owner-j2")
+PRJC2_RUN=$(printf '%s\n' "$pr_jc2" | sed -n 's/^RUN_ID=//p')
+bash "$STATE" claim-slot --task "$TASK_J" --run-id "$PRJC2_RUN" --slot slot1 --owner "owner-j2" --owner-gen 2 --generation 2 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_J" --run-id "$PRJC2_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot1 --attempt 1 --task-id "tjc2-1" --child-thread-id "ctjc2-1" --child-run-id "crjc2-1" >/dev/null
+bash "$STATE" record-result --task "$TASK_J" --run-id "$PRJC2_RUN" --generation 2 --owner "owner-j2" --owner-gen 2 --slot slot1 --attempt 1 --task-id "tjc2-1" --child-run-id "crjc2-1" --input "$TMP/rev-jc-clean.json" >/dev/null
+out=$(bash "$STATE" finish-review-round --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "confirmation full round converges cleanly" "$rc" 0
+assert_contains "CONVERGED=1" "$out" "CONVERGED=1"
+
+# Phase 5 with Chinese invariant_id / guard_test / review_md_entry MUST PASS!
+cat > "$TASK_J/implement.md" <<'EOF'
+# 实施计划
+- 实现 不变量-1，补充 回归测试-并发锁，并在实施 PR 中更新 中文/REVIEW.md#禁止裸写sql。
+EOF
+cat > "$TASK_J/implement.jsonl" <<'EOF'
+{"file": "中文/REVIEW.md", "reason": "Chinese path JSONL verification"}
+EOF
+cat > "$TASK_J/check.jsonl" <<'EOF'
+{"file": ".trellis/spec/core.md", "reason": "Check spec"}
+EOF
+out=$(bash "$STATE" commit-phase5 --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "Phase 5 passes Chinese codified invariant/guard_test/review_md_entry & non-ASCII JSONL path" "$rc" 0
+
+# Phase 6 ready + activate-task with concurrent takeover-run blocked by .activation.lock!
+bash "$STATE" commit-phase6-ready --task "$TASK_J" --repo "$REPO_J" --authorization "impl" >/dev/null
+export TRELLIS_CONTEXT_ID="ctx-r2"
+MOCK_PID_J="$TMP/j-taskpy.pid"
+rm -f "$MOCK_PID_J"
+MOCK_START_MODE=sleep_long MOCK_START_SLEEP=1.5 MOCK_START_PID_FILE="$MOCK_PID_J" \
+  bash "$STATE" activate-task --task "$TASK_J" --repo "$REPO_J" --owner "owner-j2" --authorization "impl" >"$TMP/act-j.out" 2>&1 &
+ACT_J_PID=$!
+for _w in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  [ -s "$MOCK_PID_J" ] && break
+  sleep 0.1
+done
+# While task.py start is running, takeover-run AND other write entrypoints MUST be blocked (exit 5) and NEVER bump generation!
+out_tk=$(bash "$STATE" takeover-run --task "$TASK_J" --new-owner "owner-j3" --reason "concurrent takeover" 2>&1); rc_tk=$?
+assert_rc "takeover-run blocked (exit 5) while Phase 6 holds .activation.lock" "$rc_tk" 5
+assert_contains "ACTIVATION_IN_PROGRESS=1 on takeover-run" "$out_tk" "ACTIVATION_IN_PROGRESS=1"
+out_p4r=$(bash "$STATE" commit-phase4-revision --task "$TASK_J" --repo "$REPO_J" 2>&1); rc_p4r=$?
+assert_rc "commit-phase4-revision blocked (exit 5) while Phase 6 holds .activation.lock" "$rc_p4r" 5
+wait "$ACT_J_PID"; rc_aj=$?
+assert_rc "activate-task finishes cleanly without generation mismatch" "$rc_aj" 0
+assert_contains "ACTIVATED=1" "$(cat "$TMP/act-j.out")" "ACTIVATED=1"
+
+# Re-running commit-phase5 with identical inputs MUST be idempotent and PRESERVE activated state (preventing duplicate after_start)!
+out_p5i=$(bash "$STATE" commit-phase5 --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "re-running commit-phase5 with identical inputs is idempotent (exit 0)" "$rc" 0
+assert_contains "PHASE5_IDEMPOTENT=1" "$out_p5i" "PHASE5_IDEMPOTENT=1"
+assert_contains "PHASE6_STATE=activated preserved" "$out_p5i" "PHASE6_STATE=activated"
+out_p6d=$(bash "$STATE" commit-phase6-ready --task "$TASK_J" --repo "$REPO_J" --authorization "impl" 2>&1); rc=$?
+assert_rc "commit-phase6-ready still refuses downgrading preserved activated state" "$rc" 3
+# Editing implement.md while task.json.status is STILL in_progress MUST ALSO refuse wiping activated!
+cp "$TASK_J/implement.md" "$TMP/imp-j.bak"
+printf '\n- Extra edit while already in_progress\n' >> "$TASK_J/implement.md"
+out_p5w=$(bash "$STATE" commit-phase5 --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "commit-phase5 refuses wiping activated while task.json.status is in_progress" "$rc" 3
+cp "$TMP/imp-j.bak" "$TASK_J/implement.md"
+
+# _probe_trellis_current exit-code & key checks: exit 7 + {"current_task":null} AND exit 2 + {"error":...} MUST fail closed!
+# Set up an activation_uncertain state cleanly (task.json back to planning + new implement.md + crash_after_ptr)
+cat > "$TASK_J/task.json" <<'EOF'
+{ "id": "01-r2", "title": "R2 Hardening", "status": "planning" }
+EOF
+rm -rf "$REPO_J/.trellis/.mock-ptrs"
+printf '\n- Re-arm for probe exit-code test\n' >> "$TASK_J/implement.md"
+bash "$STATE" commit-phase5 --task "$TASK_J" --repo "$REPO_J" >/dev/null
+bash "$STATE" commit-phase6-ready --task "$TASK_J" --repo "$REPO_J" --authorization "impl" >/dev/null
+MOCK_START_MODE=crash_after_ptr T3_TRI_PLAN_TEST_CRASH_AFTER_START=1 bash "$STATE" activate-task --task "$TASK_J" --repo "$REPO_J" --owner "owner-j2" --authorization "impl" >/dev/null 2>&1
+# While state is 'activating' (lock released after simulated crash), takeover-run MUST STILL fail closed (exit 3)!
+out_tka=$(bash "$STATE" takeover-run --task "$TASK_J" --new-owner "owner-j3" --reason "during activating" 2>&1); rc=$?
+assert_rc "takeover-run blocked (exit 3) while Phase 6 is activating" "$rc" 3
+# Probe exit 2 with {"error":...} -> recover-activation MUST fail closed as probe_failed (NOT unstarted)!
+rm -rf "$REPO_J/.trellis/.mock-ptrs"
+out=$(MOCK_CURRENT_MODE=exit2_error bash "$STATE" recover-activation --task "$TASK_J" --repo "$REPO_J" 2>&1); rc=$?
+assert_rc "recover-activation fails closed on exit 2 JSON error object" "$rc" 3
+assert_contains "RECOVERY_CASE=probe_failed on exit2_error" "$out" "RECOVERY_CASE=probe_failed"
+# Probe exit 7 with {"current_task":null} -> resolve-activation reset_to_ready MUST fail closed (exit 3)!
+out=$(MOCK_CURRENT_MODE=exit7_null bash "$STATE" resolve-activation --task "$TASK_J" --repo "$REPO_J" --resolution reset_to_ready --evidence "probe test" 2>&1); rc=$?
+assert_rc "resolve-activation reset_to_ready rejects exit 7 even with valid null JSON" "$rc" 3
+# Probe exit 0 with missing current_task key -> ALSO fails closed!
+out=$(MOCK_CURRENT_MODE=exit0_missing_key bash "$STATE" resolve-activation --task "$TASK_J" --repo "$REPO_J" --resolution reset_to_ready --evidence "probe test" 2>&1); rc=$?
+assert_rc "resolve-activation reset_to_ready rejects JSON missing current_task key" "$rc" 3
+# And while activation_uncertain, takeover-run MUST still be blocked (exit 3)!
+out=$(bash "$STATE" takeover-run --task "$TASK_J" --new-owner "owner-j3" --reason "during uncertain" 2>&1); rc=$?
+assert_rc "takeover-run blocked (exit 3) while Phase 6 is activation_uncertain" "$rc" 3
+
+# J4. TriTx::_git fails closed on SIGTERM (does NOT treat $? >> 8 == 0 as success)!
+SHIM_BIN="$TMP/git-sigterm-bin"
+mkdir -p "$SHIM_BIN"
+REAL_GIT=$(command -v git)
+cat > "$SHIM_BIN/git" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = "diff-index" ]; then
+    kill -TERM \$\$
+  fi
+done
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$SHIM_BIN/git"
+out=$(PATH="$SHIM_BIN:$PATH" perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'compute_worktree_fp($ARGV[0], "")' "$REPO_J" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && assert_contains "TriTx::_git SIGTERM fails closed with rc=143" "$out" "rc=143" || fail "TriTx::_git treated SIGTERM as rc=0!"
 
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

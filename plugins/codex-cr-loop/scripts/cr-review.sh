@@ -248,26 +248,118 @@ tree_fp_v2() {
   tidx=$(mktemp "${TMPDIR:-/tmp}/cr-tf2i.XXXXXX") || { rm -f "$tdiff"; return 1; }
   twt=$(mktemp "${TMPDIR:-/tmp}/cr-tf2w.XXXXXX") || { rm -f "$tdiff" "$tidx"; return 1; }
   tuntr=$(mktemp "${TMPDIR:-/tmp}/cr-tf2u.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt"; return 1; }
-  tman=$(mktemp "${TMPDIR:-/tmp}/cr-tf2m.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr"; return 1; }
+  tstage=$(mktemp "${TMPDIR:-/tmp}/cr-tf2s.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr"; return 1; }
+  tman=$(mktemp "${TMPDIR:-/tmp}/cr-tf2m.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage"; return 1; }
   if ! git -C "$ROOT" diff HEAD --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tdiff" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
   if ! git -C "$ROOT" diff --cached --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tidx" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
   if ! git -C "$ROOT" diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$twt" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
-  dh=$(git -C "$ROOT" hash-object --stdin < "$tdiff" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
-  ih=$(git -C "$ROOT" hash-object --stdin < "$tidx" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
-  wh=$(git -C "$ROOT" hash-object --stdin < "$twt" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  dh=$(git -C "$ROOT" hash-object --stdin < "$tdiff" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  ih=$(git -C "$ROOT" hash-object --stdin < "$tidx" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  wh=$(git -C "$ROOT" hash-object --stdin < "$twt" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   if ! git -C "$ROOT" ls-files --others --exclude-standard -z > "$tuntr" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
-  perl -e '
+  if ! git -C "$ROOT" ls-files --stage -z > "$tstage" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
+  fi
+  perl -MDigest::SHA=sha256_hex -e '
     use strict;
     use warnings;
-    my ($root, $dh, $ih, $wh, $untr_file, $man_file) = @ARGV;
+    my ($root, $dh, $ih, $wh, $untr_file, $stage_file, $man_file) = @ARGV;
+
+    sub run_git_raw {
+      my ($dir, @args) = @_;
+      open(my $ph, "-|", "git", "-C", $dir, @args) or return (1, "");
+      binmode($ph, ":raw");
+      local $/;
+      my $out = <$ph>;
+      my $closed = close $ph;
+      my $st = $?;
+      my $rc = (!$closed && $st == 0) ? 1 : (!defined($st) || $st == -1) ? 127 : ($st & 127) ? (128 + ($st & 127)) : ($st >> 8);
+      return ($rc, defined $out ? $out : "");
+    }
+
+    sub hash_file_raw {
+      my ($f) = @_;
+      open(my $fh, "<:raw", $f) or exit 1;
+      my $ctx = Digest::SHA->new(256);
+      $ctx->addfile($fh);
+      close $fh or exit 1;
+      return $ctx->hexdigest;
+    }
+
+    my $hash_git_repo;
+    $hash_git_repo = sub {
+      my ($dir, $depth) = @_;
+      exit 1 if $depth > 8;
+      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "HEAD");
+      $sh =~ s/\s+//g;
+      if ($rc_h != 0 || !length $sh) {
+        my ($rc_sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
+        exit 1 unless $rc_sym == 0;
+        $sh = "UNBORN";
+      }
+      my $ctx = Digest::SHA->new(256);
+      $ctx->add("head\0$sh\0");
+      if ($sh ne "UNBORN") {
+        my ($rc_d, $d_out) = run_git_raw($dir, "diff", "HEAD", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+        exit 1 unless $rc_d == 0;
+        $ctx->add("diff_head\0" . sha256_hex($d_out) . "\0");
+        my ($rc_c, $c_out) = run_git_raw($dir, "diff", "--cached", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+        exit 1 unless $rc_c == 0;
+        $ctx->add("diff_cached\0" . sha256_hex($c_out) . "\0");
+      } else {
+        my ($rc_st, $st_out) = run_git_raw($dir, "ls-files", "--stage", "-z");
+        exit 1 unless $rc_st == 0;
+        $ctx->add("stage_unborn\0" . sha256_hex($st_out) . "\0");
+      }
+      my ($rc_w, $w_out) = run_git_raw($dir, "diff", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+      exit 1 unless $rc_w == 0;
+      $ctx->add("diff_wt\0" . sha256_hex($w_out) . "\0");
+
+      my ($rc_u, $u_out) = run_git_raw($dir, "ls-files", "--others", "--exclude-standard", "-z");
+      exit 1 unless $rc_u == 0;
+      for my $up (sort grep { length $_ } split(/\0/, $u_out)) {
+        my $ufull = "$dir/$up";
+        if (-l $ufull) {
+          my $tgt = readlink($ufull); defined $tgt or exit 1;
+          $ctx->add("ul\0$up\0$tgt\0");
+        } elsif (-f $ufull) {
+          my $ex = (-x $ufull) ? "x" : "f";
+          $ctx->add("uf\0$ex\0$up\0" . hash_file_raw($ufull) . "\0");
+        } elsif (-d $ufull && -e "$ufull/.git") {
+          $ctx->add("ug\0$up\0" . $hash_git_repo->($ufull, $depth + 1) . "\0");
+        } elsif (-d $ufull) {
+          $ctx->add("ud\0$up\0");
+        } else {
+          $ctx->add("uo\0$up\0");
+        }
+      }
+      my ($rc_gs, $gs_out) = run_git_raw($dir, "ls-files", "--stage", "-z");
+      exit 1 unless $rc_gs == 0;
+      my %sub_nested;
+      for my $ent (split(/\0/, $gs_out)) {
+        if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+          $sub_nested{$2} = $1;
+        }
+      }
+      for my $sp (sort keys %sub_nested) {
+        my $sfull = "$dir/$sp";
+        if (-d $sfull && -e "$sfull/.git") {
+          $ctx->add("sub\0$sp\0$sub_nested{$sp}\0" . $hash_git_repo->($sfull, $depth + 1) . "\0");
+        } else {
+          $ctx->add("sub_absent\0$sp\0$sub_nested{$sp}\0");
+        }
+      }
+      return $ctx->hexdigest;
+    };
+
     open(my $uf, "<:raw", $untr_file) or exit 1;
     local $/ = "\0";
     my @paths;
@@ -279,8 +371,29 @@ tree_fp_v2() {
     }
     close $uf;
     @paths = sort @paths;
+
+    open(my $sf, "<:raw", $stage_file) or exit 1;
+    my %gitlinks;
+    while (defined(my $ent = <$sf>)) {
+      chomp $ent;
+      if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+        $gitlinks{$2} = $1;
+      }
+    }
+    close $sf;
+
     open(my $mf, ">:raw", $man_file) or exit 1;
     print $mf "tracked\t$dh\nindex\t$ih\nworktree\t$wh\n";
+    for my $sp (sort keys %gitlinks) {
+      my $full = "$root/$sp";
+      my $ep = $sp; $ep =~ s/\\/\\\\/g; $ep =~ s/\n/\\n/g; $ep =~ s/\t/\\t/g;
+      if (-d $full && -e "$full/.git") {
+        my $sub_h = $hash_git_repo->($full, 1);
+        print $mf "submodule\t$gitlinks{$sp}\t$sub_h\t$ep\n";
+      } else {
+        print $mf "submodule_uninit\t$gitlinks{$sp}\t$ep\n";
+      }
+    }
     for my $p (@paths) {
       my $full = "$root/$p";
       my $ep = $p; $ep =~ s/\\/\\\\/g; $ep =~ s/\n/\\n/g; $ep =~ s/\t/\\t/g;
@@ -299,14 +412,8 @@ tree_fp_v2() {
         print $mf "file\t$exec\t$oid\t$ep\n";
       } elsif (-d $full) {
         if (-e "$full/.git") {
-          open(my $gh, "-|", "git", "-C", $full, "rev-parse", "HEAD") or exit 1;
-          my $sh = <$gh>; close $gh;
-          $sh = defined($sh) ? $sh : ""; chomp $sh;
-          open(my $gs, "-|", "git", "-C", $full, "status", "--porcelain=v1", "-z") or exit 1;
-          local $/; my $st = <$gs>; close $gs or exit 1;
-          $st = "" unless defined $st;
-          my $st_hex = unpack("H*", $st);
-          print $mf "gitdir\t$sh\t$st_hex\t$ep\n";
+          my $sub_h = $hash_git_repo->($full, 1);
+          print $mf "gitdir\t$sub_h\t$ep\n";
         } else {
           print $mf "dir\t$ep\n";
         }
@@ -315,10 +422,10 @@ tree_fp_v2() {
       }
     }
     close $mf or exit 1;
-  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   vh=$(git -C "$ROOT" hash-object --stdin < "$tman" 2>/dev/null)
   rc=$?
-  rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"
+  rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"
   [ "$rc" -eq 0 ] && [ -n "$vh" ] || return 1
   printf 'v2:%s\n' "$vh"
 }
@@ -443,14 +550,16 @@ write_prompt() {
 
 cmd_init() {
   resolve_paths; resolve_knobs; ensure_state
+  conv_head=$(sget post_rebase_confirmed_head); conv_base=$(sget post_rebase_confirmed_base_sha)
+  if [ -z "$conv_head" ]; then conv_head=$(sget base_converged_head); conv_base=$(sget base_converged_base_sha); fi
   printf 'CR_REVIEW_VERSION=%s\nBRANCH=%s\nSTATE_DIR=%s\nLEDGER=%s\n' "$SELF_VERSION" "$BRANCH" "$STATE_DIR" "$LEDGER"
   printf 'ROUND_CAP=%s\nMAX_STEP_BACKS=%s\nSKIP_P3=%s\nREVIEW_EFFORT=%s\nREVIEW_MODEL=%s\n' \
     "$ROUND_CAP" "$MAX_STEP_BACKS" "$SKIP_P3" "$EFFORT" "${MODEL:-<codex default>}"
   printf 'ROUNDS_TOTAL=%s\nDIRTY_SINCE_STEP_BACK=%s\nSTEP_BACKS_DONE=%s\nLAST_REVIEWED_HEAD=%s\nCLASSES=%s\n' \
     "$(snum rounds_total)" "$(snum dirty_since_step_back)" "$(snum step_backs_done)" \
     "$(sget last_reviewed_head)" "$(( $(snum next_class_id) - 1 ))"
-  printf 'CLEAN_STREAK=%s\nLAST_CLEAN_HEAD=%s\nLAST_CLEAN_MODE=%s\n' \
-    "$(snum clean_streak)" "$(sget last_clean_head)" "$(sget last_clean_mode)"
+  printf 'CLEAN_STREAK=%s\nLAST_CLEAN_HEAD=%s\nLAST_CLEAN_MODE=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\n' \
+    "$(snum clean_streak)" "$(sget last_clean_head)" "$(sget last_clean_mode)" "$conv_head" "$conv_base"
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ]; then printf 'CURRENT_ROUND=%s (%s)\n' "$cur" "$(round_state "$cur")"; fi
   command -v codex >/dev/null 2>&1 && printf 'CODEX=%s\n' "$(command -v codex)" || printf 'CODEX=missing\n'
@@ -497,11 +606,13 @@ cmd_next() {
   # Already converged on this exact binding (only when caller did not override --clean-streak)
   if [ "$cs_explicit" -eq 0 ]; then
     if [ "$cs" -ge 2 ] && [ "$lcm" = "full" ]; then
-      printf 'MODE=converged\nCLEAN_STREAK=%s\nREASON=already converged on this HEAD/base/policy\n' "$cs"
+      printf 'MODE=converged\nCLEAN_STREAK=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\nREASON=already converged on this HEAD/base/policy\n' \
+        "$cs" "$head" "$(sget last_clean_base_sha)"
       return 0
     fi
     if [ -n "$bch" ] && [ "$bch" = "$head" ] && [ "$bcp" = "$SKIP_P3" ] && { [ -z "$base_sha" ] || [ "$bcb" = "$base_sha" ]; }; then
-      printf 'MODE=converged\nCLEAN_STREAK=%s\nREASON=recorded convergence already holds for this HEAD/base/policy\n' "$cs"
+      printf 'MODE=converged\nCLEAN_STREAK=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\nREASON=recorded convergence already holds for this HEAD/base/policy\n' \
+        "$cs" "$bch" "$bcb"
       return 0
     fi
   fi
@@ -1060,7 +1171,8 @@ cmd_mark_converged() {
 
   commit_tx "$tx_dir" mark-converged
   rm -rf "$tx_dir"
-  printf 'CONVERGED=%s\n' "$head"
+  if [ "$post_rebase" -eq 1 ]; then conv_base="$base_sha"; else conv_base="$lcb"; fi
+  printf 'CONVERGED=%s\nBASE_SHA=%s\n' "$head" "$conv_base"
 }
 
 cmd_release_state() {
@@ -1068,8 +1180,11 @@ cmd_release_state() {
   action="${1:-get}"; [ $# -gt 0 ] && shift
   case "$action" in
     get)
-      printf 'PRE_REBASE_HEAD=%s\nPINNED_REMOTE_HEAD_SHA=%s\nTARGET_BASE_SHA=%s\nREBASED_IN_8_0=%s\n' \
-        "$(sget rel_pre_rebase_head)" "$(sget rel_pinned_remote_head_sha)" "$(sget rel_target_base_sha)" "$(snum rel_rebased_in_8_0)"
+      conv_head=$(sget post_rebase_confirmed_head); conv_base=$(sget post_rebase_confirmed_base_sha)
+      if [ -z "$conv_head" ]; then conv_head=$(sget base_converged_head); conv_base=$(sget base_converged_base_sha); fi
+      printf 'PRE_REBASE_HEAD=%s\nPINNED_REMOTE_HEAD_SHA=%s\nTARGET_BASE_SHA=%s\nREBASED_IN_8_0=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\n' \
+        "$(sget rel_pre_rebase_head)" "$(sget rel_pinned_remote_head_sha)" "$(sget rel_target_base_sha)" "$(snum rel_rebased_in_8_0)" \
+        "$conv_head" "$conv_base"
       ;;
     set)
       [ $# -gt 0 ] || die "release-state set: at least one KEY=VAL required"

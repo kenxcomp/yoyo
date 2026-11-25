@@ -23,38 +23,39 @@ Run the shared T3 Code multi-model review protocol from `<PLUGIN_ROOT>/reference
    - Fetch base: `git fetch "$REMOTE" "$CR_PR_BASE" --quiet` (abort on failure).
    - Check `bash "$T3_STATE" tree-clean` prints `TREE=clean`.
    - Record `START=$(git rev-parse HEAD)` and `FEATURE_BRANCH=$(git branch --show-current)` (abort on detached HEAD or `FEATURE_BRANCH == $CR_PR_BASE`).
-   - Verify `BASE` and `$PR_TARGET_REF` resolve, AND verify `BASE` covers the PR diff (`PR_MB=$(git merge-base "$PR_TARGET_REF" HEAD)`; require `BASE` is ancestor of or equal to `$PR_MB` so no `PR_MB..BASE` commits are skipped).
-   - **Base-currency gate** (`CR_LOOP_REQUIRE_REBASED=1`): check `git merge-base --is-ancestor "$BASE" HEAD`; if stale, ask user **(A) Rebase first** (`git rebase "$BASE"`) or **(B) Abort**. Never auto-rebase at preflight.
-3. **Steps 2–7 — Review Loop**: run protocol Steps 2–7 with `BASE`.
+   - Verify `BASE` and `$PR_TARGET_REF` resolve.
+   - **Base-currency gate** (`CR_LOOP_REQUIRE_REBASED=1`, runs BEFORE the explicit-`$BASE` coverage check so a stale branch always gets the rebase prompt first): require BOTH `git merge-base --is-ancestor "$BASE" HEAD` AND `git merge-base --is-ancestor "$PR_TARGET_REF" HEAD`; if stale, ask user **(A) Rebase first** (`git rebase "$PR_TARGET_REF"`, or `git rebase "$BASE"` when explicit) or **(B) Abort**. Never auto-rebase at preflight.
+   - **PR diff coverage check**: compute `PR_MB=$(git merge-base "$PR_TARGET_REF" HEAD)` and `BASE_MB=$(git merge-base "$BASE" HEAD)`; verify `git merge-base --is-ancestor "$BASE_MB" "$PR_MB"`. When default `BASE` equals `$PR_TARGET_REF`, `BASE_MB == PR_MB` (works even with `CR_LOOP_REQUIRE_REBASED=0` when target is ahead). If an explicit `$EXPLICIT_BASE` sits strictly ahead of `$PR_MB`, abort so no `PR_MB..BASE_MB` commits escape review.
+3. **Steps 2–7 — Review Loop**: run protocol Steps 2–7 with `BASE`. Capture the **immutable** `REVIEWED_BASE_SHA` (40-char commit SHA) from `mark-converged`'s `BASE_SHA=` output (or `t3-cr-state.sh release-state get`'s `CONVERGED_BASE_SHA=`). **Never** re-resolve a mutable ref like `$REMOTE/$CR_PR_BASE` for Step 8 coverage checks!
 4. **Step 8 — Auto-Rebase, Coverage Check, Push & PR** (after convergence):
 
    ### 8.0 Pre-Rebase Checks, Release Intent & Post-Rebase Confirmation (`CR_PR_AUTO_REBASE != 0`)
-   1. **Verify branch & HEAD BEFORE touching git history**: confirm `git branch --show-current == $FEATURE_BRANCH`, `tree-clean == TREE=clean`, and `git rev-parse HEAD == $LAST_REVIEWED_HEAD`.
+   1. **Verify branch & HEAD BEFORE touching git history**: confirm `git branch --show-current == $FEATURE_BRANCH`, `tree-clean == TREE=clean`, and `git rev-parse HEAD == $LAST_REVIEWED_HEAD`. Also confirm `REVIEWED_BASE_SHA` is the immutable SHA from `release-state get` (`CONVERGED_BASE_SHA=`) / `mark-converged` (`BASE_SHA=`).
    2. **Re-fetch PR target & upstream feature branch**:
       - `git fetch "$REMOTE" "$CR_PR_BASE" --quiet` (defer `pr-deferred-fetch-failed` on error); `NEW_BASE_TIP=$(git rev-parse "$PR_TARGET_REF")`.
       - Check `bash "$T3_STATE" release-state get`. If upstream points to `$REMOTE/$FEATURE_BRANCH` and `PINNED_REMOTE_HEAD_SHA` is not yet persisted:
         - `git fetch "$REMOTE" "$FEATURE_BRANCH" --quiet`.
         - Set `PINNED_REMOTE_HEAD_SHA=$(git rev-parse "refs/remotes/$REMOTE/$FEATURE_BRANCH")` and verify `git merge-base --is-ancestor "$PINNED_REMOTE_HEAD_SHA" "$LAST_REVIEWED_HEAD"` (if not, remote has unseen commits → defer immediately with `push-rejected`).
-   3. **Check whether rebase or coverage confirmation is needed**:
-      - Compute `PR_MB=$(git merge-base "$NEW_BASE_TIP" "$LAST_REVIEWED_HEAD")` and `REVIEWED_BASE_SHA=$(git rev-parse "$BASE^{commit}")`.
-      - If `NEW_BASE_TIP` is ancestor of `$LAST_REVIEWED_HEAD` AND `REVIEWED_BASE_SHA` is at or before `$PR_MB`: no rebase and no extra round needed; proceed to Preconditions.
+   3. **Check whether rebase or coverage confirmation is needed (using immutable `$REVIEWED_BASE_SHA`)**:
+      - Compute `PR_MB=$(git merge-base "$NEW_BASE_TIP" "$LAST_REVIEWED_HEAD")`. Do NOT re-resolve `$BASE`; use the persisted immutable `REVIEWED_BASE_SHA`.
+      - If `git merge-base --is-ancestor "$NEW_BASE_TIP" "$LAST_REVIEWED_HEAD"` succeeds AND `git merge-base --is-ancestor "$REVIEWED_BASE_SHA" "$PR_MB"` succeeds: no rebase and no extra round needed; proceed to Preconditions.
       - **If `NEW_BASE_TIP` is NOT ancestor of `$LAST_REVIEWED_HEAD`**:
         - **Persist release intent BEFORE calling `git rebase`** so a crash right after rebase succeeds preserves the pre-rebase lease target and `REBASED_IN_8_0=1`:
           `bash "$T3_STATE" release-state set rel_pre_rebase_head="${PRE_REBASE_HEAD:-$LAST_REVIEWED_HEAD}" rel_pinned_remote_head_sha="${PINNED_REMOTE_HEAD_SHA:-}" rel_target_base_sha="$NEW_BASE_TIP" rel_rebased_in_8_0=1`.
         - Run `git rebase "$NEW_BASE_TIP"`.
         - On conflict: capture `git diff --name-only --diff-filter=U`, run `git rebase --abort`; clear `release-state` ONLY if no earlier 8.0 rebase had already succeeded in this cycle (prior `REBASED_IN_8_0 == 0` and `HEAD == PRE_REBASE_HEAD`); defer with `pr-deferred-rebase-conflict`.
         - On clean rebase: `rel_rebased_in_8_0=1` is already persisted; **update `BASE="$NEW_BASE_TIP"`** across the entire remainder of the flow.
-      - **If `NEW_BASE_TIP` IS ancestor of `$LAST_REVIEWED_HEAD` but `$REVIEWED_BASE_SHA` was strictly ahead of `$PR_MB`**: do not rebase, **update `BASE="$NEW_BASE_TIP"`**.
-      - **Run one `post-rebase-confirmation` round** (default single reviewer, `MODE=full` against updated `BASE` via protocol Steps 3b–3d):
-        - **Clean** (or P3-only with `SKIP_P3=1`, or acked `needs-human` via 4h): run `bash "$T3_STATE" mark-converged --post-rebase --base "$BASE" --round "$ROUND_DIR"`, set `LAST_REVIEWED_HEAD=$REVIEWED_HEAD`, continue to Preconditions.
+      - **If `NEW_BASE_TIP` IS ancestor of `$LAST_REVIEWED_HEAD` but `$REVIEWED_BASE_SHA` is NOT an ancestor of `$PR_MB` (coverage gap or target rewind)**: do not rebase, **update `BASE="$NEW_BASE_TIP"`**.
+      - **Run one `post-rebase-confirmation` round** (default single reviewer, `MODE=full` against updated `BASE="$NEW_BASE_TIP"` via protocol Steps 3b–3d):
+        - **Clean** (or P3-only with `SKIP_P3=1`, or acked `needs-human` via 4h): run `bash "$T3_STATE" mark-converged --post-rebase --base "$NEW_BASE_TIP" --round "$ROUND_DIR"`, update `LAST_REVIEWED_HEAD=$REVIEWED_HEAD` and `REVIEWED_BASE_SHA=$NEW_BASE_TIP`, continue to Preconditions.
         - **Dirty**: fix (Steps 5–6) and return to **Step 3** using updated `BASE="$NEW_BASE_TIP"` to re-converge with **two full clean rounds** while keeping `rel_pinned_remote_head_sha` and `rel_rebased_in_8_0=1` persisted.
 
    ### Preconditions (Re-verified Immediately Before Push, Including `CR_PR_AUTO_REBASE=0`)
    - **(a)** `bash "$T3_STATE" tree-clean` prints `TREE=clean`.
    - **(b)** `[ "$(git branch --show-current)" = "$FEATURE_BRANCH" ]` and `[ "$(git rev-parse HEAD)" = "$LAST_REVIEWED_HEAD" ]`.
    - **(c)** `[ "$FEATURE_BRANCH" != "$CR_PR_BASE" ]`.
-   - **(d)** Unless `REBASED_IN_8_0=1`, if upstream is set, `BASE` is ancestor of `@{u}`.
-   - **(e) Unified pre-push PR target coverage check**: re-fetch `git fetch "$REMOTE" "$CR_PR_BASE" --quiet`, resolve `PR_TARGET_TIP`, compute `PR_MB=$(git merge-base "$PR_TARGET_TIP" "$LAST_REVIEWED_HEAD")`. Require BOTH `git merge-base --is-ancestor "$PR_TARGET_TIP" "$LAST_REVIEWED_HEAD"` AND `git merge-base --is-ancestor "$BASE" "$PR_MB" || [ "$BASE" = "$PR_MB" ]` (catches both target advance AND target rewind). Defer on failure.
+   - **(d)** Unless `REBASED_IN_8_0=1`, if upstream is set, `git merge-base --is-ancestor "$REVIEWED_BASE_SHA" "$UPSTREAM"`.
+   - **(e) Unified pre-push PR target coverage check (using immutable `$REVIEWED_BASE_SHA`)**: re-fetch `git fetch "$REMOTE" "$CR_PR_BASE" --quiet`, resolve `PR_TARGET_TIP`, compute `PR_MB=$(git merge-base "$PR_TARGET_TIP" "$LAST_REVIEWED_HEAD")`. Require BOTH `git merge-base --is-ancestor "$PR_TARGET_TIP" "$LAST_REVIEWED_HEAD"` AND `git merge-base --is-ancestor "$REVIEWED_BASE_SHA" "$PR_MB"` (catches both target advance AND target rewind behind the actually reviewed baseline). Defer on failure.
    - **(f) Target repository verification**: confirm once more before pushing/creating PR whether T3 native PR tools match the target repo of `$REMOTE` (otherwise switch to `gh --repo <owner/repo>`).
 
    ### Push (Always Explicit Reviewed SHA Refspec)
@@ -62,7 +63,7 @@ Run the shared T3 Code multi-model review protocol from `<PLUGIN_ROOT>/reference
    - **Upstream unset**: `git push -u "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
    - **Upstream is `$REMOTE/$FEATURE_BRANCH` and `REBASED_IN_8_0=0`**: `git push "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
    - **Upstream is `$REMOTE/$FEATURE_BRANCH` and `REBASED_IN_8_0=1`**: block for explicit user confirmation quoting BOTH `PINNED_REMOTE_HEAD_SHA` and `LAST_REVIEWED_HEAD`:
-     - **(A) Force-update PR**: immediately AFTER user confirms and BEFORE pushing, **re-verify preconditions (a), (b), and (e)** (`tree-clean`, `HEAD == $LAST_REVIEWED_HEAD`, and re-fetched PR target tip coverage — defer if anything drifted while awaiting consent), then run `git push --force-with-lease="refs/heads/$FEATURE_BRANCH:$PINNED_REMOTE_HEAD_SHA" "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
+     - **(A) Force-update PR**: immediately AFTER user confirms and BEFORE pushing, **re-verify preconditions (a), (b), and (e)** (`tree-clean`, `HEAD == $LAST_REVIEWED_HEAD`, and re-fetched PR target tip coverage against immutable `$REVIEWED_BASE_SHA` — defer if anything drifted while awaiting consent), then run `git push --force-with-lease="refs/heads/$FEATURE_BRANCH:$PINNED_REMOTE_HEAD_SHA" "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
      - **(B) Skip push**: defer with `pr-deferred-force-push-declined`.
    - Clear persisted release state (`bash "$T3_STATE" release-state clear`) once push succeeds.
 

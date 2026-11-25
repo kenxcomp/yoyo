@@ -130,6 +130,13 @@ sub ensure_no_symlink_components {
   }
 }
 
+sub _decode_git_path {
+  my ($raw) = @_;
+  return '' unless defined $raw;
+  my $dec = eval { decode('UTF-8', $raw, FB_CROAK | LEAVE_SRC) };
+  return $@ ? $raw : $dec;
+}
+
 # Deterministic recursive directory manifest (for move_dir_to_archive).
 # Rejects any symlink inside the directory.
 sub dir_tree_manifest {
@@ -149,12 +156,13 @@ sub dir_tree_manifest {
       die "EXTERNAL_CONFLICT: symlink forbidden inside managed directory at $p\n" if -l $p;
       my $rel = File::Spec->abs2rel($p, $abs_dir);
       $rel =~ s{\\}{/}g;
-      my $parent = dirname($rel);
+      my $rel_key = _decode_git_path($rel);
+      my $parent = dirname($rel_key);
       $dir_has_child{$parent} = 1 if $parent ne '.';
       if (-d $p) {
-        $empty_dirs{$rel} = 1;
+        $empty_dirs{$rel_key} = 1;
       } elsif (-f $p) {
-        $files{$rel} = sha256_file($p);
+        $files{$rel_key} = sha256_file($p);
       } else {
         die "EXTERNAL_CONFLICT: unsupported non-regular file at $p\n";
       }
@@ -622,15 +630,25 @@ sub execute_tx {
   return $tx_id;
 }
 
-# Helper to run git commands safely in $repo_root.
+# Helper to run git commands safely in $repo_root (fails closed on signals as 128+sig!).
 sub _git {
   my ($repo_root, @args) = @_;
   open(my $ph, '-|', 'git', '-C', $repo_root, @args) or return (1, '');
   binmode($ph, ':raw');
   local $/;
   my $out = <$ph>;
-  close $ph;
-  my $rc = $? >> 8;
+  my $closed = close $ph;
+  my $status = $?;
+  my $rc;
+  if (!$closed && $status == 0) {
+    $rc = 1;
+  } elsif (!defined($status) || $status == -1) {
+    $rc = 127;
+  } elsif (my $sig = $status & 127) {
+    $rc = 128 + $sig;
+  } else {
+    $rc = $status >> 8;
+  }
   return ($rc, defined $out ? $out : '');
 }
 
@@ -666,8 +684,9 @@ sub compute_worktree_fp {
     }
   }
 
-  my $engine_prefix = defined $task_rel && length $task_rel
-    ? "$task_rel/research/plans"
+  my $task_rel_key = defined $task_rel && length $task_rel ? _decode_git_path($task_rel) : '';
+  my $engine_prefix = length($task_rel_key)
+    ? "$task_rel_key/research/plans"
     : '';
 
   my $is_engine_runtime = sub {
@@ -691,9 +710,10 @@ sub compute_worktree_fp {
     if (length $raw_s) {
       for my $entry (split(/\0/, $raw_s)) {
         next unless $entry =~ /\A(\d+)\s+([0-9a-f]+)\s+\d+\t(.+)\z/s;
-        my ($mode, $blob, $p) = ($1, $2, $3);
-        next if $is_engine_runtime->($p);
-        $staged{$p} = "$mode:$blob";
+        my ($mode, $blob, $raw_p) = ($1, $2, $3);
+        my $p_key = _decode_git_path($raw_p);
+        next if $is_engine_runtime->($p_key);
+        $staged{$p_key} = "$mode:$blob";
       }
     }
   } else {
@@ -703,16 +723,17 @@ sub compute_worktree_fp {
       my @toks = split(/\0/, $raw_s);
       my $i = 0;
       while ($i + 1 < @toks) {
-        my ($meta, $p) = ($toks[$i], $toks[$i + 1]);
+        my ($meta, $raw_p) = ($toks[$i], $toks[$i + 1]);
         $i += 2;
-        next if $is_engine_runtime->($p);
-        $staged{$p} = $meta;
+        my $p_key = _decode_git_path($raw_p);
+        next if $is_engine_runtime->($p_key);
+        $staged{$p_key} = $meta;
       }
     }
   }
 
   # Collect ALL truly modified tracked paths (content-checked, fail-closed on git failure)
-  # + non-ignored untracked paths.
+  # + non-ignored untracked paths. Keep raw OS bytes for filesystem syscalls and decoded UTF-8 keys for JSON!
   my %wt_paths;
   my ($rc_m, $raw_m) = _git($repo_root, 'diff', '--no-ext-diff', '--no-renames', '--name-only', '-z');
   die "WORKTREE_FP_ERROR: git diff failed (rc=$rc_m)\n" unless $rc_m == 0;
@@ -728,16 +749,17 @@ sub compute_worktree_fp {
   $wt_paths{$_} = 1 for grep { length $_ } split(/\0/, $raw_u);
 
   my %wt_files;
-  for my $p (sort keys %wt_paths) {
-    next if $is_engine_runtime->($p);
-    my $abs = File::Spec->catfile($repo_root, $p);
+  for my $raw_p (sort keys %wt_paths) {
+    my $p_key = _decode_git_path($raw_p);
+    next if $is_engine_runtime->($p_key);
+    my $abs = File::Spec->catfile($repo_root, $raw_p);
     if (-l $abs) {
       my $lnk = readlink($abs) // '';
-      $wt_files{$p} = 'symlink:' . sha256_bytes($lnk);
+      $wt_files{$p_key} = 'symlink:' . sha256_bytes($lnk);
     } elsif (-f $abs) {
       my @st = lstat($abs);
       my $exec = (@st && ($st[2] & 0111)) ? 'x' : '-';
-      $wt_files{$p} = "file:$exec:" . sha256_file($abs);
+      $wt_files{$p_key} = "file:$exec:" . sha256_file($abs);
     } elsif (-d $abs) {
       # Dirty submodule / nested gitlink: capture its HEAD + status + diff hash instead of static 'dir'!
       if (-e "$abs/.git") {
@@ -745,15 +767,15 @@ sub compute_worktree_fp {
         $sub_h =~ s/\s+//g;
         my ($rc_sp, $sub_p) = _git($abs, 'status', '--porcelain', '--untracked-files=all', '-z');
         my ($rc_sd, $sub_d) = _git($abs, 'diff', '--no-ext-diff', 'HEAD');
-        die "WORKTREE_FP_ERROR: failed inspecting dirty submodule '$p'\n"
+        die "WORKTREE_FP_ERROR: failed inspecting dirty submodule '$p_key'\n"
           unless $rc_sp == 0 && ($rc_sh == 0 || $rc_sd == 0);
-        $wt_files{$p} = 'gitlink:' . sha256_bytes("$sub_h\0$sub_p\0$sub_d");
+        $wt_files{$p_key} = 'gitlink:' . sha256_bytes("$sub_h\0$sub_p\0$sub_d");
       } else {
         my (undef, $tsha) = dir_tree_manifest($abs);
-        $wt_files{$p} = "dir:$tsha";
+        $wt_files{$p_key} = "dir:$tsha";
       }
     } else {
-      $wt_files{$p} = 'deleted';
+      $wt_files{$p_key} = 'deleted';
     }
   }
 
@@ -836,10 +858,11 @@ sub scan_repo_rules {
   $head =~ s/\s+//g;
   $head = '' if $rc_h != 0;
 
-  my %base_rules;   # path => blob_sha256
-  my %rule_files;   # REVIEW.md paths => 1
-  my %rules_index;  # REVIEW.md#slug => 1
-  my %wt_deltas;    # path => status/sha
+  my %base_rules;   # decoded_path => blob_sha256
+  my %rule_files;   # decoded REVIEW.md paths => 1
+  my %rules_index;  # decoded REVIEW.md#slug => 1
+  my %wt_deltas;    # decoded_path => status/sha
+  my %raw_by_key;   # decoded_path => raw OS bytes path
 
   my $is_rule_name = sub {
     my ($p) = @_;
@@ -854,27 +877,29 @@ sub scan_repo_rules {
     if (length $raw_t) {
       for my $entry (split(/\0/, $raw_t)) {
         next unless $entry =~ /\A(\d+)\s+(\w+)\s+([0-9a-f]+)\t(.+)\z/s;
-        my ($mode, $objtype, $oid, $p) = ($1, $2, $3, $4);
-        next unless $is_rule_name->($p);
+        my ($mode, $objtype, $oid, $raw_p) = ($1, $2, $3, $4);
+        next unless $is_rule_name->($raw_p);
+        my $p_key = _decode_git_path($raw_p);
+        $raw_by_key{$p_key} = $raw_p;
         if ($objtype eq 'blob' && $mode ne '120000') {
           my ($rc_b, $blob) = _git($repo_root, 'cat-file', 'blob', $oid);
-          die "RULES_SCAN_ERROR: git cat-file blob $oid failed for $p (rc=$rc_b)\n" unless $rc_b == 0;
+          die "RULES_SCAN_ERROR: git cat-file blob $oid failed for $p_key (rc=$rc_b)\n" unless $rc_b == 0;
           my $bsha = sha256_bytes($blob);
-          $base_rules{$p} = "$mode:$bsha";
-          my $base = $p; $base =~ s{\A.*/}{}s;
+          $base_rules{$p_key} = "$mode:$bsha";
+          my $base = $p_key; $base =~ s{\A.*/}{}s;
           if ($base eq 'REVIEW.md') {
-            $rule_files{$p} = 1;
+            $rule_files{$p_key} = 1;
             my $blob_text = eval { decode('UTF-8', $blob, FB_CROAK | LEAVE_SRC) };
             $blob_text = $blob if $@;
             for my $line (split(/\r?\n/, $blob_text)) {
               if ($line =~ /\A#{1,6}\s+(.+?)\s*#*\s*\z/) {
                 my $slug = _slugify_heading($1);
-                $rules_index{"$p#$slug"} = 1 if length $slug;
+                $rules_index{"$p_key#$slug"} = 1 if length $slug;
               }
             }
           }
         } else {
-          $base_rules{$p} = "$mode:$objtype:$oid";
+          $base_rules{$p_key} = "$mode:$objtype:$oid";
         }
       }
     }
@@ -885,12 +910,17 @@ sub scan_repo_rules {
   my ($rc_u, $raw_u) = _git($repo_root, 'ls-files', '--others', '--exclude-standard', '-z');
   die "RULES_SCAN_ERROR: git ls-files --others failed (rc=$rc_u)\n" unless $rc_u == 0;
   if (length $raw_u) {
-    for my $p (split(/\0/, $raw_u)) {
-      $cand_paths{$p} = 1 if length($p) && $is_rule_name->($p);
+    for my $raw_p (split(/\0/, $raw_u)) {
+      if (length($raw_p) && $is_rule_name->($raw_p)) {
+        my $p_key = _decode_git_path($raw_p);
+        $raw_by_key{$p_key} = $raw_p;
+        $cand_paths{$p_key} = 1;
+      }
     }
   }
-  for my $p (sort keys %cand_paths) {
-    my $abs = File::Spec->catfile($repo_root, $p);
+  for my $p_key (sort keys %cand_paths) {
+    my $raw_p = exists $raw_by_key{$p_key} ? $raw_by_key{$p_key} : $p_key;
+    my $abs = File::Spec->catfile($repo_root, $raw_p);
     my $wt_val;
     if (-l $abs) {
       $wt_val = 'symlink:' . sha256_bytes(readlink($abs) // '');
@@ -899,13 +929,13 @@ sub scan_repo_rules {
     } else {
       $wt_val = 'deleted';
     }
-    my $base_v = $base_rules{$p};
+    my $base_v = $base_rules{$p_key};
     if (!defined $base_v) {
-      $wt_deltas{$p} = "added:$wt_val";
+      $wt_deltas{$p_key} = "added:$wt_val";
     } elsif ($base_v =~ /\A\d+:([0-9a-f]{64})\z/ && $wt_val eq "file:$1") {
       # unchanged
     } else {
-      $wt_deltas{$p} = "modified:$wt_val";
+      $wt_deltas{$p_key} = "modified:$wt_val";
     }
   }
 
@@ -953,7 +983,8 @@ sub compute_non_prd_baseline {
   my $fp = compute_worktree_fp($repo_root, $task_rel);
   # Filter worktree files to NON-TASK paths (so edits to repo code/specs/rules change baseline,
   # while task-internal review-rounds/ledger appends and Trellis runtime pointers do not perturb cross-round baseline).
-  my $task_prefix = defined $task_rel && length $task_rel ? "$task_rel/" : '';
+  my $task_rel_key = defined $task_rel && length $task_rel ? _decode_git_path($task_rel) : '';
+  my $task_prefix = length($task_rel_key) ? "$task_rel_key/" : '';
   my $is_trellis_runtime = sub {
     my ($p) = @_;
     return 1 if $p eq '.trellis/.current-task' || $p eq '.trellis/.developer' || $p eq '.trellis/.session-id';
@@ -984,8 +1015,9 @@ sub compute_non_prd_baseline {
         return if -d $p;
         my $rel = File::Spec->abs2rel($p, $repo_root);
         $rel =~ s{\\}{/}g;
-        if (-l $p) { $spec_shas{$rel} = 'symlink:' . sha256_bytes(readlink($p) // ''); }
-        elsif (-f $p) { $spec_shas{$rel} = sha256_file($p); }
+        my $rel_key = _decode_git_path($rel);
+        if (-l $p) { $spec_shas{$rel_key} = 'symlink:' . sha256_bytes(readlink($p) // ''); }
+        elsif (-f $p) { $spec_shas{$rel_key} = sha256_file($p); }
       },
     }, $spec_dir);
   }

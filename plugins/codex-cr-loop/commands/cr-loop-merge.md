@@ -136,11 +136,7 @@ that v1.7.0 removed are mapped. This command adds two:
      `git log --oneline "$LAST_REVIEWED_HEAD"..HEAD`.
    - **(c) The current branch is not the merge target:**
      `[ "$FEATURE_BRANCH" != "${CR_MERGE_TARGET:-main}" ]`.
-   - **(d) Every commit being merged was reviewed.** Compute
-     `MERGE_BASE=$(git merge-base "${CR_MERGE_TARGET:-main}" HEAD)`. Then require
-     `git merge-base --is-ancestor "$BASE" "$MERGE_BASE"` or
-     `[ "$BASE" = "$MERGE_BASE" ]`. Diagnostic: `git log --oneline "$BASE"..HEAD` plus
-     `git log --oneline "$MERGE_BASE".."$BASE"`.
+   - **(d) Every commit being merged was reviewed.** Obtain the **immutable** `REVIEWED_BASE_SHA` (40-char commit SHA) from the convergence record (`mark-converged`'s `BASE_SHA=` or `cr-review.sh release-state get`'s `CONVERGED_BASE_SHA=`) — **never** re-resolve a mutable branch ref such as `${CR_MERGE_TARGET:-main}` after convergence (if the local target rewound to an ancestor `B` behind the reviewed baseline `A`, re-resolving the branch name would silently skip `B..A`). Compute `MERGE_BASE=$(git merge-base "${CR_MERGE_TARGET:-main}" "$LAST_REVIEWED_HEAD")`. Then require `git merge-base --is-ancestor "$REVIEWED_BASE_SHA" "$MERGE_BASE"`. Diagnostic: `git log --oneline "$REVIEWED_BASE_SHA".."$LAST_REVIEWED_HEAD"` plus `git log --oneline "$MERGE_BASE".."$REVIEWED_BASE_SHA"`.
    - **(e) The target has no diverged commits.** Check
      `[ "$MERGE_BASE" = "$(git rev-parse "${CR_MERGE_TARGET:-main}")" ]`. If the target
      has diverged, `auto` and `no-ff` create a merge commit, while `ff-only` **defers**.
@@ -148,8 +144,8 @@ that v1.7.0 removed are mapped. This command adds two:
 
    **Merge,** once (a)–(e) hold:
 
-   - **Find out whether another worktree has the target checked out:**
-     `MAIN_WT=$(git worktree list --porcelain | awk -v t="refs/heads/${CR_MERGE_TARGET:-main}" '/^worktree / {wt=$2} $0=="branch "t {print wt; exit}')`.
+   - **Find out whether another worktree has the target checked out (space-safe):**
+     `MAIN_WT=$(git worktree list --porcelain | awk -v t="refs/heads/${CR_MERGE_TARGET:-main}" '/^worktree / {wt=$0; sub(/^worktree /, "", wt)} $0=="branch "t {print wt; exit}')`.
    - **Path A: the target is not checked out anywhere.** Map `CR_MERGE_FF` to a flag:
      `auto` → no flag, `ff-only` → `--ff-only`, `no-ff` → `--no-ff`. Then run:
      ```bash

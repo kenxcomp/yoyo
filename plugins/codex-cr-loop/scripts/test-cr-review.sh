@@ -514,5 +514,94 @@ expect "cr-tx directory target conflict fails closed" "2" "$?"
 [ -f "$SD_CR/pending.tx" ] && ok || bad "cr-tx deleted pending.tx despite directory target conflict!"
 rm -rf "$SD_CR/pending.tx" "$TX_DIR_BAD" "$SD_CR/rounds/999-full"
 
+# --- Round 2 hardening regressions: immutable BASE_SHA rewind check, dirty submodule 2nd edit, PR preflight ahead check, space worktree ---
+
+# 5. mark-converged & release-state expose immutable CONVERGED_BASE_SHA (catches target rewind B..A!)
+B_SHA=$(git rev-parse main)
+git switch -qc r2/rewind-base main
+printf 'base-a\n' > rewind-base.txt && git add rewind-base.txt && git commit -qm "base A"
+A_SHA=$(git rev-parse HEAD)
+git switch -qc r2/rewind-check "$A_SHA"
+printf 'feat-f\n' > rewind-feat.txt && git add rewind-feat.txt && git commit -qm "feat F"
+for _i in 1 2; do
+  FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base r2/rewind-base >/dev/null
+  bash "$CR" wait --timeout 30 >/dev/null
+  bash "$CR" finish >/dev/null
+done
+out_mc=$(bash "$CR" mark-converged --base r2/rewind-base)
+expect "mark-converged emits immutable BASE_SHA" "$A_SHA" "$(printf '%s\n' "$out_mc" | kv BASE_SHA)"
+expect "release-state get exposes CONVERGED_BASE_SHA" "$A_SHA" "$(bash "$CR" release-state get | kv CONVERGED_BASE_SHA)"
+# Simulate target rewind to ancestor B: mutable ref passes, immutable CONVERGED_BASE_SHA catches B..A!
+REV_BASE_SHA=$(bash "$CR" release-state get | kv CONVERGED_BASE_SHA)
+git branch -f r2/rewind-base "$B_SHA"
+PR_MB_REWIND=$(git merge-base r2/rewind-base HEAD)
+git merge-base --is-ancestor "$(git rev-parse r2/rewind-base)" "$PR_MB_REWIND" && ok || bad "rewind setup sanity failed"
+if git merge-base --is-ancestor "$REV_BASE_SHA" "$PR_MB_REWIND" 2>/dev/null; then
+  bad "immutable CONVERGED_BASE_SHA failed to detect target rewind"
+else
+  ok
+fi
+git branch -D r2/rewind-base >/dev/null 2>&1
+
+# 6. tree_fp_v2 catches a SECOND edit to an already-dirty tracked submodule file!
+SUB_REPO="$TMP/submod-src"
+mkdir -p "$SUB_REPO"
+(
+  cd "$SUB_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'sub-v1\n' > sub.txt && git add sub.txt && git commit -qm sub1
+)
+SUB_HOST="$TMP/submod-host"
+mkdir -p "$SUB_HOST"
+(
+  cd "$SUB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'host-v1\n' > host.txt && git add host.txt && git commit -qm host1
+  git -c protocol.file.allow=always submodule -q add "$SUB_REPO" vendor/sub >/dev/null 2>&1
+  git commit -qm "add submodule"
+  git switch -qc feat/submod
+  printf 'feat\n' >> host.txt && git commit -qam "feat edit"
+  # Dirty tracked submodule file BEFORE review starts!
+  printf 'dirty-1\n' >> vendor/sub/sub.txt
+  FAKE_SLEEP=1 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+  # Make a SECOND edit to the SAME already-dirty submodule file mid-round!
+  printf 'dirty-2\n' >> vendor/sub/sub.txt
+  bash "$CR" wait --timeout 30 >/dev/null
+  out_sub=$(bash "$CR" finish); rc_sub=$?
+  [ "$rc_sub" -eq 3 ] && [ "$(printf '%s\n' "$out_sub" | kv REASON)" = "tree-changed" ]
+) && ok || bad "tree_fp_v2 missed 2nd edit inside already-dirty tracked submodule!"
+
+# 7. PR preflight: default target ahead does NOT trip coverage check before Base-currency rebase prompt;
+#    explicit intermediate BASE (PR_TARGET -> E -> HEAD) STILL fails coverage check!
+PRE_REPO="$TMP/preflight-ahead"
+mkdir -p "$PRE_REPO"
+(
+  cd "$PRE_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf '1\n' > f.txt && git add f.txt && git commit -qm c1
+  git switch -qc feat/ahead
+  printf 'e\n' >> f.txt && git commit -qam e1
+  E_SHA=$(git rev-parse HEAD)
+  printf 'f\n' >> f.txt && git commit -qam f1
+  git switch -q main && printf 'm2\n' > m.txt && git add m.txt && git commit -qm m2
+  git switch -q feat/ahead
+  # Default BASE=main (ahead of HEAD): Base-currency fails (offering rebase), while BASE_MB==PR_MB passes coverage!
+  PR_MB=$(git merge-base main HEAD)
+  BASE_MB=$(git merge-base main HEAD)
+  ! git merge-base --is-ancestor main HEAD &&
+    git merge-base --is-ancestor "$BASE_MB" "$PR_MB" &&
+    ! git merge-base --is-ancestor "$(git merge-base "$E_SHA" HEAD)" "$PR_MB"
+) && ok || bad "PR preflight coverage math failed for ahead target / intermediate base"
+
+# 8. Space-safe worktree parsing preserves full worktree path containing spaces!
+SPACE_WT="$TMP/main checkout with spaces"
+git branch space-target main
+git worktree add -q "$SPACE_WT" space-target >/dev/null 2>&1
+PARSED_WT=$(git worktree list --porcelain | awk -v t="refs/heads/space-target" '/^worktree / {wt=$0; sub(/^worktree /, "", wt)} $0=="branch "t {print wt; exit}')
+REAL_SPACE_WT=$(cd "$SPACE_WT" && pwd -P)
+expect "space-safe worktree parser preserves spaces in path" "$REAL_SPACE_WT" "$PARSED_WT"
+git worktree remove -f "$SPACE_WT" >/dev/null 2>&1
+git branch -D space-target >/dev/null 2>&1
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

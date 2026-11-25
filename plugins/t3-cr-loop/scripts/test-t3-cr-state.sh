@@ -160,6 +160,28 @@ cat > "$F_DIRTY_MERGED" <<'EOF'
   "out_of_scope": []
 }
 EOF
+F_REOPEN_SLOT="$TMP/reopen-slot.json"
+cat > "$F_REOPEN_SLOT" <<'EOF'
+{
+  "summary": "C1 still missing one site.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P2",
+      "reopens": "C1",
+      "title": "Missing null guard",
+      "location": "app.txt:2",
+      "pattern": "Unchecked access",
+      "still_wrong": "Second site missed",
+      "instances": ["app.txt:2"],
+      "fix": "Validate at boundary",
+      "prevent": "Add invariant test"
+    }
+  ],
+  "step_back": [],
+  "out_of_scope": []
+}
+EOF
 F_REOPEN_MERGED="$TMP/reopen-merged.json"
 cat > "$F_REOPEN_MERGED" <<'EOF'
 {
@@ -245,14 +267,14 @@ expect "explicit finish retry idempotent" "dirty" "$(bash "$ST" finish "$RD1" --
 # --- 3. Same HEAD after dirty -> full default; commit -> incremental default; cap 3 -> step-back council; convergence -> reset ---
 expect "same HEAD after dirty -> full default" "full:default" "$(bash "$ST" next --base main | sed -n 's/^PURPOSE=//p;s/^PROFILE=//p' | paste -sd: -)"
 
-run_single_round() { # run_single_round <purpose> <mode> <base> <merged_file> [since]
-  local p="$1" m="$2" b="$3" mf="$4" s="${5:-}"
+run_single_round() { # run_single_round <purpose> <mode> <base> <merged_file> [since] [slot_file]
+  local p="$1" m="$2" b="$3" mf="$4" s="${5:-}" sf="${6:-$4}"
   local po rd
   po=$(bash "$ST" prepare --purpose "$p" --mode "$m" --base "$b" ${s:+--since "$s"} --slots s1 --owner "$OWNER") || return 9
   rd=$(printf '%s\n' "$po" | kv ROUND_DIR)
   bash "$ST" claim-slot "$rd" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{"reasoningEffort":"high"}' >/dev/null || return 9
   bash "$ST" record-dispatch "$rd" --slot s1 --attempt 1 --owner "$OWNER" --task-id "t-$rd" --child-thread-id "ct-$rd" >/dev/null || return 9
-  bash "$ST" record-result "$rd" --slot s1 --attempt 1 --owner "$OWNER" --input "$F_CLEAN" >/dev/null || return 9
+  bash "$ST" record-result "$rd" --slot s1 --attempt 1 --owner "$OWNER" --input "$sf" >/dev/null || return 9
   bash "$ST" finish "$rd" --merged "$mf"
 }
 
@@ -260,7 +282,7 @@ for i in 1 2; do
   printf 'fix %s\n' "$i" >> app.txt && git commit -qam "fix $i"
   nx=$(bash "$ST" next --base main)
   expect "incremental default round $i" "incremental:default" "$(printf '%s\n' "$nx" | kv PURPOSE):$(printf '%s\n' "$nx" | kv PROFILE)"
-  out_i=$(run_single_round incremental incremental main "$F_REOPEN_MERGED" "$(printf '%s\n' "$nx" | kv SINCE)")
+  out_i=$(run_single_round incremental incremental main "$F_REOPEN_MERGED" "$(printf '%s\n' "$nx" | kv SINCE)" "$F_REOPEN_SLOT")
   expect "reopen C1 round $i" "C1" "$(printf '%s\n' "$out_i" | kv REOPENED)"
 done
 expect "C1 marked recurring" "C1" "$(printf '%s\n' "$out_i" | kv RECURRING)"
@@ -393,17 +415,19 @@ cat > "$TMP/cfg-stale-eff.json" <<'EOF'
     "effortMode": "unified",
     "unifiedEffort": "medium",
     "reviewers": [
-      { "providerInstanceId": "antigravity", "model": "gemini-4-neon", "effortKey": "thought_level", "effort": "high" },
-      { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "ultra" }
+      { "providerInstanceId": "antigravity", "model": "gemini-4-neon", "effortKey": "thought_level", "effort": "" },
+      { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "" }
     ]
   },
-  "knobs": { "roundCap": 2, "maxStepBacks": 0, "skipP3": 1 }
+  "knobs": { "roundCap": 2, "maxStepBacks": 0, "skipP3": 1, "requireRebased": 0, "prAutoRebase": 0 }
 }
 EOF
 bash "$ST" config-set --file "$TMP/cfg-stale-eff.json" >/dev/null
+expect "config-set accepts schema knobs requireRebased/prAutoRebase & unified empty effort" "0" "$?"
 out_ue=$(bash "$ST" config-show --capabilities "$CAPS")
 expect "unifiedEffort medium applied to council slot 1" 'antigravity|gemini-4-neon|thought_level|medium|{"thought_level":"medium"}' "$(printf '%s\n' "$out_ue" | kv COUNCIL_SLOT_1)"
 expect "unifiedEffort medium applied to council slot 2" 'codex|gpt-6.2-sol|reasoningEffort|medium|{"reasoningEffort":"medium"}' "$(printf '%s\n' "$out_ue" | kv COUNCIL_SLOT_2)"
+expect "config-show exports requireRebased=0 and prAutoRebase=0" "0:0" "$(printf '%s\n' "$out_ue" | kv KNOB_requireRebased):$(printf '%s\n' "$out_ue" | kv KNOB_prAutoRebase)"
 # Inline :effort wins over global --override-effort
 out_inl=$(bash "$ST" config-show --capabilities "$CAPS" --override-council "antigravity/gemini-4-neon:high,codex/gpt-6.2-sol:ultra" --override-effort medium)
 expect "inline :effort preserves per-model mode" "per-model" "$(printf '%s\n' "$out_inl" | kv COUNCIL_EFFORT_MODE)"
@@ -460,6 +484,165 @@ bash "$ST" init >/dev/null 2>&1
 expect "cr-tx directory target conflict fails closed" "2" "$?"
 [ -f "$SD/pending.tx" ] && ok || bad "cr-tx deleted pending.tx despite directory target conflict!"
 rm -rf "$SD/pending.tx" "$TX_BAD" "$SD/rounds/999-test"
+
+# --- 7. Round 2 hardening regressions ---
+
+# 7a. config-show with empty --capabilities (0 models) MUST fail closed (CONFIG_VALID=0, exit 3)!
+CAPS_EMPTY="$TMP/caps-empty.json"
+printf '{"providers":[]}\n' > "$CAPS_EMPTY"
+out_ec=$(bash "$ST" config-show --capabilities "$CAPS_EMPTY" 2>&1); rc=$?
+expect "empty capabilities JSON rejects models fail-closed (exit 3, CONFIG_VALID=0)" "3:0" "$rc:$(printf '%s\n' "$out_ec" | kv CONFIG_VALID)"
+
+# 7b. config-set rejects unified effortMode with empty effortKey member OR conflicting member effort!
+cat > "$TMP/cfg-bad-unif-emptykey.json" <<'EOF'
+{
+  "version": 1,
+  "authorizedProviders": ["antigravity", "codex"],
+  "defaultReviewer": { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "high" },
+  "council": {
+    "effortMode": "unified",
+    "unifiedEffort": "high",
+    "reviewers": [
+      { "providerInstanceId": "antigravity", "model": "no-effort", "effortKey": "", "effort": "" },
+      { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "" }
+    ]
+  }
+}
+EOF
+bash "$ST" config-set --file "$TMP/cfg-bad-unif-emptykey.json" >/dev/null 2>&1
+expect "config-set rejects unified effortMode with empty effortKey member" "2" "$?"
+
+cat > "$TMP/cfg-bad-unif-conflict.json" <<'EOF'
+{
+  "version": 1,
+  "authorizedProviders": ["antigravity", "codex"],
+  "defaultReviewer": { "providerInstanceId": "codex", "model": "gpt-6.2-sol", "effortKey": "reasoningEffort", "effort": "high" },
+  "council": {
+    "effortMode": "unified",
+    "unifiedEffort": "medium",
+    "reviewers": [
+      { "providerInstanceId": "antigravity", "model": "gemini-4-neon", "effortKey": "thought_level", "effort": "high" }
+    ]
+  }
+}
+EOF
+bash "$ST" config-set --file "$TMP/cfg-bad-unif-conflict.json" >/dev/null 2>&1
+expect "config-set rejects unified effortMode with conflicting member effort" "2" "$?"
+
+# 7c. init wires requireRebased/prAutoRebase AND persists --ignore-project-config across init/next!
+cat > "$R/.t3-cr-loop.json" <<'EOF'
+{
+  "knobs": { "roundCap": 9, "requireRebased": 1, "prAutoRebase": 1 }
+}
+EOF
+expect "project knob roundCap=9 active before ignore" "9" "$(bash "$ST" init | kv ROUND_CAP)"
+out_ign_init=$(bash "$ST" init --ignore-project-config)
+expect "init --ignore-project-config restores user knobs (roundCap=2, requireRebased=0)" "2:0:0:1" \
+  "$(printf '%s\n' "$out_ign_init" | kv ROUND_CAP):$(printf '%s\n' "$out_ign_init" | kv REQUIRE_REBASED):$(printf '%s\n' "$out_ign_init" | kv PR_AUTO_REBASE):$(printf '%s\n' "$out_ign_init" | kv PROJECT_CONFIG_IGNORED)"
+# Subsequent init WITHOUT flag inherits persisted ignore_project_config=1!
+expect "persisted ignore_project_config survives resume init" "2:1" "$(bash "$ST" init | kv ROUND_CAP):$(bash "$ST" init | kv PROJECT_CONFIG_IGNORED)"
+bash "$ST" init --use-project-config >/dev/null
+expect "--use-project-config re-enables project roundCap=9" "9" "$(bash "$ST" init | kv ROUND_CAP)"
+rm -f "$R/.t3-cr-loop.json"
+
+# 7d. record-result refuses pre-existing directory at canonical result path (never marks completed_valid)!
+po_dir=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1 --owner "$OWNER")
+RDDIR=$(printf '%s\n' "$po_dir" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDDIR" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDDIR" --slot s1 --attempt 1 --owner "$OWNER" --task-id tdir --child-thread-id ctdir >/dev/null
+mkdir -p "$RDDIR/result-s1-a1.json"
+bash "$ST" record-result "$RDDIR" --slot s1 --attempt 1 --owner "$OWNER" --task-id tdir --input "$F_CLEAN" >/dev/null 2>&1
+expect "record-result rejects directory conflict at result-s1-a1.json" "2" "$?"
+expect "slot NOT marked completed_valid after dir conflict" "0" "$(bash "$ST" round-summary "$RDDIR" | kv VALID_SLOTS)"
+rmdir "$RDDIR/result-s1-a1.json"
+bash "$ST" cancel-round "$RDDIR" --owner "$OWNER" >/dev/null
+
+# 7e. Single-reviewer & council finish CANNOT settle blocking P1 finding as clean (without evidenced --dismissed-findings)!
+F_P1_SLOT="$TMP/p1-slot.json"
+cat > "$F_P1_SLOT" <<'EOF'
+{
+  "summary": "Real P1 bug found.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1",
+      "reopens": "",
+      "title": "Race condition in lock",
+      "location": "app.txt:1",
+      "pattern": "Unprotected write",
+      "still_wrong": "",
+      "instances": ["app.txt:1"],
+      "fix": "Acquire flock",
+      "prevent": "Concurrency test"
+    }
+  ],
+  "step_back": [],
+  "out_of_scope": []
+}
+EOF
+po_b1=$(bash "$ST" prepare --purpose full --mode full --base main --slots s1 --owner "$OWNER")
+RDB1=$(printf '%s\n' "$po_b1" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDB1" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDB1" --slot s1 --attempt 1 --owner "$OWNER" --task-id tb1 --child-thread-id ctb1 >/dev/null
+bash "$ST" record-result "$RDB1" --slot s1 --attempt 1 --owner "$OWNER" --task-id tb1 --input "$F_P1_SLOT" >/dev/null
+out_fake=$(bash "$ST" finish "$RDB1" --merged "$F_CLEAN"); rc=$?
+expect "single-reviewer P1 CANNOT be settled as clean" "5:error" "$rc:$(printf '%s\n' "$out_fake" | kv VERDICT)"
+# Omitting --merged directly consumes recorded single slot result -> dirty!
+out_auto=$(bash "$ST" finish "$RDB1"); rc=$?
+expect "single-reviewer auto-consumes recorded P1 -> dirty" "0:dirty:1" "$rc:$(printf '%s\n' "$out_auto" | kv VERDICT):$(printf '%s\n' "$out_auto" | kv P1)"
+
+# Council: s1 reports P1, s2 reports clean -> clean merged rejected without --dismissed-findings, accepted with code_evidence!
+po_b2=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1,s2 --owner "$OWNER")
+RDB2=$(printf '%s\n' "$po_b2" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDB2" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDB2" --slot s1 --attempt 1 --owner "$OWNER" --task-id tb2a --child-thread-id ctb2a >/dev/null
+bash "$ST" record-result "$RDB2" --slot s1 --attempt 1 --owner "$OWNER" --task-id tb2a --input "$F_P1_SLOT" >/dev/null
+bash "$ST" claim-slot "$RDB2" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDB2" --slot s2 --attempt 1 --owner "$OWNER" --task-id tb2b --child-thread-id ctb2b >/dev/null
+bash "$ST" record-result "$RDB2" --slot s2 --attempt 1 --owner "$OWNER" --task-id tb2b --input "$F_CLEAN" >/dev/null
+out_drop=$(bash "$ST" finish "$RDB2" --merged "$F_CLEAN"); rc=$?
+expect "council finish rejects silently dropping P1 finding to clean" "5:error" "$rc:$(printf '%s\n' "$out_drop" | kv VERDICT)"
+cat > "$TMP/dismissed-p1.json" <<'EOF'
+[{ "slot": "s1", "title": "Race condition in lock", "severity": "P1", "code_evidence": "app.txt:1 is immutable constant" }]
+EOF
+out_dism=$(bash "$ST" finish "$RDB2" --merged "$F_CLEAN" --dismissed-findings "$TMP/dismissed-p1.json"); rc=$?
+expect "council finish accepts evidenced --dismissed-findings" "0:clean" "$rc:$(printf '%s\n' "$out_dism" | kv VERDICT)"
+
+# 7f. mark-converged emits immutable BASE_SHA and release-state get exposes CONVERGED_BASE_SHA!
+run_single_round confirmation-full full main "$F_CLEAN" >/dev/null
+out_mc=$(bash "$ST" mark-converged --base main)
+expect "t3 mark-converged emits immutable BASE_SHA" "$BASE_SHA" "$(printf '%s\n' "$out_mc" | kv BASE_SHA)"
+expect "t3 release-state get exposes CONVERGED_BASE_SHA" "$BASE_SHA" "$(bash "$ST" release-state get | kv CONVERGED_BASE_SHA)"
+
+# 7g. tree_fp_v2 catches a SECOND edit inside an already-dirty tracked submodule!
+SUB_SRC="$TMP/sub-src"
+mkdir -p "$SUB_SRC"
+(
+  cd "$SUB_SRC" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'v1\n' > sub.txt && git add sub.txt && git commit -qm s1
+)
+SUB_HOST="$TMP/sub-host"
+mkdir -p "$SUB_HOST"
+(
+  cd "$SUB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'h1\n' > host.txt && git add host.txt && git commit -qm h1
+  git -c protocol.file.allow=always submodule -q add "$SUB_SRC" vendor/sub >/dev/null 2>&1
+  git commit -qm "add sub"
+  git switch -qc feat/sub
+  printf 'h2\n' >> host.txt && git commit -qam h2
+  printf 'sub-dirty-1\n' >> vendor/sub/sub.txt
+  po_sm=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1 --owner "$OWNER")
+  RDSM=$(printf '%s\n' "$po_sm" | kv ROUND_DIR)
+  bash "$ST" claim-slot "$RDSM" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+  bash "$ST" record-dispatch "$RDSM" --slot s1 --attempt 1 --owner "$OWNER" --task-id tsm --child-thread-id ctsm >/dev/null
+  bash "$ST" record-result "$RDSM" --slot s1 --attempt 1 --owner "$OWNER" --task-id tsm --input "$F_CLEAN" >/dev/null
+  # Second edit to SAME already-dirty submodule file!
+  printf 'sub-dirty-2\n' >> vendor/sub/sub.txt
+  out_sm=$(bash "$ST" finish "$RDSM" --merged "$F_CLEAN"); rc_sm=$?
+  [ "$rc_sm" -eq 3 ] && [ "$(printf '%s\n' "$out_sm" | kv REASON)" = "tree-changed" ]
+) && ok || bad "t3 tree_fp_v2 missed 2nd edit inside already-dirty tracked submodule!"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -77,7 +77,7 @@ bash "$T3_STATE" config-show --capabilities "$CAPS_JSON" \
 - **Exit 3 (`CONFIG_VALID=0`)**: a configured or requested model/effort is unavailable or invalid on this host. Surface every `CONFIG_ERROR=` verbatim and ask the user to reconfigure or specify an available model. **Never silently substitute another model or clamp effort unasked.**
 - **`NEEDS_PROVIDER_AUTH=1`** (a repository `.t3-cr-loop.json` selected a `providerInstanceId` not in the user's `authorizedProviders`): pause, display the effective reviewer list and `UNAUTHORIZED_PROVIDERS`, and ask the user to either:
   - **(A) Authorize** (`bash "$T3_STATE" config-authorize-provider <id>`) and proceed,
-  - **(B) Ignore project provider override** (`--ignore-project-config`) and use user config, or
+  - **(B) Ignore project provider override** (`--ignore-project-config` on `config-show` AND `init --ignore-project-config`, which persists the ignore policy for this branch's loop) and use user config, or
   - **(C) Abort**.
 - Whenever `PROJECT_OVERRIDDEN=1` or per-invocation overrides changed the reviewers, display the resolved effective reviewers (`default` and `council`, with exact `providerInstanceId/model` and effort options) to the user before dispatching.
 
@@ -86,10 +86,10 @@ bash "$T3_STATE" config-show --capabilities "$CAPS_JSON" \
 ## Step 2 — State Setup
 
 ```bash
-bash "$T3_STATE" init
+bash "$T3_STATE" init [--ignore-project-config]
 ```
 
-- Shared knobs (env overrides or `config.json` `knobs`): `CR_LOOP_ROUND_CAP=3` (`0` disables step-back), `CR_LOOP_MAX_STEP_BACKS=1`, `CR_LOOP_SKIP_P3=1`, `CR_LOOP_REQUIRE_REBASED=1`.
+- Shared knobs (env overrides or `config.json` `knobs`): `CR_LOOP_ROUND_CAP=3` (`0` disables step-back), `CR_LOOP_MAX_STEP_BACKS=1`, `CR_LOOP_SKIP_P3=1`, `CR_LOOP_REQUIRE_REBASED=1`, `CR_PR_AUTO_REBASE=1`. Passing `--ignore-project-config` to `init` persists the ignore policy in branch state so subsequent `next`/`prepare`/`finish`/`ack-rules`/`mark-converged` commands consume the same effective knobs on resume.
 - If `ACTIVE_ROUND=` is present, an earlier async round is still open — follow step 3a (`PURPOSE=resume`) before starting anything new.
 
 ---
@@ -176,18 +176,18 @@ Inspect current slot state with `bash "$T3_STATE" round-summary "$ROUND_DIR"`.
 
 ### 3d. Synthesize council results & finish the round
 
-- **Single valid reviewer**: copy its canonical `result-<slot>-a<k>.json` to `$ROUND_DIR/merged-result.json` (optionally tagging each item with `sources: ["<provider>/<model>"]`).
+- **Single valid reviewer**: `finish` enforces exact canonical equivalence with the recorded `result-<slot>-a<k>.json` (modulo optional `sources: ["<provider>/<model>"]` tags; `--merged` may also be omitted to directly consume the recorded canonical slot file). A blocking finding from a single reviewer can never be settled as `clean`.
 - **Multiple valid reviewers (council synthesis)**:
   - Keep every model's raw canonical `result-<slot>-a<k>.json` untouched for auditability.
   - Semantically merge into `$ROUND_DIR/merged-result.json`:
     1. Findings sharing a **verified** root pattern become one class: take the **highest severity** (`P0 > P1 > P2 > P3`), take the **union of deduplicated `instances[]`**, combine the strongest `pattern`/`fix`/`prevent`, and set `sources: ["provider/model", ...]`. Preserve valid ledger `reopens` without duplicating the same non-empty `reopens` id across two merged entries.
-    2. **Divergent findings** (reported by only one model or with conflicting claims): inspect the cited code directly before deciding — keep valid issues (tagged with their reporting `sources`), never silently drop a real bug just because another model missed it.
+    2. **Divergent findings** (reported by only one model or with conflicting claims): inspect the cited code directly before deciding — keep valid issues (tagged with their reporting `sources`), never silently drop a real bug just because another model missed it. If a blocking finding from a council slot is verified to be a false positive after inspecting the code, pass `--dismissed-findings <json-file>` containing `[{ "slot": "...", "title": "...", "severity": "...", "code_evidence": "..." }]` with concrete code evidence; otherwise `finish` rejects unaccounted blocking findings.
     3. Merge `step_back[]` and `out_of_scope[]` similarly with `sources[]`.
     4. Set `verdict: "clean"` iff merged `findings` is empty; otherwise `"findings"`.
 - **Commit the round atomically**:
   ```bash
-  bash "$T3_STATE" finish "$ROUND_DIR" --merged "$ROUND_DIR/merged-result.json" \
-    [--partial-approved "<reason>"]
+  bash "$T3_STATE" finish "$ROUND_DIR" [--merged "$ROUND_DIR/merged-result.json"] \
+    [--dismissed-findings "$ROUND_DIR/dismissed.json"] [--partial-approved "<reason>"]
   ```
   - Exit 3 (`head-drift`): `head-moved`, `head-moved-and-returned`, or `tree-changed` (catches any accidental write by a shared-worktree child or concurrent editor; marks the round `drifted` and clears `active_round_dir` so the next run does not loop in `resume`). Do NOT classify; write `head-drift-during-review` handoff and stop.
   - Exit 5 (`error`): merged JSON failed strict schema validation or `review-rules.sh` scan/render failed. Fix merged JSON formatting if parent-induced (or retry `finish` on transient scan error); otherwise `reviewer-error` handoff.

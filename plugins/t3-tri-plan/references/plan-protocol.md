@@ -64,7 +64,7 @@ bash "$TRI_STATE" config-show --repo "$REPO_ROOT" --capabilities "$CAPS_JSON" \
   - Inline `:effort` wins over global `effort=`. When `effortMode == "unified"`, `unifiedEffort` is validated against the strict intersection and applied to EVERY member's emitted `options`. Models without an effort option reject non-empty effort values.
   - Each resolved target emits `*_PROVIDER`, `*_DRIVER_KIND`, `*_MODEL`, and `*_OPTIONS` for `delegate_task.target`.
 - **Exit 3 (`CONFIG_VALID=0`)**: report every `CONFIG_ERROR=` verbatim and ask the user to fix/reconfigure. **Never silently substitute models or clamp effort.**
-- **`NEEDS_PROVIDER_AUTH=1`**: pause and ask the user to authorize (`config-authorize-provider <id>`), ignore project override (`--ignore-project-config`), or abort.
+- **`NEEDS_PROVIDER_AUTH=1`**: pause and ask the user to authorize (`config-authorize-provider <id>`), ignore project override (`--ignore-project-config` on `config-show` AND persisted via `commit-phase0 --ignore-project-config` so `commit-phase1`/`next-review` consume the same effective knobs on resume), or abort.
 
 ---
 
@@ -161,8 +161,9 @@ Check open run via `bash "$TRI_STATE" run-summary --task "$TASK"`:
 5. **Council synthesis** (`initial-full` / `step-back`, or single reviewer pass-through):
    - Deduplicate findings by code-verified root mechanism (max severity `BLOCKER > SHOULD_FIX > OPTIONAL`, union of verified `instances` and `evidence`, `sources[]` tagged).
    - If reviewers contradict on the same `Dn` (`verified` vs `reopens`), inspect real code and record a `disputes[]` entry (`resolution: "reopen" | "verified" | "unresolved"` + `code_evidence`). Any `"unresolved"` dispute blocks `clean`!
-6. Run `finish-review-round --task "$TASK" --merged-input "$MERGED_JSON" [--degraded-approval "..."] [--inherit-wording-confirmation]`.
+6. Run `finish-review-round --task "$TASK" [--merged-input "$MERGED_JSON"] [--dismissed-findings "$DISMISSED_JSON"] [--degraded-approval "..."] [--inherit-wording-confirmation]`.
    - Checks mid-round drift across `design.md`, `prd.md`, `worktree_fp` v3, and `review_baseline_sha256` (drifted rounds are discarded without touching ledger/counters).
+   - Enforces slot-to-merged binding: single-reviewer rounds enforce exact canonical equivalence with the recorded slot file (`--merged-input` may be omitted); multi-reviewer council rounds verify every blocking (`BLOCKER`/`SHOULD_FIX`) slot finding is traced into merged `findings[].sources`, resolved via evidenced `disputes[]`, or explicitly dismissed via `--dismissed-findings` with concrete `code_evidence`.
    - Re-validates merged JSON (`--merged`), counts at most 1 occurrence per class per council round, promotes `recurring` (≥2 rounds in lineage, named by `step-back`, or non-empty `violates_review_md_rule`), renders `review.md`, and atomically commits `review-ledger.md` + `planning-state.json` (on `step-back`, increments `step_backs_done` AND resets `dirty_since_step_back = 0`, setting `step_back_assessment_status = "pending"` even when `findings[]` is empty).
 
 ### Phase 4 — Controlled Revision, Codification & Stop Decisions

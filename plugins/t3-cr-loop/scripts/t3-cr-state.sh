@@ -8,18 +8,18 @@
 #               [--override-council SPEC] [--single PROV/MODEL[:EFFORT]] [--ignore-project-config]
 #   config-set [--file FILE]                       (reads JSON from FILE or stdin)
 #   config-authorize-provider PROVIDER_INSTANCE_ID
-#   init
-#   next [--base REF] [--purpose P] [--clean-streak N]
-#   prepare --purpose P --mode M --base REF [--since SHA] --slots S1,S2 --owner THREAD_ID
+#   init [--ignore-project-config|--use-project-config]
+#   next [--base REF] [--purpose P] [--clean-streak N] [--ignore-project-config]
+#   prepare --purpose P --mode M --base REF [--since SHA] --slots S1,S2 --owner THREAD_ID [--ignore-project-config]
 #   claim-slot ROUND_DIR --slot S --attempt K --owner T --provider P --model M --options-json J
 #   record-dispatch ROUND_DIR --slot S --attempt K --owner T --task-id TID --child-thread-id CTID [--child-run-id CRID]
 #   update-slot ROUND_DIR --slot S --attempt K --owner T --state ST [--reason R]
 #   record-result ROUND_DIR --slot S --attempt K --owner T [--task-id TID] --input RAW_FILE
 #   round-summary [ROUND_DIR]
 #   cancel-round ROUND_DIR --owner T [--reason R]
-#   finish ROUND_DIR --merged MERGED_JSON [--partial-approved REASON]
-#   ack-rules FP [--base REF] [NOTE...]
-#   mark-converged [--post-rebase] [--base REF] [--round ROUND_DIR]
+#   finish ROUND_DIR [--merged MERGED_JSON] [--dismissed-findings FILE] [--partial-approved REASON] [--ignore-project-config]
+#   ack-rules FP [--base REF] [--ignore-project-config] [NOTE...]
+#   mark-converged [--post-rebase] [--base REF] [--round ROUND_DIR] [--ignore-project-config]
 #   release-state get | set KEY=VAL... | clear
 #   note TEXT...
 #   add SEVERITY TITLE [DETAIL]
@@ -130,14 +130,28 @@ with_branch_lock() {
 # ---------------------------------------------------------------- knobs ----
 
 resolve_knobs() {
-  cfg_rc=""; cfg_sb=""; cfg_p3=""
+  rk_ign_arg="${1:-}"
+  PROJECT_CONFIG_IGNORED_ACTIVE=0
+  if [ "$rk_ign_arg" = "1" ]; then
+    PROJECT_CONFIG_IGNORED_ACTIVE=1
+  elif [ "$rk_ign_arg" = "0" ]; then
+    PROJECT_CONFIG_IGNORED_ACTIVE=0
+  elif [ "${T3_CR_IGNORE_PROJECT_CONFIG:-0}" = "1" ]; then
+    PROJECT_CONFIG_IGNORED_ACTIVE=1
+  elif [ -n "${STATE:-}" ] && [ -f "$STATE" ] && [ "$(sget ignore_project_config)" = "1" ]; then
+    PROJECT_CONFIG_IGNORED_ACTIVE=1
+  fi
+
+  cfg_rc=""; cfg_sb=""; cfg_p3=""; cfg_rr=""; cfg_prar=""
   ucfg=$(user_config_path)
   pcfg=""
-  if [ -n "${ROOT:-}" ] && [ -f "$ROOT/.t3-cr-loop.json" ]; then
-    pcfg="$ROOT/.t3-cr-loop.json"
-  elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    cand="$(git rev-parse --show-toplevel)/.t3-cr-loop.json"
-    [ -f "$cand" ] && pcfg="$cand"
+  if [ "$PROJECT_CONFIG_IGNORED_ACTIVE" -eq 0 ]; then
+    if [ -n "${ROOT:-}" ] && [ -f "$ROOT/.t3-cr-loop.json" ]; then
+      pcfg="$ROOT/.t3-cr-loop.json"
+    elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      cand="$(git rev-parse --show-toplevel)/.t3-cr-loop.json"
+      [ -f "$cand" ] && pcfg="$cand"
+    fi
   fi
   if [ -f "$ucfg" ] || [ -n "$pcfg" ]; then
     kv_out=$(perl -MJSON::PP -e '
@@ -161,27 +175,36 @@ resolve_knobs() {
         if (defined $kh->{maxStepBacks} && !ref $kh->{maxStepBacks} && $kh->{maxStepBacks} =~ /\A[0-9]+\z/) {
           $k{maxStepBacks} = $kh->{maxStepBacks};
         }
-        if (exists $kh->{skipP3}) {
-          my $v = $kh->{skipP3};
-          if (JSON::PP::is_bool($v)) { $k{skipP3} = $v ? 1 : 0; }
-          elsif (defined $v && !ref $v && ($v eq "0" || $v eq "1")) { $k{skipP3} = $v; }
+        for my $bk (qw(skipP3 requireRebased prAutoRebase)) {
+          next unless exists $kh->{$bk};
+          my $v = $kh->{$bk};
+          if (JSON::PP::is_bool($v)) { $k{$bk} = $v ? 1 : 0; }
+          elsif (defined $v && !ref $v && ($v eq "0" || $v eq "1")) { $k{$bk} = $v; }
         }
       }
       print "RC=$k{roundCap}\n" if defined $k{roundCap};
       print "SB=$k{maxStepBacks}\n" if defined $k{maxStepBacks};
       print "P3=$k{skipP3}\n" if defined $k{skipP3};
+      print "RR=$k{requireRebased}\n" if defined $k{requireRebased};
+      print "PRAR=$k{prAutoRebase}\n" if defined $k{prAutoRebase};
     ' "$ucfg" "$pcfg" 2>/dev/null || true)
     cfg_rc=$(printf '%s\n' "$kv_out" | sed -n 's/^RC=//p' | tail -n 1)
     cfg_sb=$(printf '%s\n' "$kv_out" | sed -n 's/^SB=//p' | tail -n 1)
     cfg_p3=$(printf '%s\n' "$kv_out" | sed -n 's/^P3=//p' | tail -n 1)
+    cfg_rr=$(printf '%s\n' "$kv_out" | sed -n 's/^RR=//p' | tail -n 1)
+    cfg_prar=$(printf '%s\n' "$kv_out" | sed -n 's/^PRAR=//p' | tail -n 1)
   fi
 
   ROUND_CAP="${CR_LOOP_ROUND_CAP:-${cfg_rc:-3}}"
   MAX_STEP_BACKS="${CR_LOOP_MAX_STEP_BACKS:-${cfg_sb:-1}}"
   SKIP_P3="${CR_LOOP_SKIP_P3:-${cfg_p3:-1}}"
+  REQUIRE_REBASED="${CR_LOOP_REQUIRE_REBASED:-${cfg_rr:-1}}"
+  PR_AUTO_REBASE="${CR_PR_AUTO_REBASE:-${cfg_prar:-1}}"
   is_uint "$ROUND_CAP" || die "CR_LOOP_ROUND_CAP must be a non-negative integer (got '$ROUND_CAP')"
   is_uint "$MAX_STEP_BACKS" || die "CR_LOOP_MAX_STEP_BACKS must be a non-negative integer (got '$MAX_STEP_BACKS')"
   case "$SKIP_P3" in 0|1) ;; *) die "CR_LOOP_SKIP_P3 must be 0 or 1 (got '$SKIP_P3')" ;; esac
+  case "$REQUIRE_REBASED" in 0|1) ;; *) die "CR_LOOP_REQUIRE_REBASED must be 0 or 1 (got '$REQUIRE_REBASED')" ;; esac
+  case "$PR_AUTO_REBASE" in 0|1) ;; *) die "CR_PR_AUTO_REBASE must be 0 or 1 (got '$PR_AUTO_REBASE')" ;; esac
 }
 
 # --------------------------------------------------------------- config ----
@@ -346,22 +369,34 @@ cmd_config_set() {
     if (exists $ch->{unifiedEffort}) {
       die "council.unifiedEffort must be string\n" unless $ch->{unifiedEffort}[0] eq "str";
     }
+    my $ue_str = (exists $ch->{unifiedEffort} && $ch->{unifiedEffort}[0] eq "str") ? $ch->{unifiedEffort}[1] : "";
     die "council.unifiedEffort required when effortMode is unified\n"
-      if $em eq "unified" && (!exists $ch->{unifiedEffort} || !length($ch->{unifiedEffort}[1]));
+      if $em eq "unified" && !length($ue_str);
     die "council.reviewers must be non-empty array\n"
       unless exists $ch->{reviewers} && $ch->{reviewers}[0] eq "arr" && @{$ch->{reviewers}[1]} > 0;
     my $idx = 0;
-    for my $rv (@{$ch->{reviewers}[1]}) { $idx++; $chk_rev->($rv, "council.reviewers[$idx]"); }
+    for my $rv (@{$ch->{reviewers}[1]}) {
+      $idx++;
+      $chk_rev->($rv, "council.reviewers[$idx]");
+      if ($em eq "unified") {
+        my $rh = $rv->[1];
+        die "council.reviewers[$idx].effortKey must be non-empty when effortMode is unified\n"
+          unless length($rh->{effortKey}[1]);
+        if (length($rh->{effort}[1]) && $rh->{effort}[1] ne $ue_str) {
+          die "council.reviewers[$idx].effort '\''$rh->{effort}[1]'\'' conflicts with council.unifiedEffort '\''$ue_str'\''\n";
+        }
+      }
+    }
     if (exists $h->{knobs}) {
       die "knobs must be object\n" unless $h->{knobs}[0] eq "obj";
       my $kh = $h->{knobs}[1];
       for my $k (sort keys %$kh) {
         if ($k eq "roundCap" || $k eq "maxStepBacks") {
           die "knobs.$k must be non-negative integer\n" unless $kh->{$k}[0] eq "num" && $kh->{$k}[2] && $kh->{$k}[1] >= 0;
-        } elsif ($k eq "skipP3") {
+        } elsif ($k eq "skipP3" || $k eq "requireRebased" || $k eq "prAutoRebase") {
           my $n = $kh->{$k};
-          my $ok_p3 = ($n->[0] eq "bool") || ($n->[0] eq "num" && $n->[2] && ($n->[1] == 0 || $n->[1] == 1));
-          die "knobs.skipP3 must be boolean or 0/1\n" unless $ok_p3;
+          my $ok_flag = ($n->[0] eq "bool") || ($n->[0] eq "num" && $n->[2] && ($n->[1] == 0 || $n->[1] == 1));
+          die "knobs.$k must be boolean or 0/1\n" unless $ok_flag;
         } else {
           die "unknown knob '\''$k'\''\n";
         }
@@ -374,6 +409,13 @@ cmd_config_set() {
       $_->{effort} = $ue for @{$j->{council}{reviewers}};
     } else {
       delete $j->{council}{unifiedEffort};
+    }
+    if (ref($j->{knobs}) eq "HASH") {
+      for my $bk (qw(skipP3 requireRebased prAutoRebase)) {
+        if (exists $j->{knobs}{$bk} && JSON::PP::is_bool($j->{knobs}{$bk})) {
+          $j->{knobs}{$bk} = $j->{knobs}{$bk} ? 1 : 0;
+        }
+      }
     }
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh JSON::PP->new->utf8->pretty->canonical->encode($j);
@@ -411,7 +453,9 @@ cmd_config_authorize_provider() {
 }
 
 cmd_config_show() {
-  caps_file=""; ov_model=""; ov_effort=""; ov_council=""; ov_single=""; ignore_proj=0
+  caps_file=""; ov_model=""; ov_effort=""; ov_council=""; ov_single=""
+  ignore_proj=0
+  [ "${T3_CR_IGNORE_PROJECT_CONFIG:-0}" = "1" ] && ignore_proj=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --capabilities) [ $# -ge 2 ] || die "config-show: --capabilities requires a file"; caps_file="$2"; shift 2 ;;
@@ -420,6 +464,7 @@ cmd_config_show() {
       --override-council) [ $# -ge 2 ] || die "config-show: --override-council requires a value"; ov_council="$2"; shift 2 ;;
       --single) [ $# -ge 2 ] || die "config-show: --single requires a value"; ov_single="$2"; shift 2 ;;
       --ignore-project-config) ignore_proj=1; shift ;;
+      --use-project-config) ignore_proj=0; shift ;;
       *) die "config-show: unknown arg $1" ;;
     esac
   done
@@ -597,15 +642,28 @@ cmd_config_show() {
           if (exists $ch->{unifiedEffort} && $ch->{unifiedEffort}[0] ne "str") {
             push @errors, "$prefix council.unifiedEffort must be string";
           }
-          if (exists $ch->{effortMode} && $ch->{effortMode}[0] eq "str" && $ch->{effortMode}[1] eq "unified" &&
-              (!exists $ch->{unifiedEffort} || $ch->{unifiedEffort}[0] ne "str" || !length($ch->{unifiedEffort}[1]))) {
+          my $is_unif = (exists $ch->{effortMode} && $ch->{effortMode}[0] eq "str" && $ch->{effortMode}[1] eq "unified") ? 1 : 0;
+          my $ue_val  = (exists $ch->{unifiedEffort} && $ch->{unifiedEffort}[0] eq "str") ? $ch->{unifiedEffort}[1] : "";
+          if ($is_unif && !length($ue_val)) {
             push @errors, "$prefix council.unifiedEffort required when effortMode is unified";
           }
           if (!exists $ch->{reviewers} || $ch->{reviewers}[0] ne "arr" || !@{$ch->{reviewers}[1]}) {
             push @errors, "$prefix council.reviewers must be non-empty array";
           } else {
             my $i = 0;
-            for my $rv (@{$ch->{reviewers}[1]}) { $i++; $chk_r->($rv, "council.reviewers[$i]"); }
+            for my $rv (@{$ch->{reviewers}[1]}) {
+              $i++;
+              $chk_r->($rv, "council.reviewers[$i]");
+              if ($is_unif && $rv && $rv->[0] eq "obj") {
+                my $rh = $rv->[1];
+                if (exists $rh->{effortKey} && $rh->{effortKey}[0] eq "str" && !length($rh->{effortKey}[1])) {
+                  push @errors, "$prefix council.reviewers[$i].effortKey must be non-empty when effortMode is unified";
+                }
+                if (length($ue_val) && exists $rh->{effort} && $rh->{effort}[0] eq "str" && length($rh->{effort}[1]) && $rh->{effort}[1] ne $ue_val) {
+                  push @errors, "$prefix council.reviewers[$i].effort '\''$rh->{effort}[1]'\'' conflicts with unifiedEffort '\''$ue_val'\''";
+                }
+              }
+            }
           }
         }
       }
@@ -616,10 +674,10 @@ cmd_config_show() {
           for my $k (sort keys %$kh) {
             if ($k eq "roundCap" || $k eq "maxStepBacks") {
               push @errors, "$prefix knobs.$k must be non-negative integer" unless $kh->{$k}[0] eq "num" && $kh->{$k}[2] && $kh->{$k}[1] >= 0;
-            } elsif ($k eq "skipP3") {
+            } elsif ($k eq "skipP3" || $k eq "requireRebased" || $k eq "prAutoRebase") {
               my $n = $kh->{$k};
-              my $ok_p3 = ($n->[0] eq "bool") || ($n->[0] eq "num" && $n->[2] && ($n->[1] == 0 || $n->[1] == 1));
-              push @errors, "$prefix knobs.skipP3 must be boolean or 0/1" unless $ok_p3;
+              my $ok_flag = ($n->[0] eq "bool") || ($n->[0] eq "num" && $n->[2] && ($n->[1] == 0 || $n->[1] == 1));
+              push @errors, "$prefix knobs.$k must be boolean or 0/1" unless $ok_flag;
             } else {
               push @errors, "$prefix unknown knob '\''$k'\''";
             }
@@ -684,6 +742,7 @@ cmd_config_show() {
 
     # Build live capability lookup if provided.
     my (%cap_prov, %cap_model);
+    my $caps_loaded = 0;
     my $inherited_pid = "";
     if (length $caps_file) {
       my $caps = eval {
@@ -691,9 +750,10 @@ cmd_config_show() {
         local $/; my $cr = <$cfh>; close $cfh;
         $J->decode($cr);
       };
-      if ($@ || ref $caps ne "HASH") {
+      if ($@ || ref $caps ne "HASH" || (exists $caps->{providers} && ref $caps->{providers} ne "ARRAY")) {
         push @errors, "cannot parse --capabilities JSON: $caps_file";
       } else {
+        $caps_loaded = 1;
         $inherited_pid = $caps->{inheritedProviderInstanceId} // "";
         for my $pr (@{$caps->{providers} || []}) {
           my $pid = $pr->{providerInstanceId} // next;
@@ -798,8 +858,8 @@ cmd_config_show() {
       }
     }
 
-    # Validate against live capabilities if supplied (no silent fallback / clamping).
-    if (length $caps_file && keys %cap_model) {
+    # Validate against live capabilities if supplied (even if providers/models list is empty!).
+    if ($caps_loaded) {
       my $check_one = sub {
         my ($rv, $label) = @_;
         my $key = "$rv->{providerInstanceId}/$rv->{model}";
@@ -920,25 +980,117 @@ tree_fp_v2() {
   tidx=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2i.XXXXXX") || { rm -f "$tdiff"; return 1; }
   twt=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2w.XXXXXX") || { rm -f "$tdiff" "$tidx"; return 1; }
   tuntr=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2u.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt"; return 1; }
-  tman=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2m.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr"; return 1; }
+  tstage=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2s.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr"; return 1; }
+  tman=$(mktemp "${TMPDIR:-/tmp}/t3cr-tf2m.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage"; return 1; }
   if ! git -C "$ROOT" diff HEAD --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tdiff" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
   if ! git -C "$ROOT" diff --cached --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tidx" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
   if ! git -C "$ROOT" diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$twt" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
-  dh=$(git -C "$ROOT" hash-object --stdin < "$tdiff" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
-  ih=$(git -C "$ROOT" hash-object --stdin < "$tidx" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
-  wh=$(git -C "$ROOT" hash-object --stdin < "$twt" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  dh=$(git -C "$ROOT" hash-object --stdin < "$tdiff" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  ih=$(git -C "$ROOT" hash-object --stdin < "$tidx" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  wh=$(git -C "$ROOT" hash-object --stdin < "$twt" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   if ! git -C "$ROOT" ls-files --others --exclude-standard -z > "$tuntr" 2>/dev/null; then
-    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
   fi
-  perl -e '
+  if ! git -C "$ROOT" ls-files --stage -z > "$tstage" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1
+  fi
+  perl -MDigest::SHA=sha256_hex -e '
     use strict; use warnings;
-    my ($root, $dh, $ih, $wh, $untr_file, $man_file) = @ARGV;
+    my ($root, $dh, $ih, $wh, $untr_file, $stage_file, $man_file) = @ARGV;
+
+    sub run_git_raw {
+      my ($dir, @args) = @_;
+      open(my $ph, "-|", "git", "-C", $dir, @args) or return (1, "");
+      binmode($ph, ":raw");
+      local $/;
+      my $out = <$ph>;
+      my $closed = close $ph;
+      my $st = $?;
+      my $rc = (!$closed && $st == 0) ? 1 : (!defined($st) || $st == -1) ? 127 : ($st & 127) ? (128 + ($st & 127)) : ($st >> 8);
+      return ($rc, defined $out ? $out : "");
+    }
+
+    sub hash_file_raw {
+      my ($f) = @_;
+      open(my $fh, "<:raw", $f) or exit 1;
+      my $ctx = Digest::SHA->new(256);
+      $ctx->addfile($fh);
+      close $fh or exit 1;
+      return $ctx->hexdigest;
+    }
+
+    my $hash_git_repo;
+    $hash_git_repo = sub {
+      my ($dir, $depth) = @_;
+      exit 1 if $depth > 8;
+      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "HEAD");
+      $sh =~ s/\s+//g;
+      if ($rc_h != 0 || !length $sh) {
+        my ($rc_sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
+        exit 1 unless $rc_sym == 0;
+        $sh = "UNBORN";
+      }
+      my $ctx = Digest::SHA->new(256);
+      $ctx->add("head\0$sh\0");
+      if ($sh ne "UNBORN") {
+        my ($rc_d, $d_out) = run_git_raw($dir, "diff", "HEAD", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+        exit 1 unless $rc_d == 0;
+        $ctx->add("diff_head\0" . sha256_hex($d_out) . "\0");
+        my ($rc_c, $c_out) = run_git_raw($dir, "diff", "--cached", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+        exit 1 unless $rc_c == 0;
+        $ctx->add("diff_cached\0" . sha256_hex($c_out) . "\0");
+      } else {
+        my ($rc_st, $st_out) = run_git_raw($dir, "ls-files", "--stage", "-z");
+        exit 1 unless $rc_st == 0;
+        $ctx->add("stage_unborn\0" . sha256_hex($st_out) . "\0");
+      }
+      my ($rc_w, $w_out) = run_git_raw($dir, "diff", "--no-relative", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--binary");
+      exit 1 unless $rc_w == 0;
+      $ctx->add("diff_wt\0" . sha256_hex($w_out) . "\0");
+
+      my ($rc_u, $u_out) = run_git_raw($dir, "ls-files", "--others", "--exclude-standard", "-z");
+      exit 1 unless $rc_u == 0;
+      for my $up (sort grep { length $_ } split(/\0/, $u_out)) {
+        my $ufull = "$dir/$up";
+        if (-l $ufull) {
+          my $tgt = readlink($ufull); defined $tgt or exit 1;
+          $ctx->add("ul\0$up\0$tgt\0");
+        } elsif (-f $ufull) {
+          my $ex = (-x $ufull) ? "x" : "f";
+          $ctx->add("uf\0$ex\0$up\0" . hash_file_raw($ufull) . "\0");
+        } elsif (-d $ufull && -e "$ufull/.git") {
+          $ctx->add("ug\0$up\0" . $hash_git_repo->($ufull, $depth + 1) . "\0");
+        } elsif (-d $ufull) {
+          $ctx->add("ud\0$up\0");
+        } else {
+          $ctx->add("uo\0$up\0");
+        }
+      }
+      my ($rc_gs, $gs_out) = run_git_raw($dir, "ls-files", "--stage", "-z");
+      exit 1 unless $rc_gs == 0;
+      my %sub_nested;
+      for my $ent (split(/\0/, $gs_out)) {
+        if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+          $sub_nested{$2} = $1;
+        }
+      }
+      for my $sp (sort keys %sub_nested) {
+        my $sfull = "$dir/$sp";
+        if (-d $sfull && -e "$sfull/.git") {
+          $ctx->add("sub\0$sp\0$sub_nested{$sp}\0" . $hash_git_repo->($sfull, $depth + 1) . "\0");
+        } else {
+          $ctx->add("sub_absent\0$sp\0$sub_nested{$sp}\0");
+        }
+      }
+      return $ctx->hexdigest;
+    };
+
     open(my $uf, "<:raw", $untr_file) or exit 1;
     local $/ = "\0";
     my @paths;
@@ -949,8 +1101,29 @@ tree_fp_v2() {
     }
     close $uf;
     @paths = sort @paths;
+
+    open(my $sf, "<:raw", $stage_file) or exit 1;
+    my %gitlinks;
+    while (defined(my $ent = <$sf>)) {
+      chomp $ent;
+      if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+        $gitlinks{$2} = $1;
+      }
+    }
+    close $sf;
+
     open(my $mf, ">:raw", $man_file) or exit 1;
     print $mf "tracked\t$dh\nindex\t$ih\nworktree\t$wh\n";
+    for my $sp (sort keys %gitlinks) {
+      my $full = "$root/$sp";
+      my $ep = $sp; $ep =~ s/\\/\\\\/g; $ep =~ s/\n/\\n/g; $ep =~ s/\t/\\t/g;
+      if (-d $full && -e "$full/.git") {
+        my $sub_h = $hash_git_repo->($full, 1);
+        print $mf "submodule\t$gitlinks{$sp}\t$sub_h\t$ep\n";
+      } else {
+        print $mf "submodule_uninit\t$gitlinks{$sp}\t$ep\n";
+      }
+    }
     for my $p (@paths) {
       my $full = "$root/$p";
       my $ep = $p; $ep =~ s/\\/\\\\/g; $ep =~ s/\n/\\n/g; $ep =~ s/\t/\\t/g;
@@ -967,24 +1140,18 @@ tree_fp_v2() {
         print $mf "file\t$exec\t$oid\t$ep\n";
       } elsif (-d $full) {
         if (-e "$full/.git") {
-          open(my $gh, "-|", "git", "-C", $full, "rev-parse", "HEAD") or exit 1;
-          my $sh = <$gh>; close $gh;
-          $sh = defined($sh) ? $sh : ""; chomp $sh;
-          open(my $gs, "-|", "git", "-C", $full, "status", "--porcelain=v1", "-z") or exit 1;
-          local $/; my $st = <$gs>; close $gs or exit 1;
-          $st = "" unless defined $st;
-          my $st_hex = unpack("H*", $st);
-          print $mf "gitdir\t$sh\t$st_hex\t$ep\n";
+          my $sub_h = $hash_git_repo->($full, 1);
+          print $mf "gitdir\t$sub_h\t$ep\n";
         } else {
           print $mf "dir\t$ep\n";
         }
       } else { print $mf "other\t$ep\n"; }
     }
     close $mf or exit 1;
-  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   vh=$(git -C "$ROOT" hash-object --stdin < "$tman" 2>/dev/null)
   rc=$?
-  rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"
+  rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"
   [ "$rc" -eq 0 ] && [ -n "$vh" ] || return 1
   printf 'v2:%s\n' "$vh"
 }
@@ -1025,31 +1192,52 @@ effective_persisted_streak() {
 # ----------------------------------------------------------- subcommands ----
 
 cmd_init() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; ensure_state
+  ign_set=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ignore-project-config) ign_set=1; shift ;;
+      --use-project-config) ign_set=0; shift ;;
+      *) die "init: unknown arg $1" ;;
+    esac
+  done
+  if [ -n "$ign_set" ]; then
+    [ ! -L "$STATE" ] && [ ! -d "$STATE" ] || die "init: invalid state target $STATE"
+    stmp="$STATE.tmp.$$"
+    build_state_file "$stmp" "ignore_project_config=$ign_set"
+    mv "$stmp" "$STATE" || { rm -f "$stmp"; die "init: failed saving ignore_project_config"; }
+  fi
+  resolve_knobs "$ign_set"
+  conv_head=$(sget post_rebase_confirmed_head); conv_base=$(sget post_rebase_confirmed_base_sha)
+  if [ -z "$conv_head" ]; then conv_head=$(sget base_converged_head); conv_base=$(sget base_converged_base_sha); fi
   ucfg=$(user_config_path)
   printf 'T3_CR_VERSION=%s\nBRANCH=%s\nSTATE_DIR=%s\nLEDGER=%s\n' "$SELF_VERSION" "$BRANCH" "$STATE_DIR" "$LEDGER"
-  printf 'USER_CONFIG=%s\nCONFIGURED=%s\n' "$ucfg" "$([ -f "$ucfg" ] && echo 1 || echo 0)"
-  printf 'ROUND_CAP=%s\nMAX_STEP_BACKS=%s\nSKIP_P3=%s\n' "$ROUND_CAP" "$MAX_STEP_BACKS" "$SKIP_P3"
+  printf 'USER_CONFIG=%s\nCONFIGURED=%s\nPROJECT_CONFIG_IGNORED=%s\n' "$ucfg" "$([ -f "$ucfg" ] && echo 1 || echo 0)" "$PROJECT_CONFIG_IGNORED_ACTIVE"
+  printf 'ROUND_CAP=%s\nMAX_STEP_BACKS=%s\nSKIP_P3=%s\nREQUIRE_REBASED=%s\nPR_AUTO_REBASE=%s\n' \
+    "$ROUND_CAP" "$MAX_STEP_BACKS" "$SKIP_P3" "$REQUIRE_REBASED" "$PR_AUTO_REBASE"
   printf 'ROUNDS_TOTAL=%s\nROUNDS_IN_CYCLE=%s\nDIRTY_SINCE_STEP_BACK=%s\nSTEP_BACKS_DONE=%s\n' \
     "$(snum rounds_total)" "$(snum rounds_in_cycle)" "$(snum dirty_since_step_back)" "$(snum step_backs_done)"
-  printf 'CLEAN_STREAK=%s\nLAST_CLEAN_HEAD=%s\nLAST_CLEAN_MODE=%s\nLAST_REVIEWED_HEAD=%s\nCLASSES=%s\n' \
-    "$(snum clean_streak)" "$(sget last_clean_head)" "$(sget last_clean_mode)" "$(sget last_reviewed_head)" "$(( $(snum next_class_id) - 1 ))"
+  printf 'CLEAN_STREAK=%s\nLAST_CLEAN_HEAD=%s\nLAST_CLEAN_MODE=%s\nLAST_REVIEWED_HEAD=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\nCLASSES=%s\n' \
+    "$(snum clean_streak)" "$(sget last_clean_head)" "$(sget last_clean_mode)" "$(sget last_reviewed_head)" "$conv_head" "$conv_base" "$(( $(snum next_class_id) - 1 ))"
   ar=$(sget active_round_dir)
   if [ -n "$ar" ] && [ -d "$ar" ]; then printf 'ACTIVE_ROUND=%s\n' "$ar"; fi
   return 0
 }
 
 cmd_next() {
-  resolve_paths; resolve_knobs; ensure_state
-  base_arg=""; purpose_arg=""; cs_explicit=0; cs=0
+  resolve_paths; ensure_state
+  base_arg=""; purpose_arg=""; cs_explicit=0; cs=0; ign_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --base) base_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --purpose) purpose_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --clean-streak) cs_explicit=1; cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;;
+      --base) [ $# -ge 2 ] || die "next: --base requires a value"; base_arg="$2"; shift 2 ;;
+      --purpose) [ $# -ge 2 ] || die "next: --purpose requires a value"; purpose_arg="$2"; shift 2 ;;
+      --clean-streak) [ $# -ge 2 ] || die "next: --clean-streak requires a value"; cs_explicit=1; cs="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
       *) die "next: unknown arg $1" ;;
     esac
   done
+  resolve_knobs "$ign_arg"
   is_uint "$cs" || die "--clean-streak must be an integer"
   head=$(git rev-parse HEAD) || die "next: cannot resolve HEAD"
   base_sha=""
@@ -1082,11 +1270,13 @@ cmd_next() {
   # Priority 3: already converged on this exact HEAD/base/policy
   if [ "$cs_explicit" -eq 0 ]; then
     if [ "$cs" -ge 2 ] && [ "$lcm" = "full" ]; then
-      printf 'PURPOSE=converged\nMODE=converged\nCLEAN_STREAK=%s\nREASON=already converged on this HEAD/base/policy\n' "$cs"
+      printf 'PURPOSE=converged\nMODE=converged\nCLEAN_STREAK=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\nREASON=already converged on this HEAD/base/policy\n' \
+        "$cs" "$head" "$(sget last_clean_base_sha)"
       return 0
     fi
     if [ -n "$bch" ] && [ "$bch" = "$head" ] && [ "$bcp" = "$SKIP_P3" ] && { [ -z "$base_sha" ] || [ "$bcb" = "$base_sha" ]; }; then
-      printf 'PURPOSE=converged\nMODE=converged\nCLEAN_STREAK=%s\nREASON=recorded convergence already holds for this HEAD/base/policy\n' "$cs"
+      printf 'PURPOSE=converged\nMODE=converged\nCLEAN_STREAK=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\nREASON=recorded convergence already holds for this HEAD/base/policy\n' \
+        "$cs" "$bch" "$bcb"
       return 0
     fi
   fi
@@ -1177,19 +1367,22 @@ write_prompt() {
 }
 
 cmd_prepare() {
-  resolve_paths; resolve_knobs; ensure_state
-  purpose=""; mode=""; base=""; since=""; slots=""; owner=""
+  resolve_paths; ensure_state
+  purpose=""; mode=""; base=""; since=""; slots=""; owner=""; ign_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --purpose) purpose="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --mode) mode="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --base) base="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --since) since="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --slots) slots="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-      --owner) owner="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      --purpose) [ $# -ge 2 ] || die "prepare: --purpose requires a value"; purpose="$2"; shift 2 ;;
+      --mode) [ $# -ge 2 ] || die "prepare: --mode requires a value"; mode="$2"; shift 2 ;;
+      --base) [ $# -ge 2 ] || die "prepare: --base requires a value"; base="$2"; shift 2 ;;
+      --since) [ $# -ge 2 ] || die "prepare: --since requires a value"; since="$2"; shift 2 ;;
+      --slots) [ $# -ge 2 ] || die "prepare: --slots requires a value"; slots="$2"; shift 2 ;;
+      --owner) [ $# -ge 2 ] || die "prepare: --owner requires a value"; owner="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
       *) die "prepare: unknown arg $1" ;;
     esac
   done
+  resolve_knobs "$ign_arg"
   case "$mode" in full|incremental|step-back) ;; *) die "prepare: --mode must be full|incremental|step-back" ;; esac
   [ -n "$purpose" ] || die "prepare: --purpose is required"
   [ -n "$base" ] || die "prepare: --base is required"
@@ -1243,7 +1436,7 @@ cmd_prepare() {
         slot => $s, attempt => 0, state => "unclaimed",
         providerInstanceId => "", model => "", optionsJson => "{}",
         clientRequestId => "", taskId => "", childThreadId => "", childRunId => "",
-        resultFile => "", rawInputSha256 => "", reason => "",
+        resultFile => "", resultSha256 => "", rawInputSha256 => "", reason => "",
       };
     }
     die "no valid slots\n" unless @order;
@@ -1261,7 +1454,11 @@ cmd_prepare() {
   mv "$atmp" "$d/active_round.json" || { rm -rf "$d"; die "prepare: cannot move active_round.json"; }
 
   stmp="$STATE.tmp.$$"
-  build_state_file "$stmp" "rounds_started=$n" "active_round_dir=$d"
+  if [ -n "$ign_arg" ]; then
+    build_state_file "$stmp" "rounds_started=$n" "active_round_dir=$d" "ignore_project_config=$ign_arg"
+  else
+    build_state_file "$stmp" "rounds_started=$n" "active_round_dir=$d"
+  fi
   mv "$stmp" "$STATE" || { rm -f "$stmp"; die "prepare: cannot update state"; }
 
   printf 'ROUND=%s\nPURPOSE=%s\nMODE=%s\nROUND_DIR=%s\nPROMPT=%s/prompt.md\nREVIEWED_HEAD=%s\nBASE_SHA=%s\n' \
@@ -1318,6 +1515,7 @@ cmd_claim_slot() {
     $s->{childThreadId} = "";
     $s->{childRunId} = "";
     $s->{resultFile} = "";
+    $s->{resultSha256} = "";
     $s->{rawInputSha256} = "";
     $s->{reason} = "";
     $s->{dispatchedAt} = $now;
@@ -1487,20 +1685,36 @@ cmd_record_result() {
   vout=$(perl "$PARSER" --validate-only "$infile" --write-canonical "$tmp_canon")
   vrc=$?
 
-  new_st="completed_valid"; err_reason=""; res_path="$canon_out"
+  new_st="completed_valid"; err_reason=""; res_path="$canon_out"; staged_art="$tmp_canon"
   if [ "$vrc" -ne 0 ]; then
     rm -f "$tmp_canon"
     cp "$infile" "$tmp_inv" || { rm -f "$tmp_inv"; die "cannot stage invalid result"; }
     new_st="completed_invalid"
     err_reason=$(printf '%s\n' "$vout" | sed -n 's/^ERROR=//p' | head -n 1)
     res_path="$invalid_out"
+    staged_art="$tmp_inv"
   fi
 
-  # 3. Stage active_round.json, then move artifact + state atomically.
+  # Refuse directory/symlink conflicts at artifact target AND active_round.json BEFORE moving!
+  if [ -d "$res_path" ] || [ -L "$res_path" ]; then
+    rm -f "$tmp_canon" "$tmp_inv"
+    die "record-result: refusing directory or symlink conflict at $res_path"
+  fi
+  if [ -d "$af" ] || [ -L "$af" ]; then
+    rm -f "$tmp_canon" "$tmp_inv"
+    die "record-result: refusing directory or symlink conflict at $af"
+  fi
+  art_sha=$(perl -MDigest::SHA=sha256_hex -e '
+    open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+    local $/; my $b = <$fh>; close $fh or exit 1;
+    print sha256_hex(defined $b ? $b : "");
+  ' "$staged_art") || { rm -f "$tmp_canon" "$tmp_inv"; die "record-result: cannot hash staged artifact"; }
+
+  # 3. Stage active_round.json, then move artifact, post-verify regular file + byte hash, and commit active_round.json.
   atmp="$af.tmp.$$"
   perl -MJSON::PP -e '
     use strict; use warnings;
-    my ($af, $out, $slot, $att, $owner, $nst, $rpath, $in_sha, $err) = @ARGV;
+    my ($af, $out, $slot, $att, $owner, $nst, $rpath, $in_sha, $art_sha, $err) = @ARGV;
     my $J = JSON::PP->new->utf8;
     open(my $fh, "<:raw", $af) or die "cannot read $af\n"; local $/; my $obj = $J->decode(<$fh>); close $fh;
     die "round not active\n" unless ($obj->{status} // "") eq "active";
@@ -1509,19 +1723,27 @@ cmd_record_result() {
     die "CAS failed: stale attempt $att (current=$s->{attempt})\n" unless $s->{attempt} == $att;
     $s->{state} = $nst;
     $s->{resultFile} = $rpath;
+    $s->{resultSha256} = $art_sha;
     $s->{rawInputSha256} = $in_sha;
     $s->{reason} = $err;
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$new_st" "$res_path" "$in_sha" "$err_reason" \
+  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$new_st" "$res_path" "$in_sha" "$art_sha" "$err_reason" \
     || { rm -f "$atmp" "$tmp_canon" "$tmp_inv"; die "record-result CAS failed"; }
 
-  if [ "$vrc" -eq 0 ]; then
-    mv "$tmp_canon" "$canon_out" || { rm -f "$atmp" "$tmp_canon"; die "record-result: failed moving $canon_out"; }
-  else
-    mv "$tmp_inv" "$invalid_out" || { rm -f "$atmp" "$tmp_inv"; die "record-result: failed moving $invalid_out"; }
+  mv "$staged_art" "$res_path" || { rm -f "$atmp" "$staged_art"; die "record-result: failed moving $res_path"; }
+  # Post-move verification: target MUST be a regular non-symlink file with exact expected SHA-256!
+  if [ ! -f "$res_path" ] || [ -L "$res_path" ] || [ -d "$res_path" ]; then
+    rm -f "$atmp"
+    die "record-result: post-move target $res_path is not a regular file"
   fi
+  post_sha=$(perl -MDigest::SHA=sha256_hex -e '
+    open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+    local $/; my $b = <$fh>; close $fh or exit 1;
+    print sha256_hex(defined $b ? $b : "");
+  ' "$res_path") || { rm -f "$atmp"; die "record-result: post-move hash failed on $res_path"; }
+  [ "$post_sha" = "$art_sha" ] || { rm -f "$atmp"; die "record-result: post-move byte verification failed on $res_path"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "record-result: failed replacing $af"; }
 
   if [ "$vrc" -ne 0 ]; then
@@ -1599,9 +1821,9 @@ cmd_cancel_round() {
 }
 
 cmd_finish() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; ensure_state
   explicit_arg="${1:-}"
-  merged_file=""; partial_reason=""
+  merged_file=""; partial_reason=""; dismissed_file=""; ign_arg=""
   if [ -n "$explicit_arg" ] && [ "${explicit_arg#--}" = "$explicit_arg" ]; then
     shift
     d=$(validate_round_dir "$explicit_arg")
@@ -1622,11 +1844,17 @@ cmd_finish() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --merged) [ $# -ge 2 ] || die "finish: --merged requires a file"; merged_file="$2"; shift 2 ;;
+      --dismissed-findings) [ $# -ge 2 ] || die "finish: --dismissed-findings requires a file"; dismissed_file="$2"; shift 2 ;;
       --partial-approved) [ $# -ge 2 ] || die "finish: --partial-approved requires a reason"; partial_reason="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
       *) die "finish: unknown arg $1" ;;
     esac
   done
-  [ -n "$merged_file" ] && [ -f "$merged_file" ] || die "finish: --merged <json-file> is required"
+  resolve_knobs "$ign_arg"
+  if [ -n "$dismissed_file" ] && { [ ! -f "$dismissed_file" ] || [ -L "$dismissed_file" ]; }; then
+    die "finish: --dismissed-findings file not found or symlink: $dismissed_file"
+  fi
 
   mode=$(mget "$d" mode); purpose=$(mget "$d" purpose); reviewed=$(mget "$d" reviewed_head); n=$(mget "$d" round)
   is_uint "$n" || die "corrupt round number in $d/meta"
@@ -1637,16 +1865,16 @@ cmd_finish() {
 
   # Verify slot completion status in active_round.json
   af="$d/active_round.json"; [ -f "$af" ] || die "finish: missing $af"
-  slot_chk=$(perl -MJSON::PP -e '
+  slot_meta=$(perl -MJSON::PP -e '
     use strict; use warnings;
     my ($af, $partial) = @ARGV;
     my $J = JSON::PP->new->utf8;
     open(my $fh, "<:raw", $af) or die "cannot read $af\n"; local $/; my $obj = $J->decode(<$fh>); close $fh;
     die "round status is $obj->{status}, not active\n" unless ($obj->{status} // "") eq "active";
-    my ($valid, $pending, @absent) = (0, 0);
+    my ($valid, $pending, @absent, @vfiles) = (0, 0);
     for my $k (@{$obj->{slotOrder}}) {
       my $s = $obj->{slots}{$k};
-      if ($s->{state} eq "completed_valid") { $valid++; }
+      if ($s->{state} eq "completed_valid") { $valid++; push @vfiles, $s->{resultFile} // ""; }
       elsif ($s->{state} =~ /^(unclaimed|dispatching|running|waiting|cancel_requested)$/) { $pending++; }
       else { push @absent, "$k($s->{providerInstanceId}/$s->{model}:$s->{state})"; }
     }
@@ -1655,8 +1883,22 @@ cmd_finish() {
     if (@absent && !length $partial) {
       die "partial failure (" . join(", ", @absent) . ") requires explicit user approval (--partial-approved)\n";
     }
-    print join(",", @absent);
+    print "VALID_COUNT=$valid\n";
+    print "SINGLE_FILE=" . ($valid == 1 ? $vfiles[0] : "") . "\n";
+    print "ABSENT=" . join(",", @absent) . "\n";
   ' "$af" "$partial_reason") || die "finish: slot precondition failed"
+  valid_cnt=$(printf '%s\n' "$slot_meta" | sed -n 's/^VALID_COUNT=//p' | head -n 1)
+  single_slot_file=$(printf '%s\n' "$slot_meta" | sed -n 's/^SINGLE_FILE=//p' | head -n 1)
+  slot_chk=$(printf '%s\n' "$slot_meta" | sed -n 's/^ABSENT=//p' | head -n 1)
+
+  if [ -z "$merged_file" ]; then
+    if [ "$valid_cnt" = "1" ] && [ -n "$single_slot_file" ] && [ -f "$single_slot_file" ] && [ ! -L "$single_slot_file" ]; then
+      merged_file="$single_slot_file"
+    else
+      die "finish: --merged <json-file> is required (unless single valid reviewer slot is auto-consumed)"
+    fi
+  fi
+  [ -f "$merged_file" ] && [ ! -L "$merged_file" ] || die "finish: --merged file not found or symlink: $merged_file"
 
   # Drift checks (fail-closed)
   head=$(git rev-parse HEAD) || { printf 'VERDICT=error\nREASON=cannot resolve HEAD\n'; exit 5; }
@@ -1700,6 +1942,10 @@ cmd_finish() {
 
   # Archive merged result and strictly validate/render it
   res="$d/merged-result.json"
+  if [ -d "$res" ] || [ -L "$res" ]; then
+    printf 'VERDICT=error\nREASON=refusing directory or symlink at %s\n' "$res"
+    exit 5
+  fi
   if [ "$(cd "$(dirname "$merged_file")" && pwd -P)/$(basename "$merged_file")" != "$res" ]; then
     cp "$merged_file" "$res" || die "cannot copy merged result to $res"
   fi
@@ -1709,6 +1955,154 @@ cmd_finish() {
   if [ "$prc" -ne 0 ]; then
     printf 'VERDICT=error\n%s\nRESULT=%s\n' "$(printf '%s\n' "$parsed" | sed -n 's/^ERROR=/REASON=/p')" "$res"
     exit 5
+  fi
+
+  # Enforce strict slot-to-merged integrity (prevents settling blocking slot findings as clean!).
+  bind_err=$(perl -MJSON::PP -MDigest::SHA=sha256_hex -MCwd=abs_path -e '
+    use strict; use warnings;
+    my ($af, $round_dir, $merged_path, $skip_p3, $mode, $dismissed_path) = @ARGV;
+    my $J = JSON::PP->new->utf8;
+    my $JC = JSON::PP->new->utf8->canonical;
+    my %rank = (P0 => 4, P1 => 3, P2 => 2, P3 => 1);
+    my $is_blocking = sub {
+      my ($sev) = @_;
+      return 1 if $sev eq "P0" || $sev eq "P1" || $sev eq "P2";
+      return ($skip_p3 eq "0" && $sev eq "P3") ? 1 : 0;
+    };
+
+    my $rdir_real = abs_path($round_dir) // die "cannot resolve round dir\n";
+    open(my $fh, "<:raw", $af) or die "cannot read $af\n"; local $/; my $ar = $J->decode(<$fh>); close $fh;
+    open(my $mfh, "<:raw", $merged_path) or die "cannot read $merged_path\n"; local $/; my $merged = $J->decode(<$mfh>); close $mfh;
+
+    my @valid_slots;
+    for my $k (@{$ar->{slotOrder}}) {
+      my $s = $ar->{slots}{$k};
+      next unless ($s->{state} // "") eq "completed_valid";
+      my $rf = $s->{resultFile} // "";
+      die "valid slot $k missing resultFile\n" unless length($rf) && -f $rf && !-l $rf;
+      my $rf_real = abs_path($rf) // die "cannot resolve resultFile for slot $k\n";
+      die "slot $k resultFile escapes round dir\n" unless index($rf_real, "$rdir_real/") == 0;
+      open(my $sfh, "<:raw", $rf) or die "cannot read slot $k resultFile\n"; local $/; my $sbytes = <$sfh>; close $sfh;
+      if (length($s->{resultSha256} // "") && sha256_hex($sbytes) ne $s->{resultSha256}) {
+        die "slot $k canonical resultFile digest mismatch (tampered on disk)\n";
+      }
+      my $sobj = eval { $J->decode($sbytes) };
+      die "slot $k canonical resultFile invalid JSON\n" if $@ || ref $sobj ne "HASH";
+      push @valid_slots, { slot => $k, meta => $s, obj => $sobj };
+    }
+
+    my $strip_sources = sub {
+      my ($o) = @_;
+      my $copy = {
+        summary => $o->{summary},
+        verdict => $o->{verdict},
+        findings => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{findings} || []} ],
+        step_back => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{step_back} || []} ],
+        out_of_scope => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{out_of_scope} || []} ],
+      };
+      return $JC->encode($copy);
+    };
+
+    if (@valid_slots == 1) {
+      my $vs = $valid_slots[0];
+      if ($strip_sources->($merged) ne $strip_sources->($vs->{obj})) {
+        die "single-reviewer merged JSON does not match recorded canonical slot result ($vs->{slot})\n";
+      }
+      exit 0;
+    }
+
+    # Multi-reviewer council: load optional evidenced --dismissed-findings.
+    my @dismissed;
+    if (defined $dismissed_path && length $dismissed_path) {
+      open(my $dfh, "<:raw", $dismissed_path) or die "cannot read --dismissed-findings\n"; local $/; my $draw = <$dfh>; close $dfh;
+      my $darr = eval { $J->decode($draw) };
+      die "--dismissed-findings must be a JSON array\n" if $@ || ref $darr ne "ARRAY";
+      my $idx = 0;
+      for my $d (@$darr) {
+        $idx++;
+        die "--dismissed-findings[$idx] must be object\n" unless ref $d eq "HASH";
+        for my $req (qw(slot title severity code_evidence)) {
+          die "--dismissed-findings[$idx].$req must be non-empty string\n"
+            unless defined $d->{$req} && !ref($d->{$req}) && $d->{$req} =~ /\S/;
+        }
+        die "--dismissed-findings[$idx].severity invalid\n" unless exists $rank{$d->{severity}};
+        push @dismissed, $d;
+      }
+    }
+
+    my $is_dismissed = sub {
+      my ($slot, $model_tag, $f) = @_;
+      for my $d (@dismissed) {
+        next unless ($d->{slot} eq $slot || $d->{slot} eq $model_tag);
+        next unless $d->{severity} eq $f->{severity};
+        next unless $d->{title} eq $f->{title};
+        if (defined $d->{reopens} && length $d->{reopens}) {
+          next unless $d->{reopens} eq ($f->{reopens} // "");
+        }
+        return 1;
+      }
+      return 0;
+    };
+
+    my %merged_reopen_max;
+    my %merged_source_max;
+    for my $mf (@{$merged->{findings} || []}) {
+      my $rk = $rank{$mf->{severity}} // 0;
+      if (length($mf->{reopens} // "")) {
+        my $cid = $mf->{reopens};
+        $merged_reopen_max{$cid} = $rk if ($merged_reopen_max{$cid} // 0) < $rk;
+      }
+      if ($is_blocking->($mf->{severity})) {
+        for my $src (@{$mf->{sources} || []}) {
+          $merged_source_max{$src} = $rk if ($merged_source_max{$src} // 0) < $rk;
+        }
+      }
+    }
+
+    my @unaccounted;
+    my $any_slot_sb = 0;
+    for my $vs (@valid_slots) {
+      my $sn = $vs->{slot};
+      my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
+      $any_slot_sb = 1 if @{$vs->{obj}{step_back} || []} > 0;
+      my $max_undism_rank = 0;
+      my @undism_titles;
+      for my $f (@{$vs->{obj}{findings} || []}) {
+        next unless $is_blocking->($f->{severity});
+        next if $is_dismissed->($sn, $mtag, $f);
+        my $rk = $rank{$f->{severity}} // 0;
+        $max_undism_rank = $rk if $rk > $max_undism_rank;
+        push @undism_titles, "$f->{severity}:$f->{title}";
+        if (length($f->{reopens} // "")) {
+          my $cid = $f->{reopens};
+          if (($merged_reopen_max{$cid} // 0) < $rk) {
+            push @unaccounted, "slot $sn ($mtag) reopened blocking $cid ($f->{severity}) missing or downgraded in merged findings without --dismissed-findings";
+          }
+        }
+      }
+      if ($max_undism_rank > 0) {
+        my $got_rk = $merged_source_max{$mtag} // 0;
+        $got_rk = $merged_source_max{$sn} if ($merged_source_max{$sn} // 0) > $got_rk;
+        if ($got_rk < $max_undism_rank) {
+          push @unaccounted, "slot $sn ($mtag) blocking finding(s) [" . join(", ", @undism_titles) . "] not traced in merged findings[].sources at >= severity without evidenced --dismissed-findings";
+        }
+      }
+    }
+    if ($mode eq "step-back" && $any_slot_sb && @{$merged->{step_back} || []} == 0) {
+      push @unaccounted, "council slot(s) reported step_back[] items that were dropped from merged output";
+    }
+    if (@unaccounted) {
+      die join("; ", @unaccounted) . "\n";
+    }
+  ' "$af" "$d" "$res" "$SKIP_P3" "$mode" "$dismissed_file" 2>&1)
+  brc=$?
+  if [ "$brc" -ne 0 ]; then
+    bind_err=$(printf '%s' "$bind_err" | tr '\n' ' ')
+    printf 'VERDICT=error\nREASON=%s\nRESULT=%s\n' "$bind_err" "$res"
+    exit 5
+  fi
+  if [ -n "$dismissed_file" ]; then
+    cp "$dismissed_file" "$d/dismissed-findings.json" || die "cannot archive dismissed findings"
   fi
   pv() { printf '%s\n' "$parsed" | sed -n "s/^$1=//p"; }
   c0=$(pv P0); c1=$(pv P1); c2=$(pv P2); c3=$(pv P3); total=$(pv TOTAL)
@@ -1871,10 +2265,18 @@ cmd_finish() {
 }
 
 cmd_ack_rules() {
-  resolve_paths; resolve_knobs; ensure_state
+  resolve_paths; ensure_state
   fp="${1:-}"; [ $# -gt 0 ] && shift
-  base_arg=""
-  if [ "${1:-}" = "--base" ]; then base_arg="${2:-}"; shift; [ $# -gt 0 ] && shift; fi
+  base_arg=""; ign_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) [ $# -ge 2 ] || die "ack-rules: --base requires a value"; base_arg="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
+      *) break ;;
+    esac
+  done
+  resolve_knobs "$ign_arg"
   pending=$(sget rules_pending_fp); pverdict=$(sget rules_pending_verdict)
   [ -n "$pending" ] && [ "$pverdict" = "needs-human" ] || die "ack-rules: no needs-human rule-file edits awaiting a person"
   [ "$fp" = "$pending" ] || die "ack-rules: fingerprint '$fp' does not match pending ($pending)"
@@ -1931,16 +2333,19 @@ cmd_ack_rules() {
 }
 
 cmd_mark_converged() {
-  resolve_paths; resolve_knobs; ensure_state
-  post_rebase=0; base_arg=""; round_arg=""
+  resolve_paths; ensure_state
+  post_rebase=0; base_arg=""; round_arg=""; ign_arg=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --post-rebase) post_rebase=1; shift ;;
       --base) [ $# -ge 2 ] || die "mark-converged: --base requires a ref"; base_arg="$2"; shift 2 ;;
       --round) [ $# -ge 2 ] || die "mark-converged: --round requires a round dir"; round_arg="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
       *) die "mark-converged: unknown arg $1" ;;
     esac
   done
+  resolve_knobs "$ign_arg"
   head=$(git rev-parse HEAD) || die "mark-converged: cannot resolve HEAD"
   short_head=$(git rev-parse --short HEAD)
   base_sha=""
@@ -1993,7 +2398,8 @@ cmd_mark_converged() {
   fi
   commit_tx "$tx_dir" mark-converged
   rm -rf "$tx_dir"
-  printf 'CONVERGED=%s\n' "$head"
+  if [ "$post_rebase" -eq 1 ]; then conv_base="$base_sha"; else conv_base="$lcb"; fi
+  printf 'CONVERGED=%s\nBASE_SHA=%s\n' "$head" "$conv_base"
 }
 
 cmd_release_state() {
@@ -2001,8 +2407,11 @@ cmd_release_state() {
   action="${1:-get}"; [ $# -gt 0 ] && shift
   case "$action" in
     get)
-      printf 'PRE_REBASE_HEAD=%s\nPINNED_REMOTE_HEAD_SHA=%s\nTARGET_BASE_SHA=%s\nREBASED_IN_8_0=%s\n' \
-        "$(sget rel_pre_rebase_head)" "$(sget rel_pinned_remote_head_sha)" "$(sget rel_target_base_sha)" "$(snum rel_rebased_in_8_0)"
+      conv_head=$(sget post_rebase_confirmed_head); conv_base=$(sget post_rebase_confirmed_base_sha)
+      if [ -z "$conv_head" ]; then conv_head=$(sget base_converged_head); conv_base=$(sget base_converged_base_sha); fi
+      printf 'PRE_REBASE_HEAD=%s\nPINNED_REMOTE_HEAD_SHA=%s\nTARGET_BASE_SHA=%s\nREBASED_IN_8_0=%s\nCONVERGED_HEAD=%s\nCONVERGED_BASE_SHA=%s\n' \
+        "$(sget rel_pre_rebase_head)" "$(sget rel_pinned_remote_head_sha)" "$(sget rel_target_base_sha)" "$(snum rel_rebased_in_8_0)" \
+        "$conv_head" "$conv_base"
       ;;
     set)
       [ $# -gt 0 ] || die "release-state set: at least one KEY=VAL required"
