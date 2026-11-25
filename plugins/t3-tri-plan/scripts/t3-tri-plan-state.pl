@@ -29,6 +29,7 @@ use TriTx qw(
   check_stale_readonly recover_tx execute_tx
   compute_worktree_fp compare_worktree_fp
   scan_repo_rules compute_non_prd_baseline compute_review_baseline
+  ensure_no_symlink_components
   write_atomic_bytes read_raw_file
 );
 
@@ -1141,8 +1142,9 @@ sub cmd_migrate_legacy {
     # Preserve legacy candidates as references ONLY; mark Phase 1 needs-reverification unless proven.
     my %leg_cands;
     for my $name (qw(claude codex)) {
-      if (-f "$plans_dir/$name.md" && !-l "$plans_dir/$name.md") {
-        $leg_cands{$name} = sha256_file("$plans_dir/$name.md");
+      my $leg_p = _fs_join($plans_dir, "$name.md");
+      if (-f $leg_p && !-l $leg_p) {
+        $leg_cands{$name} = sha256_file($leg_p);
       }
     }
     $st->{phases}{'1'} = {
@@ -1392,7 +1394,7 @@ sub cmd_commit_phase0 {
         'check.jsonl',
       );
       for my $rel (@archive_candidates) {
-        if (-e "$real_task/$rel") {
+        if (-e _fs_join($real_task, $rel)) {
           my $dst_name = $rel;
           $dst_name =~ s{\Aresearch/plans/}{};
           push @moves, { src => $rel, dst => "$sup_rel/$dst_name" };
@@ -1671,7 +1673,7 @@ sub cmd_prepare_judge {
 
     # Verify live candidates match Phase 1 hashes.
     for my $slot (sort keys %{$p1->{candidates}}) {
-      my $cp = "$plans_dir/candidates/$slot.md";
+      my $cp = _fs_join($plans_dir, 'candidates', "$slot.md");
       die_err("candidate file missing or modified: $slot.md")
         unless -f $cp && !-l $cp && sha256_file($cp) eq $p1->{candidates}{$slot};
     }
@@ -2608,7 +2610,7 @@ sub cmd_commit_phase2a {
       die_err("prd.md modified since Phase 0 commit — run commit-phase0 first", 3)
         unless sha256_file($prd_path) eq ($st->{effective_prd_sha256} // '');
       for my $slot (sort keys %{$p1->{candidates} || {}}) {
-        my $cp = "$plans_dir/candidates/$slot.md";
+        my $cp = _fs_join($plans_dir, 'candidates', "$slot.md");
         die_err("candidate file missing or modified: $slot.md", 3)
           unless -f $cp && !-l $cp && sha256_file($cp) eq $p1->{candidates}{$slot};
       }
@@ -3217,6 +3219,62 @@ sub _verify_review_slot_binding {
     $disputed_classes{$cid} = $res;
   }
 
+  # Reject contradictory --dismissed-findings on any class whose dispute resolved 'reopen',
+  # and ensure every 'reopen' dispute is actually represented in merged findings[].
+  for my $d (@dismissed) {
+    if (length($d->{reopens}) && ($disputed_classes{$d->{reopens}} // '') eq 'reopen') {
+      die_err("contradictory --dismissed-findings for class $d->{reopens}: dispute resolved as 'reopen' cannot be dismissed", 3);
+    }
+  }
+  for my $cid (sort keys %disputed_classes) {
+    if ($disputed_classes{$cid} eq 'reopen') {
+      my $has_reopen_finding = grep { ($_->{reopens} // '') eq $cid } @{$merged_obj->{findings} || []};
+      die_err("dispute for $cid resolved as 'reopen' but merged findings[] has no entry reopening $cid", 3)
+        unless $has_reopen_finding;
+    }
+  }
+
+  my $norm = sub {
+    my ($s) = @_;
+    $s = defined $s ? lc($s) : '';
+    $s =~ s/\A\s+|\s+\z//g;
+    $s =~ s/\s+/ /g;
+    return $s;
+  };
+
+  my $finding_locs = sub {
+    my ($f) = @_;
+    my %locs;
+    for my $raw (($f->{location} // ''), @{$f->{instances} || []}) {
+      my $n = $norm->($raw);
+      $locs{$n} = 1 if length $n;
+    }
+    return \%locs;
+  };
+
+  my $locs_overlap = sub {
+    my ($la, $lb) = @_;
+    for my $k (keys %$la) {
+      return 1 if $lb->{$k};
+    }
+    return 0;
+  };
+
+  my $text_matches = sub {
+    my ($a, $b) = @_;
+    my ($na, $nb) = ($norm->($a), $norm->($b));
+    return 0 unless length($na) && length($nb);
+    return 1 if $na eq $nb;
+    my ($short, $long) = (length($na) <= length($nb)) ? ($na, $nb) : ($nb, $na);
+    my $min_len = ($short =~ /[^\x00-\x7f]/) ? 4 : 6;
+    return 0 if length($short) < $min_len;
+    return 0 if length($nb) < length($na) && (length($nb) * 2 < length($na));
+    if ($short =~ /[^\x00-\x7f]/) {
+      return index($long, $short) >= 0 ? 1 : 0;
+    }
+    return ($long =~ /(?:\A|[^a-z0-9])\Q$short\E(?:[^a-z0-9]|\z)/) ? 1 : 0;
+  };
+
   # Bipartite maximum matching helper (Kuhn) for strict 1-to-1 per-slot traceability.
   my $has_perfect_matching = sub {
     my ($n_left, $n_right, $adj) = @_;
@@ -3249,30 +3307,67 @@ sub _verify_review_slot_binding {
     return 0;
   };
 
+  # Reject duplicate copies in merged findings[] and step_back[] (prevents padding duplicates to drop independent items!).
   my @m_findings = @{$merged_obj->{findings} || []};
   my @m_sbs      = @{$merged_obj->{step_back} || []};
+  my (%seen_mf_tl, %seen_mf_lp, %seen_mf_tpf);
+  for my $mf (@m_findings) {
+    my $nreo = $norm->($mf->{reopens});
+    my $k_tl  = join("\0", $nreo, $norm->($mf->{title}), $norm->($mf->{location}));
+    die_err("duplicate merged finding detected: $mf->{title} ($mf->{location})", 3) if $seen_mf_tl{$k_tl}++;
+    my $k_lp  = join("\0", $nreo, $norm->($mf->{location}), $norm->($mf->{pattern}));
+    die_err("duplicate merged finding location/pattern detected: $mf->{title} ($mf->{location})", 3) if $seen_mf_lp{$k_lp}++;
+    my $k_tpf = join("\0", $nreo, $norm->($mf->{title}), $norm->($mf->{pattern}), $norm->($mf->{fix}));
+    die_err("duplicate merged finding title/pattern/fix detected: $mf->{title} ($mf->{location})", 3) if $seen_mf_tpf{$k_tpf}++;
+  }
+  my (%seen_sb_name, %seen_sb_app);
+  for my $msb (@m_sbs) {
+    my $ckey = join(',', sort map { $norm->($_) } @{$msb->{classes} || []});
+    my $kn = join("\0", $ckey, $norm->($msb->{name}));
+    my $ka = join("\0", $ckey, $norm->($msb->{approach_change}));
+    die_err("duplicate merged step_back[] proposal detected: $msb->{name}", 3)
+      if $seen_sb_name{$kn}++ || $seen_sb_app{$ka}++;
+  }
+
   my @unaccounted;
 
   for my $so (@slot_objs) {
     my $sn   = $so->{slot};
     my $mtag = $so->{mtag};
 
-    # 1. Per-finding 1-to-1 blocking finding binding.
+    # 1. Per-finding 1-to-1 identity-bound blocking finding binding.
     #    Reopened blocking findings are exempted ONLY when a validated dispute resolved 'verified' or 'unresolved'
-    #    (resolution 'reopen' MUST keep the reopened finding at >= severity unless explicitly dismissed!).
+    #    (resolution 'reopen' MUST keep the reopened finding at >= severity and CANNOT be dismissed!).
     my @need_f;
     for my $f (@{$so->{obj}{findings} || []}) {
       next unless $is_blocking->($f->{severity});
-      next if $consume_dismissal->($sn, $mtag, $f);
       if (length($f->{reopens} // '')) {
         my $dres = $disputed_classes{$f->{reopens}} // '';
+        if ($dres eq 'reopen') {
+          die_err("contradictory --dismissed-findings for reopened blocking class $f->{reopens} whose dispute resolved as 'reopen'", 3)
+            if $consume_dismissal->($sn, $mtag, $f);
+          push @need_f, $f;
+          next;
+        }
         next if $dres eq 'verified' || $dres eq 'unresolved';
       }
+      next if $consume_dismissal->($sn, $mtag, $f);
       push @need_f, $f;
     }
 
     if (@need_f) {
       my @cand_mf = grep { $is_blocking->($_->{severity}) } @m_findings;
+      my @need_locs = map { $finding_locs->($_) } @need_f;
+      my @cand_locs = map { $finding_locs->($_) } @cand_mf;
+      my @same_loc_peer = (0) x scalar(@need_f);
+      for my $i (0 .. $#need_f) {
+        for my $k ($i + 1 .. $#need_f) {
+          if ($locs_overlap->($need_locs[$i], $need_locs[$k])) {
+            $same_loc_peer[$i] = 1;
+            $same_loc_peer[$k] = 1;
+          }
+        }
+      }
       my @adj;
       for my $i (0 .. $#need_f) {
         my $nf   = $need_f[$i];
@@ -3290,6 +3385,10 @@ sub _verify_review_slot_binding {
             }
           } else {
             next unless $has_src->($mf, $sn, $mtag);
+            my $loc_ok = $locs_overlap->($need_locs[$i], $cand_locs[$j]);
+            my $id_ok  = $text_matches->($nf->{title}, $mf->{title}) || $text_matches->($nf->{pattern}, $mf->{pattern});
+            next unless $loc_ok || $text_matches->($nf->{title}, $mf->{title});
+            next if $same_loc_peer[$i] && !$id_ok;
           }
           push @edges, $j;
         }
@@ -3297,30 +3396,34 @@ sub _verify_review_slot_binding {
       }
       if (!$has_perfect_matching->(scalar(@need_f), scalar(@cand_mf), \@adj)) {
         my @titles = map { "$_->{severity}:" . (length($_->{reopens} // '') ? "$_->{reopens}:" : '') . $_->{title} } @need_f;
-        push @unaccounted, "slot $sn ($mtag) has " . scalar(@need_f) . " undismissed blocking finding(s) [" . join(', ', @titles) . "] not matched 1-to-1 in merged findings[] at >= severity (with slot sources / matching reopens) without validated dispute or evidenced --dismissed-findings";
+        push @unaccounted, "slot $sn ($mtag) has " . scalar(@need_f) . " undismissed blocking finding(s) [" . join(', ', @titles) . "] not matched 1-to-1 by identity/instances in merged findings[] at >= severity (with slot sources / matching reopens) without validated dispute or evidenced --dismissed-findings";
       }
     }
 
-    # 2. Per-proposal 1-to-1 step_back[] binding (requires sources attribution & class-set preservation!).
+    # 2. Per-proposal 1-to-1 identity-bound step_back[] binding (sources, class-set superset, AND proposal identity!).
     my @slot_sbs = @{$so->{obj}{step_back} || []};
     if (@slot_sbs) {
       my @cand_sbs = grep { $has_src->($_, $sn, $mtag) } @m_sbs;
       my @adj;
       for my $i (0 .. $#slot_sbs) {
-        my %need_cls = map { $_ => 1 } @{$slot_sbs[$i]{classes} || []};
+        my $sb = $slot_sbs[$i];
+        my %need_cls = map { $_ => 1 } @{$sb->{classes} || []};
         my @edges;
         for my $j (0 .. $#cand_sbs) {
-          my %got_cls = map { $_ => 1 } @{$cand_sbs[$j]{classes} || []};
+          my $msb = $cand_sbs[$j];
+          my %got_cls = map { $_ => 1 } @{$msb->{classes} || []};
           my $ok_cls = 1;
           for my $c (keys %need_cls) {
             if (!$got_cls{$c}) { $ok_cls = 0; last; }
           }
-          push @edges, $j if $ok_cls;
+          next unless $ok_cls;
+          next unless $text_matches->($sb->{name}, $msb->{name}) || $text_matches->($sb->{approach_change}, $msb->{approach_change});
+          push @edges, $j;
         }
         push @adj, \@edges;
       }
       if (!$has_perfect_matching->(scalar(@slot_sbs), scalar(@cand_sbs), \@adj)) {
-        push @unaccounted, "slot $sn ($mtag) reported " . scalar(@slot_sbs) . " step_back[] proposal(s) not preserved 1-to-1 in merged step_back[] (with sources attributing slot and covering all classes)";
+        push @unaccounted, "slot $sn ($mtag) reported " . scalar(@slot_sbs) . " step_back[] proposal(s) not preserved 1-to-1 by class/proposal identity in merged step_back[]";
       }
     }
   }
@@ -4002,7 +4105,7 @@ sub _evaluate_upstream_freshness {
     return { ok => 0, next_stage => 'phase1', reasons => ['Phase 1 has no committed candidates'] };
   }
   for my $slot (sort keys %{$p1->{candidates}}) {
-    my $cp = "$plans_dir/candidates/$slot.md";
+    my $cp = _fs_join($plans_dir, 'candidates', "$slot.md");
     if (!-f $cp || -l $cp || sha256_file($cp) ne $p1->{candidates}{$slot}) {
       return { ok => 0, next_stage => 'phase1', reasons => ["candidate $slot.md missing or hash mismatch"] };
     }
@@ -4106,7 +4209,7 @@ sub _evaluate_freshness {
   }
   for my $jf (['implement.jsonl', 'implement_jsonl_sha256'], ['check.jsonl', 'check_jsonl_sha256']) {
     my ($fname, $key) = @$jf;
-    my $fp = "$real_task/$fname";
+    my $fp = _fs_join($real_task, $fname);
     my ($okj, $jmsg) = _validate_jsonl_non_seed($repo, $fp);
     return { ok => 0, next_stage => 'phase5', reasons => [$jmsg], live_baseline => $live_baseline } unless $okj;
     return { ok => 0, next_stage => 'phase5', reasons => ["$fname hash mismatch"], live_baseline => $live_baseline }
@@ -4189,7 +4292,7 @@ sub cmd_commit_phase5 {
 
       # Independent hard checks (compensating for task_context.py skipping missing/seed-only JSONL!).
       for my $fname (qw(implement.jsonl check.jsonl)) {
-        my ($okj, $jmsg) = _validate_jsonl_non_seed($repo, "$real_task/$fname");
+        my ($okj, $jmsg) = _validate_jsonl_non_seed($repo, _fs_join($real_task, $fname));
         die_err("Phase 5 JSONL gate failed: $jmsg", 3) unless $okj;
       }
       my ($okc, $cmsg) = _validate_implement_codification($real_task, $st);
@@ -4425,9 +4528,31 @@ sub _verify_activation_postconditions {
   }
 }
 
+sub _prepare_phase6_lock {
+  my ($task_arg, $create_plans_dir) = @_;
+  die_err("EXTERNAL_CONFLICT: symlink forbidden at task directory " . _display_path($task_arg), 2)
+    if -l $task_arg;
+  my $real_task = abs_path($task_arg) // die_err("invalid --task");
+  die_err("invalid --task: not a directory") unless -d $real_task;
+  my $plans_dir = "$real_task/research/plans";
+  my $lock_path = "$plans_dir/.activation.lock";
+  eval { ensure_no_symlink_components($real_task, $lock_path); };
+  die_err(_display_path($@), 2) if $@;
+  if ($create_plans_dir && !-d $plans_dir) {
+    make_path($plans_dir);
+    eval { ensure_no_symlink_components($real_task, $lock_path); };
+    die_err(_display_path($@), 2) if $@;
+  }
+  return ($real_task, $plans_dir);
+}
+
 sub _try_activation_lock {
-  my ($plans_dir) = @_;
+  my ($plans_dir, $real_task) = @_;
   my $lp = "$plans_dir/.activation.lock";
+  if (defined $real_task && length $real_task) {
+    eval { ensure_no_symlink_components($real_task, $lp); };
+    die_err(_display_path($@), 2) if $@;
+  }
   my $o_nofollow = eval { Fcntl::O_NOFOLLOW() } || 0;
   die_err("EXTERNAL_CONFLICT: symlink or non-regular lockfile at " . _display_path($lp), 2)
     if -l $lp || (-e $lp && !-f $lp);
@@ -4449,12 +4574,10 @@ sub cmd_activate_task {
   die_err("activate-task requires --task, --owner, --authorization")
     unless defined $opt{task} && defined $opt{owner} && defined $opt{authorization};
 
-  my $real_task = abs_path($opt{task}) // die_err("invalid --task");
-  my $plans_dir = "$real_task/research/plans";
-  make_path($plans_dir) unless -d $plans_dir;
+  my ($real_task, $plans_dir) = _prepare_phase6_lock($opt{task}, 1);
 
   # 1. Acquire process-lifetime non-blocking activation lock FIRST!
-  my $act_lock_fh = _try_activation_lock($plans_dir);
+  my $act_lock_fh = _try_activation_lock($plans_dir, $real_task);
   if (!$act_lock_fh) {
     print "ACTIVATION_IN_PROGRESS=1\nREASON=another starter currently holds .activation.lock\n";
     exit 5;
@@ -4610,9 +4733,8 @@ sub cmd_recover_activation {
   my %opt = @_;
   die_err("recover-activation requires --task") unless defined $opt{task} && -d $opt{task};
 
-  my $real_task = abs_path($opt{task}) // die_err("invalid --task");
-  my $plans_dir = "$real_task/research/plans";
-  my $act_lock_fh = _try_activation_lock($plans_dir);
+  my ($real_task, $plans_dir) = _prepare_phase6_lock($opt{task}, 0);
+  my $act_lock_fh = _try_activation_lock($plans_dir, $real_task);
   if (!$act_lock_fh) {
     print "ACTIVATION_IN_PROGRESS=1\nREASON=original starter still holds .activation.lock\n";
     exit 5;
@@ -4728,9 +4850,8 @@ sub cmd_recover_activation {
 sub cmd_cancel_activating {
   my %opt = @_;
   die_err("cancel-activating requires --task") unless defined $opt{task} && -d $opt{task};
-  my $real_task = abs_path($opt{task}) // die_err("invalid --task");
-  my $plans_dir = "$real_task/research/plans";
-  my $act_lock_fh = _try_activation_lock($plans_dir);
+  my ($real_task, $plans_dir) = _prepare_phase6_lock($opt{task}, 0);
+  my $act_lock_fh = _try_activation_lock($plans_dir, $real_task);
   if (!$act_lock_fh) {
     print "ACTIVATION_IN_PROGRESS=1\nREASON=starter holds .activation.lock\n";
     exit 5;
@@ -4779,9 +4900,8 @@ sub cmd_resolve_activation {
   die_err("invalid --resolution '$opt{resolution}'")
     unless $opt{resolution} eq 'confirmed_activated' || $opt{resolution} eq 'reset_to_ready';
 
-  my $real_task = abs_path($opt{task}) // die_err("invalid --task");
-  my $plans_dir = "$real_task/research/plans";
-  my $act_lock_fh = _try_activation_lock($plans_dir);
+  my ($real_task, $plans_dir) = _prepare_phase6_lock($opt{task}, 0);
+  my $act_lock_fh = _try_activation_lock($plans_dir, $real_task);
   if (!$act_lock_fh) {
     print "ACTIVATION_IN_PROGRESS=1\nREASON=starter holds .activation.lock\n";
     exit 5;

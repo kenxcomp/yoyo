@@ -765,6 +765,51 @@ bash "$ST" record-dispatch "$RD2P1" --slot s2 --attempt 1 --owner "$OWNER" --tas
 bash "$ST" record-result "$RD2P1" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2p1b --input "$F_CLEAN" >/dev/null
 out_collapse=$(bash "$ST" finish "$RD2P1" --merged "$F_ONE_P1_DOUBLE_SRC"); rc=$?
 expect "council rejects collapsing 2 same-severity P1 findings from 1 slot into 1" "5:error" "$rc:$(printf '%s\n' "$out_collapse" | kv VERDICT)"
+# Round 4 High #2: duplicate copies of Bug One (exact or tweaked) CANNOT substitute for independent Bug Two!
+F_TWO_P1_DUP="$TMP/two-p1-dup.json"
+cat > "$F_TWO_P1_DUP" <<'EOF'
+{
+  "summary": "Duplicated Bug One twice to drop Bug Two.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
+      "sources": ["s1"]
+    },
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
+      "sources": ["s1"]
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_TWO_P1_DUP_TWEAK="$TMP/two-p1-dup-tweak.json"
+cat > "$F_TWO_P1_DUP_TWEAK" <<'EOF'
+{
+  "summary": "Tweaked duplicate of Bug One to drop Bug Two.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
+      "sources": ["s1"]
+    },
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One copy", "location": "app.txt:1",
+      "pattern": "p1 copy", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1 copy", "prevent": "t1",
+      "sources": ["s1"]
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+out_dup1=$(bash "$ST" finish "$RD2P1" --merged "$F_TWO_P1_DUP"); rc=$?
+expect "council rejects substituting 2 exact copies of Bug One for [Bug One, Bug Two]" "5:error" "$rc:$(printf '%s\n' "$out_dup1" | kv VERDICT)"
+out_dup2=$(bash "$ST" finish "$RD2P1" --merged "$F_TWO_P1_DUP_TWEAK"); rc=$?
+expect "council rejects substituting tweaked copy of Bug One for [Bug One, Bug Two]" "5:error" "$rc:$(printf '%s\n' "$out_dup2" | kv VERDICT)"
 out_both=$(bash "$ST" finish "$RD2P1" --merged "$F_TWO_P1_MERGED"); rc=$?
 expect "council accepts preserving both P1 findings 1-to-1" "0:dirty:2" "$rc:$(printf '%s\n' "$out_both" | kv VERDICT):$(printf '%s\n' "$out_both" | kv P1)"
 
@@ -819,6 +864,59 @@ out_sb1=$(bash "$ST" finish "$RD2SB" --merged "$F_ONE_SB_MERGED"); rc=$?
 expect "council rejects dropping 1 of 2 step_back[] proposals" "5:error" "$rc:$(printf '%s\n' "$out_sb1" | kv VERDICT)"
 out_sb2=$(bash "$ST" finish "$RD2SB" --merged "$F_TWO_SB_MERGED"); rc=$?
 expect "council accepts preserving both step_back[] proposals 1-to-1" "0:clean" "$rc:$(printf '%s\n' "$out_sb2" | kv VERDICT)"
+
+# Round 4 High #2 (step_back): 2 independent proposals covering the SAME class C1 CANNOT be replaced by 2 copies of Proposal X!
+F_TWO_SB_SAME_CLS="$TMP/two-sb-same-cls.json"
+cat > "$F_TWO_SB_SAME_CLS" <<'EOF'
+{
+  "summary": "Two independent proposals for C1.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Split FSM table", "invites_because": "a", "approach_change": "extract explicit state table", "prevent": "t1" },
+    { "classes": ["C1"], "name": "Enforce lock order", "invites_because": "b", "approach_change": "acquire repo lock before task lock", "prevent": "t2" }
+  ],
+  "out_of_scope": []
+}
+EOF
+F_TWO_SB_SAME_DUP="$TMP/two-sb-same-dup.json"
+cat > "$F_TWO_SB_SAME_DUP" <<'EOF'
+{
+  "summary": "Substituted two copies of Proposal 1.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Split FSM table", "invites_because": "a", "approach_change": "extract explicit state table", "prevent": "t1", "sources": ["s1"] },
+    { "classes": ["C1"], "name": "Split FSM table v2", "invites_because": "a", "approach_change": "extract explicit state table v2", "prevent": "t1", "sources": ["s1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+F_TWO_SB_SAME_OK="$TMP/two-sb-same-ok.json"
+cat > "$F_TWO_SB_SAME_OK" <<'EOF'
+{
+  "summary": "Preserved both proposals for C1.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Split FSM table", "invites_because": "a", "approach_change": "extract explicit state table", "prevent": "t1", "sources": ["s1"] },
+    { "classes": ["C1"], "name": "Enforce lock order", "invites_because": "b", "approach_change": "acquire repo lock before task lock", "prevent": "t2", "sources": ["s1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+po_2sb_same=$(bash "$ST" prepare --purpose step-back --mode step-back --base main --slots s1,s2 --owner "$OWNER")
+RD2SBS=$(printf '%s\n' "$po_2sb_same" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RD2SBS" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2SBS" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2sbsa --child-thread-id ct2sbsa >/dev/null
+bash "$ST" record-result "$RD2SBS" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2sbsa --input "$F_TWO_SB_SAME_CLS" >/dev/null
+bash "$ST" claim-slot "$RD2SBS" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2SBS" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2sbsb --child-thread-id ct2sbsb >/dev/null
+bash "$ST" record-result "$RD2SBS" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2sbsb --input "$F_CLEAN" >/dev/null
+out_sbs_dup=$(bash "$ST" finish "$RD2SBS" --merged "$F_TWO_SB_SAME_DUP"); rc=$?
+expect "council rejects substituting 2 copies of Proposal 1 for 2 independent same-class step_back[] proposals" "5:error" "$rc:$(printf '%s\n' "$out_sbs_dup" | kv VERDICT)"
+out_sbs_ok=$(bash "$ST" finish "$RD2SBS" --merged "$F_TWO_SB_SAME_OK"); rc=$?
+expect "council accepts preserving both independent same-class step_back[] proposals" "0:clean" "$rc:$(printf '%s\n' "$out_sbs_ok" | kv VERDICT)"
 
 # 8e. SIGTERM on submodule git rev-parse HEAD fails closed & unborn nested gitdir leaks ZERO stderr!
 SIG_BIN="$TMP/t3-git-sigterm"

@@ -636,6 +636,40 @@ mkdir -p "$CAS_REPO"
   [ "$(git rev-parse refs/heads/main)" = "$B_SHA" ] || exit 13
 ) && ok || bad "CAS merge failed to abort on concurrent target rewind A -> B"
 
+# 9b. Round 4 High #4: Path A git checkout refuses atomically when target is concurrently checked out in another worktree,
+#     and both merge protocols enforce repo-common lock + re-run defer guidance (no bare git merge on target move/rewind).
+PA_REPO="$TMP/patha-race-repo"
+PA_OTHER_WT="$TMP/patha-other-wt"
+mkdir -p "$PA_REPO"
+(
+  cd "$PA_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'a\n' > f.txt && git add f.txt && git commit -qm "commit A"
+  A_SHA=$(git rev-parse HEAD)
+  git switch -qc feat/patha
+  printf 'f\n' >> f.txt && git commit -qam "commit F"
+  # Simulate concurrent checkout of main in another worktree right after Path A detection:
+  git worktree add -q "$PA_OTHER_WT" main >/dev/null 2>&1
+  # Path A claims main via git checkout (NOT bare update-ref) -> Git MUST reject atomically, leaving PA_OTHER_WT intact!
+  if git checkout -q main 2>/dev/null; then
+    exit 21
+  fi
+  [ "$(git rev-parse refs/heads/main)" = "$A_SHA" ] || exit 22
+  [ "$(git -C "$PA_OTHER_WT" rev-parse HEAD)" = "$A_SHA" ] || exit 23
+  [ -z "$(git -C "$PA_OTHER_WT" status --porcelain)" ] || exit 24
+) && ok || bad "Path A git checkout failed to abort cleanly against concurrent target worktree checkout"
+
+CODEX_MERGE_DOC="$HERE/../commands/cr-loop-merge.md"
+T3_MERGE_DOC="$HERE/../../t3-cr-loop/skills/t3-cr-loop-merge/SKILL.md"
+(
+  grep -q 'cr-loop-merge.lock' "$CODEX_MERGE_DOC" &&
+  grep -q 'cr-loop-merge.lock' "$T3_MERGE_DOC" &&
+  grep -q 'git checkout "${CR_MERGE_TARGET:-main}"' "$CODEX_MERGE_DOC" &&
+  grep -q 'git checkout "$CR_MERGE_TARGET"' "$T3_MERGE_DOC" &&
+  ! grep -q 'git checkout main && git merge' "$CODEX_MERGE_DOC" &&
+  ! grep -q 'git checkout main && git merge' "$T3_MERGE_DOC"
+) && ok || bad "merge protocol docs missing repo-common lock, Path A checkout claim, or safe defer guidance"
+
 # 10. SIGTERM on submodule git rev-parse HEAD fails closed (NEVER misclassified as UNBORN)!
 SIG_GIT_BIN="$TMP/codex-git-sigterm"
 mkdir -p "$SIG_GIT_BIN"

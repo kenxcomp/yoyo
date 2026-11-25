@@ -1908,9 +1908,10 @@ assert_rc "inspect-task on Chinese task dir 01-中文 succeeds" "$rc" 0
 TDIR_OUT=$(printf '%s\n' "$out_ik" | sed -n 's/^TASK_DIR=//p')
 [ -d "$TDIR_OUT" ] && ok "inspect-task TASK_DIR prints exact valid UTF-8 path (no mojibake): $TDIR_OUT" || fail "inspect-task TASK_DIR mojibaked: $TDIR_OUT"
 
-# Initialize WITH project config active (roundCap=1, maxStepBacks=0) to also test K5 toggle!
-out=$(bash "$STATE" commit-phase0 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
-assert_rc "commit-phase0 on Chinese task dir 01-中文 succeeds (no EXTERNAL_CONFLICT)" "$rc" 0
+# Initialize WITH project config active (roundCap=1, maxStepBacks=0) AND Chinese --authorization
+# so planning-state.json has non-ASCII UTF-8 strings from Phase 0 onward (Round 4 High #1 regression!).
+out=$(bash "$STATE" commit-phase0 --task "$TASK_K" --repo "$REPO_K" --authorization "用户批准中文规划" 2>&1); rc=$?
+assert_rc "commit-phase0 on Chinese task dir 01-中文 with Chinese --authorization succeeds" "$rc" 0
 
 # Phase 1 -> Phase 2a -> Phase 2b on Chinese task dir!
 pd_k=$(bash "$STATE" prepare-design --task "$TASK_K" --repo "$REPO_K" --slots-json "$TMP/designers.json" --owner "owner-k1")
@@ -2054,6 +2055,51 @@ bash "$STATE" record-result --task "$TASK_K" --run-id "$PRK1_RUN" --generation 1
 
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-collapsed.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council rejects collapsing 2 independent BLOCKERs from 1 slot into 1 (exit 3)" "$rc" 3
+# Round 4 High #2: duplicating Blocker One (exact or tweaked) CANNOT substitute for independent Blocker Two!
+cat > "$TMP/rev-k1-dup.json" <<EOF
+{
+  "summary": "Duplicated Blocker One twice", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1"]
+    },
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1"]
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-k1-dup-tweak.json" <<EOF
+{
+  "summary": "Tweaked duplicate of Blocker One", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1"]
+    },
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One copy", "location": "design.md:1",
+      "pattern": "p1 copy", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1 copy", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1"]
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-dup.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects substituting 2 exact copies of Blocker One for [Blocker One, Blocker Two] (exit 3)" "$rc" 3
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-dup-tweak.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects substituting tweaked copy of Blocker One for [Blocker One, Blocker Two] (exit 3)" "$rc" 3
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-both.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council accepts preserving both BLOCKERs 1-to-1" "$rc" 0
 
@@ -2158,6 +2204,21 @@ EOF
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k2-reopen-downgrade.json" 2>&1); rc=$?
 assert_rc "disputes[] resolution=reopen CANNOT downgrade reopened BLOCKER to OPTIONAL (exit 3)" "$rc" 3
 
+# (ii-b) Round 4 High #3: disputes[] resolution=reopen + contradictory --dismissed-findings CANNOT downgrade to OPTIONAL / clean!
+cat > "$TMP/disp-k2-contradict.json" <<'EOF'
+[
+  {
+    "slot": "slot1",
+    "title": "D1 still broken",
+    "severity": "BLOCKER",
+    "reopens": "D1",
+    "code_evidence": "src/app.py:1"
+  }
+]
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k2-reopen-downgrade.json" --dismissed-findings "$TMP/disp-k2-contradict.json" 2>&1); rc=$?
+assert_rc "disputes[] resolution=reopen + contradictory --dismissed-findings rejected (exit 3, never clean)" "$rc" 3
+
 # (iii) Valid slots with genuine reopen-vs-verified disagreement resolved 'verified' -> PASSES!
 cat > "$TMP/rev-k2-valid-dispute.json" <<EOF
 {
@@ -2226,6 +2287,20 @@ bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKSB_RUN" --generatio
 bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKSB_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-sbb" --child-run-id "crk-sbb" --input "$TMP/rev-ksb-clean.json" >/dev/null
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-one.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council rejects dropping 1 of 2 step_back[] proposals (exit 3)" "$rc" 3
+# Round 4 High #2 (step_back): 2 copies of Prop 1 covering superset classes ["D1","D2"] CANNOT substitute for [Prop 1, Prop 2]!
+cat > "$TMP/rev-ksb-dup.json" <<EOF
+{
+  "summary": "Duplicated Prop 1 with superset classes", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
+  "findings": [], "verified": [],
+  "step_back": [
+    { "classes": ["D1", "D2"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["slot1"] },
+    { "classes": ["D1", "D2"], "name": "Prop 1 copy", "invites_because": "a", "approach_change": "x copy", "prevent": "t1", "sources": ["slot1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-dup.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects substituting 2 copies of Prop 1 (superset classes) for [Prop 1, Prop 2] (exit 3)" "$rc" 3
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-both.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council accepts preserving both step_back[] proposals 1-to-1" "$rc" 0
 
@@ -2275,6 +2350,16 @@ assert_rc "Phase 5 rejects numeric codified invariant_id:701 / guard_test:703 in
 cp "$TMP/ps-k.bak" "$TASK_K/research/plans/planning-state.json"
 out=$(bash "$STATE" commit-phase5 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
 assert_rc "Phase 5 succeeds on Chinese task dir once valid string JSONL & codified restored" "$rc" 0
+
+# Round 4 High #1: extend Chinese task dir (01-中文 with non-ASCII state) all the way through Phase 6 activation!
+out=$(bash "$STATE" commit-phase6-ready --task "$TASK_K" --repo "$REPO_K" --authorization "用户批准启动中文任务" 2>&1); rc=$?
+assert_rc "commit-phase6-ready succeeds on Chinese task dir 01-中文" "$rc" 0
+out=$(TRELLIS_CONTEXT_ID="ctx-k-zh" bash "$STATE" activate-task --task "$TASK_K" --repo "$REPO_K" --owner "owner-k1" --authorization "用户批准启动中文任务" 2>&1); rc=$?
+assert_rc "activate-task on Chinese task dir 01-中文 succeeds cleanly (never activation_uncertain)" "$rc" 0
+assert_contains "activate-task on Chinese task dir emits ACTIVATED=1" "$out" "ACTIVATED=1"
+out_cfk=$(bash "$STATE" check-freshness --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
+assert_rc "check-freshness after Phase 6 activation on Chinese task dir succeeds" "$rc" 0
+assert_contains "check-freshness after Phase 6 activation on Chinese task dir reports NEXT_STAGE=done" "$out_cfk" "NEXT_STAGE=done"
 
 # K7. TriTx::_git SIGTERM on rev-parse HEAD fails closed (NEVER returns UNBORN!) + TriTx catches 2nd edit to untracked file inside submodule!
 SHIM_HEAD="$TMP/git-sigterm-head"
