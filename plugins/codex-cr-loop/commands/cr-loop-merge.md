@@ -113,7 +113,7 @@ that v1.7.0 removed are mapped. This command adds two:
        - **(B) Abort.**
 
        Block on the reply. "No response" is not consent.
-   - **Initialize** `ROUND_NUM=0`, `CLEAN_STREAK=0`, and leave `LAST_CLEAN_HEAD` empty.
+   - **Initialize** `ROUND_NUM=0`. The persisted counters (including `clean_streak`) and ledger belong to `cr-review.sh`.
 
 2. **Run the review loop: protocol steps 2–7.** Follow them exactly as written, using
    `BASE` from step 1.
@@ -154,18 +154,20 @@ that v1.7.0 removed are mapped. This command adds two:
      `auto` → no flag, `ff-only` → `--ff-only`, `no-ff` → `--no-ff`. Then run:
      ```bash
      git checkout "${CR_MERGE_TARGET:-main}"
-     git merge $MERGE_FLAG "$FEATURE_BRANCH"
+     git merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"
      git checkout "$FEATURE_BRANCH"
      ```
    - **Path B: another worktree at `$MAIN_WT` has the target checked out.**
-     - **If a fast-forward is possible,** run
-       `git fetch . "HEAD:refs/heads/${CR_MERGE_TARGET:-main}"`. This is a local fetch with
-       no network and no push.
-     - **If a true merge is needed,** defer with `Merge status: deferred — target locked by
-       worktree at $MAIN_WT and merge is not fast-forward`. Include the command
-       `cd "$MAIN_WT" && git merge $MERGE_FLAG "$FEATURE_BRANCH"`.
+     Never run `git fetch . HEAD:refs/heads/<target>` into a branch that is checked out (Git rejects it, and updating a checked-out ref without updating its index/worktree would corrupt that worktree). Instead:
+     1. Verify `$MAIN_WT` is on `${CR_MERGE_TARGET:-main}`, at the expected ref tip (`[ "$(git -C "$MAIN_WT" branch --show-current)" = "${CR_MERGE_TARGET:-main}" ]`), and completely clean (`[ -z "$(git -C "$MAIN_WT" status --porcelain --untracked-files=all)" ]`).
+     2. If `$MAIN_WT` is dirty or drifted, defer with `Merge status: deferred — target worktree at $MAIN_WT is dirty or not on ${CR_MERGE_TARGET:-main}` and print `cd "$MAIN_WT" && git merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"`.
+     3. If `$MAIN_WT` is clean, run the user's selected `CR_MERGE_FF` merge mode directly inside `$MAIN_WT`:
+        ```bash
+        git -C "$MAIN_WT" merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"
+        ```
+        On conflict, run `git -C "$MAIN_WT" merge --abort` and defer with `Merge status: deferred — conflicts on <files>`.
    - **Hook failure:** defer and show the hook output. Never use `--no-verify`.
-   - **Conflict in Path A:** run `git merge --abort`, then defer with
+   - **Conflict in Path A:** run `git merge --abort`, return to `$FEATURE_BRANCH`, then defer with
      `Merge status: deferred — conflicts on <files>`.
 
    **After a successful merge:**
@@ -210,13 +212,10 @@ The shared guardrails from the protocol apply. In addition:
   pending.
 - **Base-currency gate.** The preflight is hard by default. It is local only, and it never
   auto-rebases. Disable it with `CR_LOOP_REQUIRE_REBASED=0`.
-- **Never `git push`.** If you need to push, you are in the wrong command; use `/cr-loop`
-  or `/cr-loop-pr`.
+- **Never `git push`.** If you need to push, you are in the wrong command; use `/cr-loop-pr` (or `/cr-loop` to stop locally and push manually).
 - **Never `--force` the merge.** `--ff-only` is allowed. `--force`, `--force-with-lease`,
   `-X theirs` and `-X ours` are forbidden.
-- **Worktree-aware.** When another worktree has the target checked out, the only automatic
-  path is a fast-forward through `git fetch . HEAD:refs/heads/<target>`. Anything else is
-  deferred with a manual command. Never force-checkout a locked branch.
+- **Worktree-aware.** When another worktree at `$MAIN_WT` has the target checked out, verify `$MAIN_WT` is clean and on `${CR_MERGE_TARGET:-main}`, then run `git -C "$MAIN_WT" merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"` (honoring `CR_MERGE_FF`); if `$MAIN_WT` is dirty or conflicts, abort/defer with a manual command. Never force-checkout a locked branch or fetch into a checked-out ref.
 
 ## Differences from `/cr-loop`
 

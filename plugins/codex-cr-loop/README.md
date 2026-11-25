@@ -224,8 +224,16 @@ The change under review must not be able to edit the checks that review it.
 - The output schema is unchanged: the classification is computed by the script, not
   reported by the reviewer, so it cannot be missed and is testable without Codex.
 - **Results are bound to what the reviewer read.** Besides HEAD, `finish` checks that the
-  HEAD reflog did not grow (HEAD moved and came back) and that tracked files were not edited
-  during the round. Rounds started by v1.7.0 still finish with the HEAD check only.
+  HEAD reflog did not grow (HEAD moved and came back) and that neither tracked files nor
+  non-ignored, non-handoff untracked files changed between start and finish snapshots
+  (`tree_fp` v2; v1.8.1). Rounds started before v1.8.1 keep their prior snapshot check.
+- **v1.8.1 hardening:** atomic `pending.tx` commit & recovery across all state writers
+  (`scripts/cr-tx.sh`), persisted `clean_streak` + strict convergence verification in
+  `mark-converged` (separating two-round convergence from `--post-rebase` confirmation),
+  `.gitattributes`-immune raw-blob rule inspection (`--no-relative --no-abbrev`), strict
+  JSON parsing (rejects duplicate keys, extra properties, and non-string scalars),
+  post-convergence `RECURRING` scoping, `ps -ww` runner verification, bounded `wait`
+  backoff, and `/cr-loop-pr` Step 8.0 base propagation + pre-rebase pinned lease.
 
 ## Breaking changes in v1.7.0
 

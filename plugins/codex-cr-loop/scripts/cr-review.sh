@@ -7,17 +7,22 @@
 #
 # Subcommands (run inside the feature branch's worktree):
 #   init                         create/load per-branch state, print knobs + state
-#   next [--clean-streak N]      print the mode the next round must use
+#   next [--clean-streak N] [--base REF]
+#                                print the mode the next round must use
 #   start --mode M --base REF [--since SHA]
 #                                launch one detached `codex exec` review round
 #   status [ROUND_DIR]           running / done for a round (default: current)
 #   wait [ROUND_DIR] [--timeout S]
 #                                block up to S seconds (default 540) for a round
-#   finish [ROUND_DIR]           head/tree-drift check, classify, append ledger, update counters
-#   ack-rules FP [NOTE...]       record a person's approval of the branch's rule-file edits (fingerprint FP)
+#   finish [ROUND_DIR]           head/tree-drift check, classify, atomic ledger/state commit
+#   ack-rules FP [--base REF] [NOTE...]
+#                                record a person's approval of pending needs-human rule edits
 #   note TEXT...                 append an author note (status, deferral, prevention) to the ledger
 #   add SEVERITY TITLE [DETAIL]  register an external finding (PR bot, human) as a new class id
-#   mark-converged               record convergence; reset round-cap counters
+#   mark-converged [--post-rebase] [--base REF] [--round ROUND_DIR]
+#                                verify convergence proof, record in ledger, reset round-cap counters
+#   release-state get | set KEY=VAL... | clear
+#                                atomically read/update/clear PR 8.0 release/rebase intent state
 #   cancel [ROUND_DIR]           stop a running round (only its own PIDs)
 #   reset                        archive this branch's state + ledger (fresh start)
 #   paths                        print STATE_DIR / LEDGER / STATE
@@ -32,10 +37,12 @@
 
 set -u
 
-SELF_VERSION="1.8.0"
+SELF_VERSION="1.8.1"
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 SCHEMA="$HERE/../references/review-output.schema.json"
 RULES="$HERE/review-rules.sh"
+# shellcheck source=cr-tx.sh
+. "$HERE/cr-tx.sh"
 
 die() { printf 'cr-review: %s\n' "$*" >&2; exit 2; }
 
@@ -56,7 +63,7 @@ resolve_paths() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
   BRANCH=$(git branch --show-current 2>/dev/null)
   [ -n "$BRANCH" ] || die "detached HEAD — check out a branch first"
-  ROOT=$(git rev-parse --show-toplevel)
+  ROOT=$(git rev-parse --show-toplevel) || die "cannot resolve repository root"
   # --git-common-dir is relative to the *current directory* (not the top level)
   # when git prints it relative; ask for an absolute path (git >= 2.31) and fall
   # back to resolving against $PWD for older git.
@@ -79,40 +86,38 @@ sget() {
 
 sset() {
   tmp="$STATE.tmp.$$"
-  { grep -v "^$1=" "$STATE" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$tmp" && mv "$tmp" "$STATE"
+  { grep -v "^$1=" "$STATE" 2>/dev/null || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp" && mv "$tmp" "$STATE" || { rm -f "$tmp"; die "cannot update state key $1"; }
 }
 
 snum() { v=$(sget "$1"); is_uint "$v" && printf '%s\n' "$v" || printf '0\n'; }
 
 ensure_state() {
   mkdir -p "$STATE_DIR/rounds" || die "cannot create $STATE_DIR"
+  validate_branch_ownership
+  recover_pending_tx
   if [ ! -f "$STATE" ]; then
+    tmp="$STATE.tmp.$$"
     {
       printf 'branch=%s\n' "$BRANCH"
       printf 'created_at=%s\n' "$(now_utc)"
-      printf 'rounds_started=0\nrounds_total=0\ndirty_since_step_back=0\nstep_backs_done=0\nnext_class_id=1\n'
-    } > "$STATE"
+      printf 'rounds_started=0\nrounds_total=0\nlatest_finished_round=0\ndirty_since_step_back=0\nstep_backs_done=0\nnext_class_id=1\nclean_streak=0\n'
+    } > "$tmp" && mv "$tmp" "$STATE" || { rm -f "$tmp"; die "cannot initialize $STATE"; }
   fi
-  stored=$(sget branch)
-  [ "$stored" = "$BRANCH" ] || die "state dir $STATE_DIR belongs to branch '$stored', not '$BRANCH' (key collision) — run 'reset' or rename the branch"
   if [ ! -f "$LEDGER" ]; then
+    ltmp="$LEDGER.tmp.$$"
     {
       printf '# cr-loop findings ledger — %s\n\n' "$BRANCH"
       printf 'Append-only. Class ids (C1, C2, ...) are stable for this branch. Reviewers must not\n'
       printf 're-report a class listed here; a reopened class cites its id ("[C3] ...").\n'
       printf 'Author notes mark classes fixed / deferred / accepted / wontfix / codified.\n'
-    } > "$LEDGER"
+    } > "$ltmp" && mv "$ltmp" "$LEDGER" || { rm -f "$ltmp"; die "cannot initialize $LEDGER"; }
   fi
 }
 
 # ---------------------------------------------------------------- lock ----
-# Every state transaction (init / next / start / finish / note / add /
-# mark-converged / cancel / reset) runs under ONE branch-level kernel advisory
-# lock: the dispatcher at the bottom re-execs the subcommand through perl, which
-# takes flock(LOCK_EX) on <state-dir>.lock and hands the locked descriptor to the
-# script as fd 9. The kernel releases it when the process exits (crash included),
-# so there is no ownership file and no stale-lock recovery. The detached reviewer
-# is launched with fd 9 closed, so it never holds the lock.
+# Every state transaction runs under ONE branch-level kernel advisory lock
+# (perl flock(LOCK_EX) on <state-dir>.lock held on fd 9). Detached reviewers
+# close fd 9 so they never hold the lock.
 
 with_branch_lock() {
   resolve_paths
@@ -127,9 +132,6 @@ with_branch_lock() {
       if (time > $deadline) { print STDERR "cr-review: state lock busy for 30s: $f\n"; exit 2 }
       select(undef, undef, undef, 0.1);
     }
-    # Hand the locked descriptor over as fd 9 and make sure it survives exec:
-    # dup2 is a no-op (keeping FD_CLOEXEC) when open() already returned fd 9,
-    # so always clear FD_CLOEXEC on fd 9 explicitly.
     if (fileno($l) != 9) { defined POSIX::dup2(fileno($l), 9) or do { print STDERR "cr-review: dup2: $!\n"; exit 2 } }
     open(my $nine, "+<&=", 9) or do { print STDERR "cr-review: fd 9: $!\n"; exit 2 };
     defined fcntl($nine, F_SETFD, 0) or do { print STDERR "cr-review: fcntl(F_SETFD): $!\n"; exit 2 };
@@ -165,29 +167,46 @@ resolve_knobs() {
 
 # --------------------------------------------------------------- rounds ----
 
+validate_round_dir() {
+  raw="$1"
+  [ -d "$raw" ] || die "round dir not found: $raw"
+  canon=$(cd "$raw" && pwd -P) || die "cannot resolve round dir: $raw"
+  rounds_root="$STATE_DIR/rounds"
+  [ -d "$rounds_root" ] || die "rounds dir missing: $rounds_root"
+  rounds_canon=$(cd "$rounds_root" && pwd -P) || die "cannot resolve rounds dir"
+  case "$canon" in
+    "$rounds_canon/"*)
+      rel="${canon#"$rounds_canon/"}"
+      case "$rel" in */*) die "round dir must be a direct child of $rounds_canon: $canon" ;; esac
+      ;;
+    *) die "round dir does not belong to branch '$BRANCH': $canon" ;;
+  esac
+  printf '%s\n' "$canon"
+}
+
 round_dir_arg() {
   d="${1:-}"
   [ -n "$d" ] || d=$(sget current_round_dir)
   [ -n "$d" ] || die "no round given and no current round recorded"
-  [ -d "$d" ] || die "round dir not found: $d"
-  printf '%s\n' "$d"
+  validate_round_dir "$d"
 }
 
 mget() { sed -n "s/^$2=//p" "$1/meta" | tail -n 1; }
 
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
-# A persisted PID only counts as this round's runner if the live process with that
-# PID is still running "cr-review.sh _run <this round dir>" (PIDs are reused after
-# a crash or reboot). Signals are only ever sent to verified processes.
-runner_pid() { # prints the verified runner PID of round $1, or nothing
+# Verify persisted PID is still running "cr-review.sh _run <this round dir>".
+# Uses -ww so macOS/BSD ps never truncates long worktree paths, and anchors the
+# match at end-of-line so a prefix dir can never match another round.
+runner_pid() {
   rp=$(cat "$1/pid" 2>/dev/null)
   pid_alive "$rp" || return 1
-  cmdline=$(ps -o command= -p "$rp" 2>/dev/null) || return 1
-  case "$cmdline" in *"_run $1"*) printf '%s\n' "$rp" ;; *) return 1 ;; esac
+  cmdline=$(ps -ww -o command= -p "$rp" 2>/dev/null) || return 1
+  cmdline=$(printf '%s' "$cmdline" | sed 's/[[:space:]]*$//')
+  case "$cmdline" in *"_run $1") printf '%s\n' "$rp" ;; *) return 1 ;; esac
 }
 
-codex_pid() { # prints the verified codex child PID of round $1 (parent == verified runner)
+codex_pid() {
   rp=$(runner_pid "$1") || return 1
   cp=$(cat "$1/codex.pid" 2>/dev/null)
   pid_alive "$cp" || return 1
@@ -195,16 +214,122 @@ codex_pid() { # prints the verified codex child PID of round $1 (parent == verif
 }
 
 round_state() {
-  # prints running | done | dead
   if [ -f "$1/exit" ]; then printf 'done\n'; return; fi
   if runner_pid "$1" >/dev/null; then printf 'running\n'; else printf 'dead\n'; fi
 }
 
-# Snapshot of what a round reads besides the commit: the number of HEAD reflog entries
-# (catches HEAD moving away and back during the round) and a hash of the tracked
-# working-tree diff (catches uncommitted edits the reviewer may have read).
-head_moves() { git reflog show --format=%H HEAD 2>/dev/null | wc -l | tr -d ' '; }
-tree_fp() { git diff HEAD --no-ext-diff --no-textconv --binary 2>/dev/null | git hash-object --stdin; }
+# Fail-closed snapshots of HEAD reflog count and working tree (v1 tracked-only for
+# pre-1.8.1 round metas; v2 tracked diff + non-ignored non-handoff untracked files).
+head_moves() {
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cr-hm.XXXXXX") || return 1
+  if ! git -C "$ROOT" reflog show --format=%H HEAD > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  cnt=$(wc -l < "$tmp" | tr -d ' ')
+  rm -f "$tmp"
+  is_uint "$cnt" || return 1
+  printf '%s\n' "$cnt"
+}
+
+tree_fp_v1() {
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cr-tf1.XXXXXX") || return 1
+  if ! git -C "$ROOT" diff HEAD --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  h=$(git -C "$ROOT" hash-object --stdin < "$tmp" 2>/dev/null)
+  rc=$?
+  rm -f "$tmp"
+  [ "$rc" -eq 0 ] && [ -n "$h" ] || return 1
+  printf '%s\n' "$h"
+}
+
+tree_fp_v2() {
+  tdiff=$(mktemp "${TMPDIR:-/tmp}/cr-tf2d.XXXXXX") || return 1
+  tidx=$(mktemp "${TMPDIR:-/tmp}/cr-tf2i.XXXXXX") || { rm -f "$tdiff"; return 1; }
+  twt=$(mktemp "${TMPDIR:-/tmp}/cr-tf2w.XXXXXX") || { rm -f "$tdiff" "$tidx"; return 1; }
+  tuntr=$(mktemp "${TMPDIR:-/tmp}/cr-tf2u.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt"; return 1; }
+  tman=$(mktemp "${TMPDIR:-/tmp}/cr-tf2m.XXXXXX") || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr"; return 1; }
+  if ! git -C "$ROOT" diff HEAD --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tdiff" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+  fi
+  if ! git -C "$ROOT" diff --cached --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$tidx" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+  fi
+  if ! git -C "$ROOT" diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --binary > "$twt" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+  fi
+  dh=$(git -C "$ROOT" hash-object --stdin < "$tdiff" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  ih=$(git -C "$ROOT" hash-object --stdin < "$tidx" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  wh=$(git -C "$ROOT" hash-object --stdin < "$twt" 2>/dev/null) || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  if ! git -C "$ROOT" ls-files --others --exclude-standard -z > "$tuntr" 2>/dev/null; then
+    rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1
+  fi
+  perl -e '
+    use strict;
+    use warnings;
+    my ($root, $dh, $ih, $wh, $untr_file, $man_file) = @ARGV;
+    open(my $uf, "<:raw", $untr_file) or exit 1;
+    local $/ = "\0";
+    my @paths;
+    while (defined(my $p = <$uf>)) {
+      chomp $p;
+      next if $p eq "";
+      next if $p =~ /^\.cr-loop-handoff-round-[0-9]+\.md$/;
+      push @paths, $p;
+    }
+    close $uf;
+    @paths = sort @paths;
+    open(my $mf, ">:raw", $man_file) or exit 1;
+    print $mf "tracked\t$dh\nindex\t$ih\nworktree\t$wh\n";
+    for my $p (@paths) {
+      my $full = "$root/$p";
+      my $ep = $p; $ep =~ s/\\/\\\\/g; $ep =~ s/\n/\\n/g; $ep =~ s/\t/\\t/g;
+      if (-l $full) {
+        my $tgt = readlink($full);
+        defined $tgt or exit 1;
+        my $et = $tgt; $et =~ s/\\/\\\\/g; $et =~ s/\n/\\n/g; $et =~ s/\t/\\t/g;
+        print $mf "link\t$ep\t$et\n";
+      } elsif (-f $full) {
+        open(my $hf, "-|", "git", "-C", $root, "hash-object", "--no-filters", "--", $full) or exit 1;
+        my $oid = <$hf>;
+        close $hf or exit 1;
+        chomp $oid if defined $oid;
+        (defined $oid && $oid =~ /^[0-9a-f]{40,64}$/) or exit 1;
+        my $exec = (-x $full) ? "x" : "f";
+        print $mf "file\t$exec\t$oid\t$ep\n";
+      } elsif (-d $full) {
+        if (-e "$full/.git") {
+          open(my $gh, "-|", "git", "-C", $full, "rev-parse", "HEAD") or exit 1;
+          my $sh = <$gh>; close $gh;
+          $sh = defined($sh) ? $sh : ""; chomp $sh;
+          open(my $gs, "-|", "git", "-C", $full, "status", "--porcelain=v1", "-z") or exit 1;
+          local $/; my $st = <$gs>; close $gs or exit 1;
+          $st = "" unless defined $st;
+          my $st_hex = unpack("H*", $st);
+          print $mf "gitdir\t$sh\t$st_hex\t$ep\n";
+        } else {
+          print $mf "dir\t$ep\n";
+        }
+      } else {
+        print $mf "other\t$ep\n";
+      }
+    }
+    close $mf or exit 1;
+  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"; return 1; }
+  vh=$(git -C "$ROOT" hash-object --stdin < "$tman" 2>/dev/null)
+  rc=$?
+  rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tman"
+  [ "$rc" -eq 0 ] && [ -n "$vh" ] || return 1
+  printf 'v2:%s\n' "$vh"
+}
+
+tree_fp_matching() {
+  expected="$1"
+  case "$expected" in
+    v2:*) tree_fp_v2 ;;
+    *)    tree_fp_v1 ;;
+  esac
+}
 
 file_size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '0\n'; fi; }
 
@@ -220,6 +345,45 @@ print_status() {
   printf 'STATE=%s\nROUND_DIR=%s\nMODE=%s\nPID=%s\nEXIT=%s\nELAPSED_S=%s\nLOG_BYTES=%s\nLOG_AGE_S=%s\n' \
     "$st" "$d" "$(mget "$d" mode)" "$(cat "$d/pid" 2>/dev/null)" "$(cat "$d/exit" 2>/dev/null)" \
     "$elapsed" "$(file_size "$d/log")" "$(file_age "$d/log")"
+}
+
+# Compute RECURRING class ids across completed ## Round sections AFTER the latest
+# ## Converged marker, deduplicating per (round, class) and ignoring ## External finding.
+compute_recurring() {
+  ledger_file="$1"
+  perl -e '
+    use strict;
+    use warnings;
+    my ($f) = @ARGV;
+    open(my $fh, "<:encoding(UTF-8)", $f) or exit 0;
+    my @lines = <$fh>;
+    close $fh;
+    my $start = 0;
+    for (my $i = 0; $i < @lines; $i++) {
+      $start = $i + 1 if $lines[$i] =~ /^## Converged\b/;
+    }
+    my $in_round = 0;
+    my %round_seen;
+    my %counts;
+    for (my $i = $start; $i < @lines; $i++) {
+      my $l = $lines[$i];
+      if ($l =~ /^## Round /) {
+        $in_round = 1;
+        %round_seen = ();
+      } elsif ($l =~ /^## /) {
+        $in_round = 0;
+      } elsif ($in_round && $l =~ /^### (C\d+)\b/) {
+        my $cid = $1;
+        $counts{$cid}++ unless $round_seen{$cid}++;
+      }
+    }
+    my @rec = sort {
+      my ($an) = ($a =~ /(\d+)/);
+      my ($bn) = ($b =~ /(\d+)/);
+      $an <=> $bn;
+    } grep { $counts{$_} >= 2 } keys %counts;
+    print join(",", @rec);
+  ' "$ledger_file"
 }
 
 write_prompt() {
@@ -251,7 +415,6 @@ write_prompt() {
         printf -- '- If the ledger already lists classes, this is a confirmation pass after earlier fixes: also look for cross-cutting problems the fixes introduced together.\n'
         ;;
     esac
-    # Rules come from the base commit, never the branch's working tree (review-rules.sh).
     bash "$RULES" prompt "$base_ref" "$base_sha" "$head" || return 1
     printf '\nLEDGER (no repeats)\n'
     printf -- '- Read the findings ledger first: %s\n' "$LEDGER"
@@ -286,6 +449,8 @@ cmd_init() {
   printf 'ROUNDS_TOTAL=%s\nDIRTY_SINCE_STEP_BACK=%s\nSTEP_BACKS_DONE=%s\nLAST_REVIEWED_HEAD=%s\nCLASSES=%s\n' \
     "$(snum rounds_total)" "$(snum dirty_since_step_back)" "$(snum step_backs_done)" \
     "$(sget last_reviewed_head)" "$(( $(snum next_class_id) - 1 ))"
+  printf 'CLEAN_STREAK=%s\nLAST_CLEAN_HEAD=%s\nLAST_CLEAN_MODE=%s\n' \
+    "$(snum clean_streak)" "$(sget last_clean_head)" "$(sget last_clean_mode)"
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ]; then printf 'CURRENT_ROUND=%s (%s)\n' "$cur" "$(round_state "$cur")"; fi
   command -v codex >/dev/null 2>&1 && printf 'CODEX=%s\n' "$(command -v codex)" || printf 'CODEX=missing\n'
@@ -294,15 +459,52 @@ cmd_init() {
   return 0
 }
 
+# Compute persisted clean_streak valid for ($head, $target_base_sha, $SKIP_P3).
+effective_persisted_streak() {
+  eh="$1"; eb="$2"
+  pcs=$(snum clean_streak)
+  [ "$pcs" -gt 0 ] || { printf '0\n'; return; }
+  [ "$(sget last_clean_head)" = "$eh" ] || { printf '0\n'; return; }
+  [ "$(sget last_clean_skip_p3)" = "$SKIP_P3" ] || { printf '0\n'; return; }
+  if [ -n "$eb" ]; then
+    [ "$(sget last_clean_base_sha)" = "$eb" ] || { printf '0\n'; return; }
+  fi
+  printf '%s\n' "$pcs"
+}
+
 cmd_next() {
   resolve_paths; resolve_knobs; ensure_state
-  cs=0
+  cs_explicit=0; cs=0; base_arg=""
   while [ $# -gt 0 ]; do
-    case "$1" in --clean-streak) cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;; *) die "next: unknown arg $1" ;; esac
+    case "$1" in
+      --clean-streak) cs_explicit=1; cs="${2:-0}"; shift; [ $# -gt 0 ] && shift ;;
+      --base) base_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      *) die "next: unknown arg $1" ;;
+    esac
   done
   is_uint "$cs" || die "--clean-streak must be an integer"
+  head=$(git rev-parse HEAD) || die "cannot resolve HEAD"
+  base_sha=""
+  if [ -n "$base_arg" ]; then
+    base_sha=$(git rev-parse --verify --quiet "$base_arg^{commit}") || die "next: --base '$base_arg' does not resolve"
+  fi
+  if [ "$cs_explicit" -eq 0 ]; then
+    cs=$(effective_persisted_streak "$head" "$base_sha")
+  fi
   dsb=$(snum dirty_since_step_back); sbd=$(snum step_backs_done)
-  last=$(sget last_reviewed_head); head=$(git rev-parse HEAD)
+  last=$(sget last_reviewed_head); lcm=$(sget last_clean_mode)
+  bch=$(sget base_converged_head); bcb=$(sget base_converged_base_sha); bcp=$(sget base_converged_skip_p3)
+  # Already converged on this exact binding (only when caller did not override --clean-streak)
+  if [ "$cs_explicit" -eq 0 ]; then
+    if [ "$cs" -ge 2 ] && [ "$lcm" = "full" ]; then
+      printf 'MODE=converged\nCLEAN_STREAK=%s\nREASON=already converged on this HEAD/base/policy\n' "$cs"
+      return 0
+    fi
+    if [ -n "$bch" ] && [ "$bch" = "$head" ] && [ "$bcp" = "$SKIP_P3" ] && { [ -z "$base_sha" ] || [ "$bcb" = "$base_sha" ]; }; then
+      printf 'MODE=converged\nCLEAN_STREAK=%s\nREASON=recorded convergence already holds for this HEAD/base/policy\n' "$cs"
+      return 0
+    fi
+  fi
   if [ "$ROUND_CAP" -gt 0 ] && [ "$dsb" -ge "$ROUND_CAP" ]; then
     if [ "$sbd" -lt "$MAX_STEP_BACKS" ]; then
       printf 'MODE=step-back\nREASON=%s dirty rounds since last step-back (cap %s)\n' "$dsb" "$ROUND_CAP"
@@ -319,8 +521,6 @@ cmd_next() {
 }
 
 launch_detached() {
-  # Detach from the caller's process group so a tool timeout that kills the
-  # caller does not kill the reviewer. macOS has no setsid(1); use perl's POSIX::setsid.
   self="$1"; d="$2"
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
@@ -348,28 +548,30 @@ cmd_start() {
   case "$mode" in full|incremental|step-back) ;; *) die "start: --mode must be full|incremental|step-back" ;; esac
   [ -n "$base" ] || die "start: --base is required"
   command -v codex >/dev/null 2>&1 || die "codex CLI not found on PATH — install it (e.g. 'npm i -g @openai/codex' or 'brew install codex') and run 'codex login'"
-  perl -MJSON::PP -e 1 2>/dev/null || die "perl with JSON::PP is required to parse review results (macOS system perl has it)"
+  command -v perl >/dev/null 2>&1 || die "perl is required to parse review results"
   [ -f "$SCHEMA" ] || die "output schema missing: $SCHEMA"
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ] && [ "$(round_state "$cur")" = "running" ]; then
     die "a review round is already running for this branch: $cur (use 'wait', 'finish' or 'cancel')"
   fi
   base_sha=$(git rev-parse --verify --quiet "$base^{commit}") || die "start: base '$base' does not resolve"
-  head=$(git rev-parse HEAD)
+  head=$(git rev-parse HEAD) || die "start: cannot resolve HEAD"
   if [ "$mode" = "incremental" ]; then
     [ -n "$since" ] || die "start: incremental mode needs --since <last reviewed sha>"
     since=$(git rev-parse --verify --quiet "$since^{commit}") || die "start: --since does not resolve"
     git merge-base --is-ancestor "$since" "$head" || die "start: --since $since is not an ancestor of HEAD — use --mode full"
     [ "$since" != "$head" ] || die "start: nothing changed since $since — use --mode full for a confirmation round"
   fi
+  hm=$(head_moves) || die "start: could not snapshot HEAD reflog (fail-closed)"
+  tf=$(tree_fp_v2) || die "start: could not snapshot working tree (fail-closed)"
   n=$(( $(snum rounds_started) + 1 ))
   d="$STATE_DIR/rounds/$(printf '%03d' "$n")-$mode"
   mkdir -p "$STATE_DIR/rounds" && mkdir "$d" 2>/dev/null || die "round dir already exists (concurrent start?): $d"
   {
     printf 'mode=%s\nbase_ref=%s\nbase_sha=%s\nsince=%s\nreviewed_head=%s\nround=%s\n' "$mode" "$base" "$base_sha" "$since" "$head" "$n"
     printf 'effort=%s\nmodel=%s\nroot=%s\nschema=%s\nstarted_at=%s\nstarted_epoch=%s\n' "$EFFORT" "$MODEL" "$ROOT" "$SCHEMA" "$(now_utc)" "$(date +%s)"
-    printf 'head_moves=%s\ntree_fp=%s\n' "$(head_moves)" "$(tree_fp)"
-  } > "$d/meta"
+    printf 'head_moves=%s\ntree_fp=%s\n' "$hm" "$tf"
+  } > "$d/meta" || { rm -rf "$d"; die "start: cannot write round meta"; }
   if ! write_prompt "$d" "$mode" "$base" "$base_sha" "$head" "$since" "$n"; then
     rm -rf "$d"; die "start: could not build the reviewer prompt (rule-file scan failed) — nothing started"
   fi
@@ -403,6 +605,15 @@ cmd__run() {
 
 cmd_status() { resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2; print_status "$d"; }
 
+sleep_bounded() {
+  # $1 = desired delay (can be 0.5), $2 = remaining integer seconds
+  perl -e '
+    my ($d, $rem) = @ARGV;
+    $d = $rem if $rem < $d;
+    select(undef, undef, undef, $d) if $d > 0;
+  ' "$1" "$2"
+}
+
 cmd_wait() {
   resolve_paths
   d=""; t=540
@@ -412,19 +623,31 @@ cmd_wait() {
   is_uint "$t" || die "--timeout must be seconds"
   d=$(round_dir_arg "$d") || exit 2
   end=$(( $(date +%s) + t ))
-  while [ "$(round_state "$d")" = "running" ] && [ "$(date +%s)" -lt "$end" ]; do sleep 10; done
+  step=0
+  while [ "$(round_state "$d")" = "running" ]; do
+    now=$(date +%s)
+    rem=$(( end - now ))
+    [ "$rem" -gt 0 ] || break
+    case "$step" in
+      0) delay=0.5 ;;
+      1) delay=1 ;;
+      2) delay=2 ;;
+      *) delay=5 ;;
+    esac
+    sleep_bounded "$delay" "$rem"
+    step=$(( step + 1 ))
+  done
   print_status "$d"
 }
 
 cmd_cancel() {
-  resolve_paths; d=$(round_dir_arg "${1:-}") || exit 2
+  resolve_paths; ensure_state
+  d=$(round_dir_arg "${1:-}") || exit 2
   [ "$(round_state "$d")" = "running" ] || { print_status "$d"; return 0; }
   rp=$(runner_pid "$d") || { print_status "$d"; return 0; }
   cp=$(codex_pid "$d")
   pg=$(ps -o pgid= -p "$rp" 2>/dev/null | tr -d ' ')
   if [ "$pg" = "$rp" ]; then
-    # The verified runner leads its own process group (setsid at launch): stop
-    # the whole group so codex's own children are not orphaned.
     kill -TERM -- "-$rp" 2>/dev/null
   else
     [ -n "$cp" ] && kill -TERM "$cp" 2>/dev/null
@@ -438,23 +661,55 @@ cmd_cancel() {
 
 cmd_finish() {
   resolve_paths; resolve_knobs; ensure_state
-  d=$(round_dir_arg "${1:-}") || exit 2
+  explicit_arg="${1:-}"
+  if [ -n "$explicit_arg" ]; then
+    d=$(validate_round_dir "$explicit_arg")
+    if [ -f "$d/finished" ]; then
+      [ -f "$d/verdict" ] || die "round already finished but verdict missing: $d"
+      cat "$d/verdict"
+      return 0
+    fi
+  else
+    if [ "$REPLAYED_TX_KIND" = "finish" ] && [ -n "$REPLAYED_TX_ROUND" ] && [ -f "$REPLAYED_TX_ROUND/verdict" ]; then
+      cat "$REPLAYED_TX_ROUND/verdict"
+      return 0
+    fi
+    d=$(round_dir_arg "")
+    [ -f "$d/finished" ] && die "round already finished: $d (pass explicit ROUND_DIR to re-read verdict)"
+  fi
+
   st=$(round_state "$d")
   [ "$st" = "running" ] && { printf 'VERDICT=running\n'; print_status "$d"; exit 4; }
-  [ -f "$d/finished" ] && die "round already finished: $d (see $d/verdict)"
+
   mode=$(mget "$d" mode); reviewed=$(mget "$d" reviewed_head); n=$(mget "$d" round)
-  head=$(git rev-parse HEAD)
-  # The result is bound to the exact commit + tracked tree the reviewer read. Rounds
-  # started before v1.8.0 have no head_moves / tree_fp in meta: only the HEAD check runs.
+  is_uint "$n" || die "corrupt round number in $d/meta"
+  rs=$(snum rounds_started); lfr=$(snum latest_finished_round)
+  if [ "$n" -le "$lfr" ] || [ "$n" -ne "$rs" ]; then
+    die "round $n is superseded (rounds_started=$rs, latest_finished_round=$lfr) — refusing out-of-order finish"
+  fi
+
+  head=$(git rev-parse HEAD) || { printf 'VERDICT=error\nREASON=cannot resolve HEAD\n'; exit 5; }
   drift=""
-  if [ "$head" != "$reviewed" ]; then drift=head-moved
-  elif [ -n "$(mget "$d" head_moves)" ] && [ "$(mget "$d" head_moves)" != "$(head_moves)" ]; then drift=head-moved-and-returned
-  elif [ -n "$(mget "$d" tree_fp)" ] && [ "$(mget "$d" tree_fp)" != "$(tree_fp)" ]; then drift=tree-changed
+  cur_hm=""; cur_tf=""
+  exp_hm=$(mget "$d" head_moves)
+  exp_tf=$(mget "$d" tree_fp)
+  if [ "$head" != "$reviewed" ]; then
+    drift=head-moved
+  else
+    if [ -n "$exp_hm" ]; then
+      cur_hm=$(head_moves) || { printf 'VERDICT=error\nREASON=could not read HEAD reflog for drift check\n'; exit 5; }
+      [ "$exp_hm" = "$cur_hm" ] || drift=head-moved-and-returned
+    fi
+    if [ -z "$drift" ] && [ -n "$exp_tf" ]; then
+      cur_tf=$(tree_fp_matching "$exp_tf") || { printf 'VERDICT=error\nREASON=could not snapshot working tree for drift check\n'; exit 5; }
+      [ "$exp_tf" = "$cur_tf" ] || drift=tree-changed
+    fi
   fi
   if [ -n "$drift" ]; then
     printf 'VERDICT=head-drift\nREASON=%s\nREVIEWED_HEAD=%s\nHEAD=%s\n' "$drift" "$reviewed" "$head"
     exit 3
   fi
+
   rc=$(cat "$d/exit" 2>/dev/null || printf 'dead')
   res="$d/result.json"
   if [ "$rc" != "0" ] || [ ! -s "$res" ]; then
@@ -462,8 +717,7 @@ cmd_finish() {
     tail -n 20 "$d/log" 2>/dev/null | sed 's/^/LOG| /'
     exit 5
   fi
-  # The verdict comes from structured JSON (codex exec --output-schema) validated by
-  # parse-review.pl — never from heuristics over prose (step-back of C1, v1.7.0).
+
   frag="$d/ledger-fragment.md"; md="$d/review.md"
   parsed=$(perl "$HERE/parse-review.pl" "$res" "$(snum next_class_id)" "$LEDGER" "$frag" "$md")
   prc=$?
@@ -481,71 +735,230 @@ cmd_finish() {
   else
     verdict=dirty
   fi
-  # The branch's edits to rule files (review-rules.sh). Removed/rewritten rules that a
-  # person has not approved (ack-rules, bound to the edits' fingerprint) keep an otherwise
-  # clean round from counting as clean: VERDICT=needs-human.
-  rules=""; rules_fp=""; rules_open=0; rbase=$(mget "$d" base_sha)
+
+  # Single-pass rule-file scan reused for classification, fingerprint, and render.
+  scan_file="$d/rules-scan.tsv"
+  rules_4col=""; rules_fp=""; rules_open=0; rbase=$(mget "$d" base_sha)
+  : > "$scan_file" || { printf 'VERDICT=error\nREASON=cannot create %s\n' "$scan_file"; exit 5; }
   if [ -n "$rbase" ]; then
-    # Fail closed: a failed scan is an error (retryable), never "no rule edits".
-    if ! rules=$(bash "$RULES" list "$rbase" "$reviewed") || ! rules_fp=$(bash "$RULES" fp "$rbase" "$reviewed"); then
+    if ! bash "$RULES" scan "$rbase" "$reviewed" > "$scan_file" || ! rules_fp=$(bash "$RULES" fp "$rbase" "$reviewed" --from-scan "$scan_file"); then
       printf 'VERDICT=error\nREASON=rule-file scan failed (review-rules.sh); the round is not finished — retry finish\nRESULT=%s\n' "$res"
       exit 5
     fi
+    rules_4col=$(awk -F '\t' 'NF >= 8 { printf "%s\t%s\t%s\t%s\n", $1, $2, $3, $8 }' "$scan_file")
   fi
   [ -n "$rules_fp" ] && [ "$rules_fp" != "$(sget rules_ack_fp)" ] && rules_open=1
   [ "$rules_open" = 1 ] && case "$verdict" in clean|p3-only) verdict=needs-human ;; esac
-  [ -n "$rbase" ] && bash "$RULES" render "$rbase" "$reviewed" "$rules_fp" "$rules_open" >> "$md"
+  if [ -n "$rbase" ]; then
+    if ! bash "$RULES" render "$rbase" "$reviewed" "$rules_fp" "$rules_open" --from-scan "$scan_file" >> "$md"; then
+      printf 'VERDICT=error\nREASON=rule-file render failed; the round is not finished — retry finish\nRESULT=%s\n' "$res"
+      exit 5
+    fi
+  fi
+
+  # Compute next state values before building the atomic transaction.
+  new_rounds_total=$(( $(snum rounds_total) + 1 ))
+  new_dsb=$(snum dirty_since_step_back)
+  new_sbd=$(snum step_backs_done)
+  if [ "$mode" = "step-back" ]; then
+    new_sbd=$(( new_sbd + 1 ))
+    new_dsb=0
+  elif [ "$verdict" = "dirty" ]; then
+    new_dsb=$(( new_dsb + 1 ))
+  fi
+
+  new_cs=$(snum clean_streak)
+  new_lch=$(sget last_clean_head)
+  new_lcb=$(sget last_clean_base_sha)
+  new_lcp=$(sget last_clean_skip_p3)
+  new_lcm=$(sget last_clean_mode)
+
+  new_bch=$(sget base_converged_head)
+  new_bcb=$(sget base_converged_base_sha)
+  new_bcp=$(sget base_converged_skip_p3)
+  new_bcr=$(sget base_converged_round)
+  new_prh=$(sget post_rebase_confirmed_head)
+  new_prb=$(sget post_rebase_confirmed_base_sha)
+  new_prr=$(sget post_rebase_confirmed_round)
+
+  rp_fp=""; rp_verdict=""; rp_round=""; rp_head=""; rp_base=""; rp_p3=""; rp_mode=""; rp_tf=""; rp_hm=""
+  case "$verdict" in
+    clean|p3-only)
+      if [ "$reviewed" = "$new_lch" ] && [ "$rbase" = "$new_lcb" ] && [ "$SKIP_P3" = "$new_lcp" ]; then
+        new_cs=$(( new_cs + 1 ))
+      else
+        new_cs=1
+      fi
+      new_lch="$reviewed"; new_lcb="$rbase"; new_lcp="$SKIP_P3"; new_lcm="$mode"
+      ;;
+    needs-human)
+      rp_fp="$rules_fp"; rp_verdict="needs-human"; rp_round="$n"
+      rp_head="$reviewed"; rp_base="$rbase"; rp_p3="$SKIP_P3"; rp_mode="$mode"
+      rp_tf="$cur_tf"; rp_hm="$cur_hm"
+      ;;
+    dirty)
+      new_cs=0; new_lch=""; new_lcb=""; new_lcp=""; new_lcm=""
+      # Invalidate any prior convergence proof on a new dirty round.
+      new_bch=""; new_bcb=""; new_bcp=""; new_bcr=""
+      new_prh=""; new_prb=""; new_prr=""
+      ;;
+  esac
+
+  cur_ptr=$(sget current_round_dir)
+  new_cur_ptr="$cur_ptr"
+  [ "$cur_ptr" = "$d" ] && new_cur_ptr=""
+  new_next_id=$(snum next_class_id)
+  is_uint "$nxt" && new_next_id="$nxt"
+
+  # Prepare atomic transaction artifacts inside $d/tx.
+  tx_dir="$d/tx"
+  mkdir -p "$tx_dir" || die "cannot create tx dir $tx_dir"
+
   {
+    cat "$LEDGER"
     printf '\n## Round %s — %s — %s — %s (P0×%s P1×%s P2×%s P3×%s) — %s\n' \
       "$n" "$mode" "$(git rev-parse --short "$reviewed")" "$verdict" "$c0" "$c1" "$c2" "$c3" "$(now_utc)"
     [ -s "$frag" ] && cat "$frag"
     if [ "$rules_open" = 1 ]; then
       printf '#### Rule-file edits awaiting a person (fingerprint %s)\n' "$rules_fp"
-      printf '%s\n' "$rules" | awk -F '\t' '$1 == "needs-human" { printf "- %s %s %s\n", $2, $3, $4 }'
+      printf '%s\n' "$rules_4col" | awk -F '\t' '$1 == "needs-human" { printf "- %s %s %s\n", $2, $3, $4 }'
     fi
-  } >> "$LEDGER"
-  if [ "$rules_open" = 1 ]; then sset rules_pending_fp "$rules_fp"; else sset rules_pending_fp ""; fi
-  is_uint "$nxt" && sset next_class_id "$nxt"
-  sset rounds_total $(( $(snum rounds_total) + 1 ))
-  sset last_reviewed_head "$reviewed"
-  sset last_reviewed_mode "$mode"
-  if [ "$mode" = "step-back" ]; then
-    sset step_backs_done $(( $(snum step_backs_done) + 1 ))
-    sset dirty_since_step_back 0
-  elif [ "$verdict" = "dirty" ]; then
-    sset dirty_since_step_back $(( $(snum dirty_since_step_back) + 1 ))
-  fi
-  sset current_round_dir ""
-  # Recurring = class ids with entries in >= 2 rounds.
-  recurring=$(grep -oE '^### C[0-9]+' "$LEDGER" | sort | uniq -c | awk '$1 >= 2 { print $3 }' | paste -sd, -)
+  } > "$tx_dir/ledger.full" || die "cannot prepare tx ledger"
+
+  build_state_file "$tx_dir/state.full" \
+    "next_class_id=$new_next_id" \
+    "rounds_total=$new_rounds_total" \
+    "latest_finished_round=$n" \
+    "last_reviewed_head=$reviewed" \
+    "last_reviewed_base_sha=$rbase" \
+    "last_reviewed_mode=$mode" \
+    "last_reviewed_verdict=$verdict" \
+    "last_reviewed_skip_p3=$SKIP_P3" \
+    "dirty_since_step_back=$new_dsb" \
+    "step_backs_done=$new_sbd" \
+    "clean_streak=$new_cs" \
+    "last_clean_head=$new_lch" \
+    "last_clean_base_sha=$new_lcb" \
+    "last_clean_skip_p3=$new_lcp" \
+    "last_clean_mode=$new_lcm" \
+    "base_converged_head=$new_bch" \
+    "base_converged_base_sha=$new_bcb" \
+    "base_converged_skip_p3=$new_bcp" \
+    "base_converged_round=$new_bcr" \
+    "post_rebase_confirmed_head=$new_prh" \
+    "post_rebase_confirmed_base_sha=$new_prb" \
+    "post_rebase_confirmed_round=$new_prr" \
+    "rules_pending_fp=$rp_fp" \
+    "rules_pending_verdict=$rp_verdict" \
+    "rules_pending_round=$rp_round" \
+    "rules_pending_head=$rp_head" \
+    "rules_pending_base_sha=$rp_base" \
+    "rules_pending_skip_p3=$rp_p3" \
+    "rules_pending_mode=$rp_mode" \
+    "rules_pending_tree_fp=$rp_tf" \
+    "rules_pending_head_moves=$rp_hm" \
+    "current_round_dir=$new_cur_ptr"
+
+  recurring=$(compute_recurring "$tx_dir/ledger.full")
   {
     printf 'VERDICT=%s\nMODE=%s\nROUND=%s\nP0=%s\nP1=%s\nP2=%s\nP3=%s\n' "$verdict" "$mode" "$n" "$c0" "$c1" "$c2" "$c3"
     printf 'NEW_CLASSES=%s\nREOPENED=%s\nRECURRING=%s\n' "$new" "$reo" "$recurring"
-    printf 'DIRTY_SINCE_STEP_BACK=%s/%s\nSTEP_BACKS_DONE=%s/%s\n' "$(snum dirty_since_step_back)" "$ROUND_CAP" "$(snum step_backs_done)" "$MAX_STEP_BACKS"
-    printf 'REVIEWED_HEAD=%s\nRESULT=%s\nRESULT_JSON=%s\nLEDGER=%s\n' "$reviewed" "$md" "$res" "$LEDGER"
-    printf 'RULE_CHANGES=%s\nRULES_NEED_HUMAN=%s\nRULES_FP=%s\n' "$(printf '%s' "$rules" | grep -c .)" \
-      "$( [ "$rules_open" = 1 ] && printf '%s' "$rules" | grep -c '^needs-human' || printf '0')" "$rules_fp"
-    [ -n "$rules" ] && printf '%s\n' "$rules" | awk -F '\t' '{ printf "RULE| [%s] %s %s %s\n", $1, $2, $3, $4 }'
-  } | tee "$d/verdict"
-  : > "$d/finished"
+    printf 'DIRTY_SINCE_STEP_BACK=%s/%s\nSTEP_BACKS_DONE=%s/%s\nCLEAN_STREAK=%s\n' \
+      "$new_dsb" "$ROUND_CAP" "$new_sbd" "$MAX_STEP_BACKS" "$new_cs"
+    printf 'REVIEWED_HEAD=%s\nBASE_SHA=%s\nRESULT=%s\nRESULT_JSON=%s\nLEDGER=%s\n' "$reviewed" "$rbase" "$md" "$res" "$LEDGER"
+    printf 'RULE_CHANGES=%s\nRULES_NEED_HUMAN=%s\nRULES_FP=%s\n' \
+      "$(printf '%s' "$rules_4col" | grep -c .)" \
+      "$( [ "$rules_open" = 1 ] && printf '%s' "$rules_4col" | grep -c '^needs-human' || printf '0')" \
+      "$rules_fp"
+    if [ -n "$rules_4col" ]; then
+      printf '%s\n' "$rules_4col" | awk -F '\t' '{ printf "RULE| [%s] %s %s %s\n", $1, $2, $3, $4 }'
+    fi
+  } > "$tx_dir/verdict.out" || die "cannot prepare tx verdict"
+
+  commit_tx "$tx_dir" finish "$d"
+  cat "$d/verdict"
 }
 
 cmd_ack_rules() {
-  resolve_paths; ensure_state
+  resolve_paths; resolve_knobs; ensure_state
   fp="${1:-}"; [ $# -gt 0 ] && shift
+  base_arg=""
+  if [ "${1:-}" = "--base" ]; then base_arg="${2:-}"; shift; [ $# -gt 0 ] && shift; fi
   pending=$(sget rules_pending_fp)
-  [ -n "$pending" ] || die "ack-rules: no rule-file edits are awaiting a person"
+  pverdict=$(sget rules_pending_verdict)
+  [ -n "$pending" ] && [ "$pverdict" = "needs-human" ] || die "ack-rules: no needs-human rule-file edits are awaiting a person"
   [ "$fp" = "$pending" ] || die "ack-rules: fingerprint '$fp' does not match the pending edits ($pending) — re-read the latest finish output"
-  sset rules_ack_fp "$fp"; sset rules_pending_fp ""
-  printf -- '- note %s @%s: rule-file edits approved by a person (fingerprint %s)%s\n' \
-    "$(now_utc)" "$(git rev-parse --short HEAD)" "$fp" "${*:+ — $*}" >> "$LEDGER"
-  printf 'ACKED=%s\n' "$fp"
+
+  pround=$(sget rules_pending_round)
+  lfr=$(snum latest_finished_round)
+  [ "$pround" = "$lfr" ] || die "ack-rules: pending rule approval (round $pround) is superseded by round $lfr"
+
+  phead=$(sget rules_pending_head); pbase=$(sget rules_pending_base_sha)
+  pp3=$(sget rules_pending_skip_p3); pmode=$(sget rules_pending_mode)
+  ptf=$(sget rules_pending_tree_fp); phm=$(sget rules_pending_head_moves)
+
+  head=$(git rev-parse HEAD) || die "ack-rules: cannot resolve HEAD"
+  [ "$head" = "$phead" ] || die "ack-rules: HEAD ($head) no longer matches pending round HEAD ($phead)"
+  [ "$SKIP_P3" = "$pp3" ] || die "ack-rules: CR_LOOP_SKIP_P3 ($SKIP_P3) differs from pending round ($pp3)"
+  if [ -n "$base_arg" ]; then
+    bsha=$(git rev-parse --verify --quiet "$base_arg^{commit}") || die "ack-rules: --base '$base_arg' does not resolve"
+    [ "$bsha" = "$pbase" ] || die "ack-rules: base ($bsha) differs from pending round base ($pbase)"
+  fi
+  if [ -n "$phm" ]; then
+    cur_hm=$(head_moves) || die "ack-rules: cannot read HEAD reflog"
+    [ "$cur_hm" = "$phm" ] || die "ack-rules: HEAD moved and returned since pending round"
+  fi
+  if [ -n "$ptf" ]; then
+    cur_tf=$(tree_fp_matching "$ptf") || die "ack-rules: cannot snapshot working tree"
+    [ "$cur_tf" = "$ptf" ] || die "ack-rules: working tree changed since pending round"
+  fi
+
+  # Apply the exact same clean-streak rule as normal clean rounds.
+  cur_cs=$(snum clean_streak)
+  if [ "$phead" = "$(sget last_clean_head)" ] && [ "$pbase" = "$(sget last_clean_base_sha)" ] && [ "$pp3" = "$(sget last_clean_skip_p3)" ]; then
+    new_cs=$(( cur_cs + 1 ))
+  else
+    new_cs=1
+  fi
+
+  tx_dir="$STATE_DIR/tx-ack.$$"
+  mkdir -p "$tx_dir" || die "cannot create $tx_dir"
+  {
+    cat "$LEDGER"
+    printf -- '- note %s @%s: rule-file edits approved by a person (fingerprint %s)%s\n' \
+      "$(now_utc)" "$(git rev-parse --short HEAD)" "$fp" "${*:+ — $*}"
+  } > "$tx_dir/ledger.full" || { rm -rf "$tx_dir"; die "cannot prepare ack ledger"; }
+
+  build_state_file "$tx_dir/state.full" \
+    "rules_ack_fp=$fp" \
+    "rules_pending_fp=" \
+    "rules_pending_verdict=" \
+    "rules_pending_round=" \
+    "rules_pending_head=" \
+    "rules_pending_base_sha=" \
+    "rules_pending_skip_p3=" \
+    "rules_pending_mode=" \
+    "rules_pending_tree_fp=" \
+    "rules_pending_head_moves=" \
+    "clean_streak=$new_cs" \
+    "last_clean_head=$phead" \
+    "last_clean_base_sha=$pbase" \
+    "last_clean_skip_p3=$pp3" \
+    "last_clean_mode=$pmode"
+
+  commit_tx "$tx_dir" ack-rules
+  rm -rf "$tx_dir"
+  printf 'ACKED=%s\nCLEAN_STREAK=%s\n' "$fp" "$new_cs"
 }
 
 cmd_note() {
   resolve_paths; ensure_state
   [ $# -gt 0 ] || die "note: text required (e.g. 'C3 fixed — prevention: REVIEW.md#stale-predicate')"
-  printf -- '- note %s @%s: %s\n' "$(now_utc)" "$(git rev-parse --short HEAD)" "$*" >> "$LEDGER"
+  ltmp="$LEDGER.tmp.$$"
+  {
+    cat "$LEDGER"
+    printf -- '- note %s @%s: %s\n' "$(now_utc)" "$(git rev-parse --short HEAD)" "$*"
+  } > "$ltmp" && mv "$ltmp" "$LEDGER" || { rm -f "$ltmp"; die "cannot update ledger"; }
   printf 'NOTED\n'
 }
 
@@ -555,26 +968,144 @@ cmd_add() {
   case "$sev" in P0|P1|P2|P3) ;; *) die "add: severity must be P0..P3" ;; esac
   [ -n "$title" ] || die "add: title required ('<class title> — <file>:<line>')"
   id="C$(snum next_class_id)"
+  new_nxt=$(( $(snum next_class_id) + 1 ))
+  tx_dir="$STATE_DIR/tx-add.$$"
+  mkdir -p "$tx_dir" || die "cannot create $tx_dir"
   {
+    cat "$LEDGER"
     printf '\n## External finding — %s @%s\n### %s [%s] %s\n' "$(now_utc)" "$(git rev-parse --short HEAD)" "$id" "$sev" "$title"
-    [ -n "$detail" ] && printf '  %s\n' "$detail"
-  } >> "$LEDGER"
-  sset next_class_id $(( $(snum next_class_id) + 1 ))
+    if [ -n "$detail" ]; then printf '  %s\n' "$detail"; fi
+  } > "$tx_dir/ledger.full" || { rm -rf "$tx_dir"; die "cannot prepare add ledger"; }
+  build_state_file "$tx_dir/state.full" "next_class_id=$new_nxt"
+  commit_tx "$tx_dir" add
+  rm -rf "$tx_dir"
   printf 'ID=%s\n' "$id"
 }
 
 cmd_mark_converged() {
+  resolve_paths; resolve_knobs; ensure_state
+  post_rebase=0; base_arg=""; round_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --post-rebase) post_rebase=1; shift ;;
+      --base) base_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      --round) round_arg="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+      *) die "mark-converged: unknown arg $1" ;;
+    esac
+  done
+  head=$(git rev-parse HEAD) || die "mark-converged: cannot resolve HEAD"
+  short_head=$(git rev-parse --short HEAD)
+  base_sha=""
+  if [ -n "$base_arg" ]; then
+    base_sha=$(git rev-parse --verify --quiet "$base_arg^{commit}") || die "mark-converged: --base '$base_arg' does not resolve"
+  fi
+  lfr=$(snum latest_finished_round)
+
+  tx_dir="$STATE_DIR/tx-conv.$$"
+  mkdir -p "$tx_dir" || die "cannot create $tx_dir"
+
+  if [ "$post_rebase" -eq 1 ]; then
+    bch=$(sget base_converged_head)
+    [ -n "$bch" ] || die "mark-converged --post-rebase: no prior two-round convergence record exists"
+    [ -n "$base_sha" ] || die "mark-converged --post-rebase: --base <ref> is required"
+    if [ -n "$round_arg" ]; then
+      rd=$(validate_round_dir "$round_arg")
+      rn=$(mget "$rd" round)
+      [ "$rn" = "$lfr" ] || die "mark-converged --post-rebase: --round ($rn) is not the latest finished round ($lfr)"
+    else
+      rn="$lfr"
+    fi
+    [ "$(sget last_clean_head)" = "$head" ] || die "mark-converged --post-rebase: HEAD ($head) has no clean confirmation round"
+    [ "$(sget last_clean_base_sha)" = "$base_sha" ] || die "mark-converged --post-rebase: clean round base does not match --base ($base_sha)"
+    [ "$(sget last_clean_skip_p3)" = "$SKIP_P3" ] || die "mark-converged --post-rebase: SKIP_P3 mismatch"
+    [ "$(sget last_clean_mode)" = "full" ] || die "mark-converged --post-rebase: confirmation round must be mode full (got '$(sget last_clean_mode)')"
+    bch_short=$(git rev-parse --short "$bch" 2>/dev/null || printf '%s' "$bch")
+    {
+      cat "$LEDGER"
+      printf '\n## Converged (post-rebase 1-round full confirmation) at %s — %s (prior 2-round convergence: %s, base: %s, round: %s)\n' \
+        "$short_head" "$(now_utc)" "$bch_short" "$(git rev-parse --short "$base_sha")" "$rn"
+    } > "$tx_dir/ledger.full" || { rm -rf "$tx_dir"; die "cannot prepare converged ledger"; }
+    build_state_file "$tx_dir/state.full" \
+      "post_rebase_confirmed_head=$head" \
+      "post_rebase_confirmed_base_sha=$base_sha" \
+      "post_rebase_confirmed_round=$rn" \
+      "dirty_since_step_back=0" \
+      "step_backs_done=0"
+  else
+    cs=$(snum clean_streak)
+    [ "$cs" -ge 2 ] || die "mark-converged: requires clean_streak >= 2 (got $cs)"
+    [ "$(sget last_clean_mode)" = "full" ] || die "mark-converged: second clean round must be mode full (got '$(sget last_clean_mode)')"
+    [ "$(sget last_clean_head)" = "$head" ] || die "mark-converged: HEAD ($head) does not match last_clean_head ($(sget last_clean_head))"
+    [ "$(sget last_clean_skip_p3)" = "$SKIP_P3" ] || die "mark-converged: SKIP_P3 ($SKIP_P3) does not match last_clean_skip_p3 ($(sget last_clean_skip_p3))"
+    lcb=$(sget last_clean_base_sha)
+    if [ -n "$base_sha" ]; then
+      [ "$lcb" = "$base_sha" ] || die "mark-converged: --base ($base_sha) does not match last_clean_base_sha ($lcb)"
+    fi
+    {
+      cat "$LEDGER"
+      printf '\n## Converged at %s — %s (rounds so far: %s, step-backs: %s)\n' \
+        "$short_head" "$(now_utc)" "$(snum rounds_total)" "$(snum step_backs_done)"
+    } > "$tx_dir/ledger.full" || { rm -rf "$tx_dir"; die "cannot prepare converged ledger"; }
+    build_state_file "$tx_dir/state.full" \
+      "base_converged_head=$head" \
+      "base_converged_base_sha=$lcb" \
+      "base_converged_skip_p3=$SKIP_P3" \
+      "base_converged_round=$lfr" \
+      "post_rebase_confirmed_head=" \
+      "post_rebase_confirmed_base_sha=" \
+      "post_rebase_confirmed_round=" \
+      "dirty_since_step_back=0" \
+      "step_backs_done=0"
+  fi
+
+  commit_tx "$tx_dir" mark-converged
+  rm -rf "$tx_dir"
+  printf 'CONVERGED=%s\n' "$head"
+}
+
+cmd_release_state() {
   resolve_paths; ensure_state
-  printf '\n## Converged at %s — %s (rounds so far: %s, step-backs: %s)\n' \
-    "$(git rev-parse --short HEAD)" "$(now_utc)" "$(snum rounds_total)" "$(snum step_backs_done)" >> "$LEDGER"
-  sset dirty_since_step_back 0
-  sset step_backs_done 0
-  printf 'CONVERGED=%s\n' "$(git rev-parse HEAD)"
+  action="${1:-get}"; [ $# -gt 0 ] && shift
+  case "$action" in
+    get)
+      printf 'PRE_REBASE_HEAD=%s\nPINNED_REMOTE_HEAD_SHA=%s\nTARGET_BASE_SHA=%s\nREBASED_IN_8_0=%s\n' \
+        "$(sget rel_pre_rebase_head)" "$(sget rel_pinned_remote_head_sha)" "$(sget rel_target_base_sha)" "$(snum rel_rebased_in_8_0)"
+      ;;
+    set)
+      [ $# -gt 0 ] || die "release-state set: at least one KEY=VAL required"
+      for kv in "$@"; do
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        case "$k" in
+          rel_pre_rebase_head|rel_pinned_remote_head_sha|rel_target_base_sha) ;;
+          rel_rebased_in_8_0)
+            case "$v" in 0|1) ;; *) die "release-state set: rel_rebased_in_8_0 must be 0 or 1" ;; esac
+            ;;
+          *) die "release-state set: disallowed key '$k'" ;;
+        esac
+      done
+      [ ! -L "$STATE" ] && [ ! -d "$STATE" ] || die "release-state set: invalid state target $STATE"
+      stmp="$STATE.tmp.$$"
+      build_state_file "$stmp" "$@"
+      mv "$stmp" "$STATE" || { rm -f "$stmp"; die "release-state set failed"; }
+      printf 'RELEASE_STATE_UPDATED\n'
+      ;;
+    clear)
+      [ ! -L "$STATE" ] && [ ! -d "$STATE" ] || die "release-state clear: invalid state target $STATE"
+      stmp="$STATE.tmp.$$"
+      build_state_file "$stmp" "rel_pre_rebase_head=" "rel_pinned_remote_head_sha=" "rel_target_base_sha=" "rel_rebased_in_8_0=0"
+      mv "$stmp" "$STATE" || { rm -f "$stmp"; die "release-state clear failed"; }
+      printf 'RELEASE_STATE_CLEARED\n'
+      ;;
+    *) die "release-state: expected get | set | clear" ;;
+  esac
 }
 
 cmd_reset() {
   resolve_paths
   [ -d "$STATE_DIR" ] || { printf 'NOTHING_TO_RESET\n'; return 0; }
+  validate_branch_ownership
+  recover_pending_tx
   cur=$(sget current_round_dir)
   if [ -n "$cur" ] && [ -d "$cur" ] && [ "$(round_state "$cur")" = "running" ]; then die "a round is running — cancel it first"; fi
   dest="$STATE_DIR.archived-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -586,7 +1117,6 @@ cmd_reset() {
 # everything must be clean except untracked repo-root .cr-loop-handoff-round-<N>.md files.
 cmd_tree_clean() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
-  # A failing `git status` (corrupt / unreadable index, ...) must never read as clean.
   all=$(git status --porcelain --untracked-files=all 2>/dev/null) || {
     printf 'TREE=error\n'
     git status --porcelain --untracked-files=all 2>&1 >/dev/null | sed 's/^/ERROR| /'
@@ -606,7 +1136,7 @@ cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STAT
 
 sub="${1:-}"
 case "$sub" in
-  init|next|start|finish|note|add|ack-rules|mark-converged|cancel|reset)
+  init|next|start|finish|note|add|ack-rules|mark-converged|release-state|cancel|reset)
     [ -n "${CR_REVIEW_LOCK_HELD:-}" ] || with_branch_lock "$@" ;;
 esac
 [ $# -gt 0 ] && shift
@@ -622,10 +1152,11 @@ case "$sub" in
   add) cmd_add "$@" ;;
   ack-rules) cmd_ack_rules "$@" ;;
   mark-converged) cmd_mark_converged "$@" ;;
+  release-state) cmd_release_state "$@" ;;
   cancel) cmd_cancel "$@" ;;
   reset) cmd_reset "$@" ;;
   paths) cmd_paths "$@" ;;
   tree-clean) cmd_tree_clean "$@" ;;
-  ''|-h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ''|-h|--help|help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown subcommand '$sub' (try --help)" ;;
 esac

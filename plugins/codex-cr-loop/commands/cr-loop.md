@@ -108,8 +108,7 @@ knobs removed in v1.7.0 and how they are mapped. `/cr-loop` has no knobs of its 
        - **(B) Abort.** Stop immediately.
 
        Block on the reply. "No response" is not consent. Either choice ends this invocation.
-   - **Initialize** `ROUND_NUM=0`, `CLEAN_STREAK=0`, and an empty `LAST_CLEAN_HEAD`. The
-     persisted counters and the ledger belong to `cr-review.sh` (protocol step 2).
+   - **Initialize** `ROUND_NUM=0`. The persisted counters (including `clean_streak` and `last_clean_*`) and the ledger belong to `cr-review.sh` (protocol step 2).
 
 2. **Reviewer setup, the review loop, fixes and commits: protocol steps 2–7.** Run them
    exactly as written in `review-protocol.md`, with `BASE` from step 1. There are three ways

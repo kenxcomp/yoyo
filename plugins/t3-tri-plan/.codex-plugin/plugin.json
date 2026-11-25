@@ -1,0 +1,38 @@
+{
+  "name": "t3-tri-plan",
+  "version": "1.0.0",
+  "description": "T3 Code-native triple-blind Trellis planning pipeline: parallel read-only multi-model design (e.g. Gemini 4 Neon + Claude Opus 5.5 + GPT 6.2 Sol), zero-history anonymous blind judging with pre-reveal decision & initial-design freeze, council design-review convergence loop, transactional flock state machine, and safe Phase 6 activation.",
+  "author": {
+    "name": "kenxcomp",
+    "url": "https://github.com/kenxcomp"
+  },
+  "repository": "https://github.com/kenxcomp/yoyo",
+  "license": "MIT",
+  "keywords": [
+    "t3-code",
+    "trellis",
+    "planning",
+    "triple-blind",
+    "multi-model",
+    "design-review",
+    "council"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "T3 Tri-Plan",
+    "shortDescription": "Triple-blind multi-model Trellis planning and design-review convergence pipeline for T3 Code.",
+    "longDescription": "Standalone T3 Code-native planning pipeline compatible with Trellis tasks without modifying repository dual-plan files. Runs 3 parallel read-only blind design candidates via delegate_task, evaluates them in a zero-history anonymous blind judge that locks the winner, surgical cherry-picks, and initial design before revealing model attribution, then runs a multi-model council/default design-review convergence loop with atomic flock transactions, cross-round baseline freshness checks, and process-locked Phase 6 activation.",
+    "developerName": "kenxcomp",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Plan",
+      "Review",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run t3-tri-plan on the current Trellis task.",
+      "Run t3-tri-plan for <requirement summary>."
+    ],
+    "brandColor": "#1D4ED8"
+  }
+}

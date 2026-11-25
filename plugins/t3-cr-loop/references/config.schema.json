@@ -1,0 +1,68 @@
+{
+  "description": "User (~/.config/t3-cr-loop/config.json) and project (.t3-cr-loop.json) configuration schema for t3-cr-loop v1.0.0.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "authorizedProviders": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "User config only: providerInstanceIds the user explicitly authorized to receive repository context. Project .t3-cr-loop.json overrides referencing any provider outside this list require explicit user confirmation before dispatch."
+    },
+    "defaultReviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providerInstanceId", "model", "effortKey", "effort"],
+      "properties": {
+        "providerInstanceId": { "type": "string" },
+        "model": { "type": "string" },
+        "effortKey": { "type": "string" },
+        "effort": { "type": "string" }
+      }
+    },
+    "council": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effortMode", "reviewers"],
+      "properties": {
+        "effortMode": {
+          "type": "string",
+          "enum": ["unified", "per-model"]
+        },
+        "unifiedEffort": {
+          "type": "string",
+          "description": "When effortMode is unified: effort value chosen from the intersection of allowed values across all council reviewers."
+        },
+        "reviewers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["providerInstanceId", "model", "effortKey", "effort"],
+            "properties": {
+              "providerInstanceId": { "type": "string" },
+              "model": { "type": "string" },
+              "effortKey": { "type": "string" },
+              "effort": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "knobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roundCap": { "type": "integer", "minimum": 0 },
+        "maxStepBacks": { "type": "integer", "minimum": 0 },
+        "skipP3": { "type": "integer", "enum": [0, 1] },
+        "requireRebased": { "type": "integer", "enum": [0, 1] },
+        "prAutoRebase": { "type": "integer", "enum": [0, 1] }
+      }
+    }
+  }
+}

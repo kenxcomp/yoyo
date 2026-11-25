@@ -1,4 +1,4 @@
-# codex-cr-loop review protocol (v1.8.0)
+# codex-cr-loop review protocol (v1.8.1)
 
 This document is the **authoritative review-loop body** shared by `/cr-loop`, `/cr-loop-merge`
 and `/cr-loop-pr`. Each command owns only its preflight (step 1) and its completion step
@@ -117,10 +117,11 @@ Everything is stored outside the working tree, under
 
 | Path | Content |
 |---|---|
-| `state` | Persisted counters: `rounds_total`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `next_class_id`, `current_round_dir`, and (v1.8.0) `rules_pending_fp` / `rules_ack_fp` for the rule-file approval (4h). Older state dirs simply lack the new keys. |
-| `ledger.md` | The append-only findings ledger (see "Ledger contract"). |
-| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta` (v1.8.0 adds `head_moves` and `tree_fp`, the snapshot `finish` checks for drift), `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`. |
-| `../<branch-key>.lock` | Branch-level **kernel advisory lock** (`flock`, taken through perl and held on fd 9). Every state transaction (`init`, `next`, `start`, `finish`, `note`, `add`, `mark-converged`, `cancel`, `reset`) runs under it, so two sessions on the same branch cannot both start a round, finish one twice, or allocate the same class id. The kernel releases the lock when the holder exits, crashes included, so there is no stale-lock state. A live holder is waited for up to 30 s. The detached reviewer is started with fd 9 closed, so it never holds the lock. |
+| `state` | Persisted counters: `rounds_total`, `latest_finished_round`, `dirty_since_step_back`, `step_backs_done`, `last_reviewed_head`, `last_reviewed_base_sha`, `next_class_id`, `current_round_dir`, `clean_streak` / `last_clean_*` (v1.8.1), `base_converged_*` / `post_rebase_confirmed_*` (v1.8.1), and `rules_pending_*` / `rules_ack_fp` for the rule-file approval (4h). Older state dirs simply lack the new keys. |
+| `ledger.md` | The append-only findings ledger (see "Ledger contract"). Replaced atomically via `pending.tx` (v1.8.1). |
+| `rounds/NNN-<mode>/` | One directory per round: `prompt.md`, `meta` (v1.8.1 stores fail-closed `head_moves` and versioned `tree_fp=v2:...` covering tracked diffs and non-ignored, non-handoff untracked files), `log`, `result.json` (the raw structured result), `review.md` (rendered), `exit`, `verdict`, `ledger-fragment.md`, `tx/`. |
+| `pending.tx` | Transient atomic commit marker (`scripts/cr-tx.sh`, v1.8.1). Every locked subcommand validates branch ownership and replays any pending transaction fail-closed before running its own mutation, preventing partial ledger writes or clobbered concurrent updates. |
+| `../<branch-key>.lock` | Branch-level **kernel advisory lock** (`flock`, taken through perl and held on fd 9). Every state transaction (`init`, `next`, `start`, `finish`, `note`, `add`, `ack-rules`, `mark-converged`, `cancel`, `reset`) runs under it, so two sessions on the same branch cannot both start a round, finish one twice, or allocate the same class id. The kernel releases the lock when the holder exits, crashes included, so there is no stale-lock state. A live holder is waited for up to 30 s. The detached reviewer is started with fd 9 closed, so it never holds the lock. |
 
 The state is shared by every worktree of the repository. It **survives across invocations
 for the same branch**. The round-cap counters persist too, so a re-invocation cannot reset
@@ -136,16 +137,17 @@ should ask for this.
 ### 3a. Choose the mode
 
 ```bash
-bash "$CR_REVIEW" next --clean-streak "$CLEAN_STREAK"
+bash "$CR_REVIEW" next --base "$BASE"
 ```
 
-`next` prints `MODE=` (and `SINCE=` for an incremental round). Apply these rules in order:
+`next` uses the persisted `clean_streak` (bound to current `HEAD`, resolved `--base`, and `CR_LOOP_SKIP_P3`; passing `--clean-streak N` overrides it) and prints `MODE=` (and `SINCE=` for an incremental round). Apply these rules in order:
 
 | Condition | `MODE` | What the reviewer sees |
 |---|---|---|
+| Persisted convergence already holds for current `HEAD`, `BASE`, and `SKIP_P3` (`clean_streak ≥ 2` with `last_clean_mode == full`, or matching `base_converged_*`) | `converged` | Nothing. Re-verify `HEAD` and `BASE`, ensure `mark-converged --base "$BASE"` is recorded, and jump to step 8. |
 | `dirty_since_step_back ≥ CR_LOOP_ROUND_CAP` and `step_backs_done < CR_LOOP_MAX_STEP_BACKS` | `step-back` | The whole branch diff plus the full ledger. The reviewer names the recurring classes, judges whether the approach structurally invites them, and proposes an approach change per class. |
 | `dirty_since_step_back ≥ CR_LOOP_ROUND_CAP` and the step-back budget is spent | `stop` | Nothing. Go to step 9 with `Stop reason: step-back-exhausted` (see 4c). |
-| `CLEAN_STREAK == 1` | `full` | A **confirmation round** on the same HEAD: the whole branch diff plus the ledger. |
+| `clean_streak ≥ 1` (bound to current `HEAD`, `BASE`, and `SKIP_P3`) | `full` | A **confirmation round** on the same HEAD: the whole branch diff plus the ledger. |
 | `last_reviewed_head` is a strict ancestor of HEAD | `incremental` | Only `git diff <last_reviewed_head>..HEAD`, which is the fixes since the last reviewed round, plus the ledger. |
 | Otherwise | `full` | The whole branch diff `git diff <base>...HEAD` plus the ledger. This covers the first round of a branch, a rebased branch, and a HEAD equal to the last reviewed one. |
 
@@ -191,13 +193,9 @@ The change under review must not be able to edit the checks that review it.
   user-level `~/.codex/AGENTS.md` still loads.
 - **The branch's rule-file edits are content under review.** `scripts/review-rules.sh`
   classifies each edited `REVIEW.md` / `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md`
-  (`git diff --no-renames <base>...<head>`):
-  - `additive`: a new file, or only added lines. Allowed (codify at source, 5c), listed in
-    the prompt and in `review.md`, but never used as a rule on this branch, so it cannot
-    exempt or downgrade this branch's findings. It applies to later branches once merged.
-  - `needs-human`: any removed or rewritten line, a deleted file, a type change, a binary
-    file, or a diff that could not be computed. The loop flags these itself; the reviewer is
-    told not to report them and not to let them move the verdict.
+  from raw tree modes and raw git blobs (`git diff --raw -z --no-relative --no-renames --no-ext-diff --no-textconv --ignore-submodules=none --no-abbrev <base>...<head>` plus `git cat-file blob`, immune to `.gitattributes` overrides):
+  - `additive`: a new regular non-binary text file, or a regular text file whose previous lines are an exact ordered subsequence of the new lines (zero deleted/rewritten/reordered lines). Allowed (codify at source, 5c), listed in the prompt and in `review.md`, but never used as a rule on this branch.
+  - `needs-human`: any removed, rewritten, or reordered line, deleted file, binary blob (contains a NUL byte), symlink (`120000`, added or modified), gitlink (`160000`), type change (`T`), or unusual path characters. The loop flags these itself; the reviewer is told not to report them and not to let them move the verdict. Git execution errors fail closed as exit 5 (`VERDICT=error`, retryable), never as `needs-human` or clean.
 - **Why deterministic, not a schema field.** The classification is line-based and computed
   by the script from the reviewed commit, not reported by the reviewer. A reviewer cannot
   miss it, the branch cannot argue it away, it is testable without Codex, and the output
@@ -229,18 +227,20 @@ take more than 15 minutes.
 
 ### 3d. Finish the round
 
+Always capture `ROUND_DIR` from `start` and pass it explicitly to `finish`:
+
 ```bash
-bash "$CR_REVIEW" finish
+bash "$CR_REVIEW" finish "$ROUND_DIR"
 ```
 
-`finish` prints `VERDICT=` and acts on it as follows.
+Passing `"$ROUND_DIR"` makes retries idempotent (if the round already committed or crashed mid-transaction, `finish "$ROUND_DIR"` recovers atomically and prints the exact committed verdict with exit 0). Before acting on a recovered/historical verdict, re-verify that `git rev-parse HEAD` still equals `REVIEWED_HEAD` and `BASE` still resolves to `BASE_SHA`. `finish` refuses out-of-order / superseded rounds and prints `VERDICT=`:
 
 | Exit | `VERDICT` | Meaning and handling |
 |---|---|---|
-| 3 | `head-drift` | What the reviewer read changed while it ran (a concurrent agent, an auto-commit hook, or another shell). `REASON=` is `head-moved` (HEAD differs from `REVIEWED_HEAD`), `head-moved-and-returned` (the HEAD reflog grew during the round although HEAD is back on `REVIEWED_HEAD`), or `tree-changed` (tracked files were edited without committing). Rounds started before v1.8.0 only get the `head-moved` check. The round's verdict does not cover the current state. **Do not classify, do not touch `CLEAN_STREAK`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
-| 5 | `error` | The reviewer exited non-zero or produced no result, or the result failed validation in `parse-review.pl`. It is also `error` when the rule-file scan (`review-rules.sh`) fails: a failed scan never counts as "no rule edits", and the round stays unfinished, so `finish` can be retried. Validation fails on: invalid JSON (for example a prose answer), a missing field, a `verdict` that disagrees with `findings` (`clean` with findings, or `findings` with none), a bad severity or `reopens` value, or a class with no instances. `REASON=` says which. Read `result.json` and the `LOG|` tail. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the reason. Never classify an unreadable review as clean. |
+| 3 | `head-drift` | What the reviewer read changed while it ran (a concurrent agent, an auto-commit hook, or another shell). `REASON=` is `head-moved` (HEAD differs from `REVIEWED_HEAD`), `head-moved-and-returned` (the HEAD reflog grew during the round although HEAD is back on `REVIEWED_HEAD`), or `tree-changed` (tracked files or non-ignored, non-handoff untracked files changed between start and finish snapshots; rounds started before v1.8.1 check tracked diffs only). The round's verdict does not cover the current state. **Do not classify, do not touch `clean_streak`, write nothing to the ledger.** Surface `git log --oneline "$REVIEWED_HEAD"..HEAD` and `git status -sb`, write a handoff with `Stop reason: head-drift-during-review`, and stop. |
+| 5 | `error` | The reviewer exited non-zero or produced no result, or the result failed strict validation in `parse-review.pl` (invalid JSON, duplicate JSON keys, unexpected extra keys, non-string scalars where strings are required, missing field, `verdict` vs `findings` mismatch, bad severity/reopens, duplicate non-empty `reopens` in the same round, or empty `instances`), or a git snapshot / `review-rules.sh` scan or render failed. `REASON=` says which. Read `result.json` and the `LOG|` tail. Retry the round once with the same mode. A second error is a handoff with `Stop reason: reviewer-error`, quoting the reason. Never classify an unreadable review as clean. |
 | 4 | `running` | The round has not finished. Go back to 3c. |
-| 0 | `clean`, `p3-only`, `needs-human` or `dirty` | Continue with step 4. `finish` has already appended the round to the ledger, assigned ids to the new classes (`NEW_CLASSES=`), listed the cited ones (`REOPENED=`), listed the classes seen in two or more rounds (`RECURRING=`), and updated the persisted counters. It also prints `RULE_CHANGES=`, `RULES_NEED_HUMAN=`, `RULES_FP=` and one `RULE|` line per edited rule file (see Rule source in 3b). |
+| 0 | `clean`, `p3-only`, `needs-human` or `dirty` | Continue with step 4. `finish` has atomically committed the ledger and state (`CLEAN_STREAK=`, `NEW_CLASSES=`, `REOPENED=`, `RECURRING=` scoped to completed rounds since the last `## Converged` marker), and printed `RULE_CHANGES=`, `RULES_NEED_HUMAN=`, `RULES_FP=`, and `RULE|` lines. |
 
 Read the review from `RESULT=`, the rendered `review.md` in the documented
 `# Codex Review` / `Review comment:` layout. The raw object is at `RESULT_JSON=`.
@@ -252,8 +252,7 @@ Everything in `log` is the reviewer's command trace.
 
 | Name | Scope | Meaning |
 |---|---|---|
-| `CLEAN_STREAK` | per invocation | Consecutive clean rounds |
-| `LAST_CLEAN_HEAD` | per invocation | HEAD of the last clean round |
+| `clean_streak` / `last_clean_*` | persisted, maintained by `finish` & `ack-rules` | Consecutive clean rounds bound to `HEAD`, `base_sha`, `CR_LOOP_SKIP_P3`, and `last_clean_mode` |
 | `dirty_since_step_back` | persisted, maintained by `finish` | Dirty rounds since the last step-back |
 | `step_backs_done` | persisted, maintained by `finish` | Step-backs done since the last convergence |
 
@@ -263,18 +262,16 @@ Everything in `log` is the reviewer's command trace.
 classes are recorded in the ledger and are not fixed). With `CR_LOOP_SKIP_P3=0`, a P3-only
 round comes back as `dirty`.
 
-1. If `LAST_CLEAN_HEAD == REVIEWED_HEAD`, increment `CLEAN_STREAK`. Otherwise set
-   `CLEAN_STREAK = 1` and `LAST_CLEAN_HEAD = REVIEWED_HEAD`.
+1. Read `CLEAN_STREAK=` from `finish` (or `ack-rules`). `cr-review.sh` increments it only when `REVIEWED_HEAD`, `BASE_SHA`, and `CR_LOOP_SKIP_P3` match the previous clean round; otherwise it resets to `1`.
 2. **Convergence rule (exact).** The loop converges when **two consecutive rounds are clean
-   on the same HEAD and the second one is a whole-diff round** (`full`).
+   on the same HEAD, base, and P3 policy, and the second one is a whole-diff round** (`full`).
    - Step 3a makes the round after any clean round a `full` round, so a clean `incremental`
      (or `step-back`) round is always followed by a whole-diff confirmation on the same HEAD.
    - That confirmation reads the ledger. It can catch cross-cutting problems the fixes
      introduced together without repeating any class already reported.
-3. If `CLEAN_STREAK ≥ 2`:
-   - Run `bash "$CR_REVIEW" mark-converged`. It records the convergence in the ledger and
-     resets the round-cap counters.
-   - Go to the command's **step 8** with `LAST_REVIEWED_HEAD = LAST_CLEAN_HEAD`.
+3. If `CLEAN_STREAK ≥ 2` and the latest round's `MODE` is `full`:
+   - Run `bash "$CR_REVIEW" mark-converged --base "$BASE"`. It verifies the two-round proof (including `last_clean_mode == full`, matching `HEAD`, `BASE_SHA`, and `SKIP_P3`), records the convergence in the ledger and `state`, and resets the round-cap counters.
+   - Go to the command's **step 8** with `LAST_REVIEWED_HEAD = REVIEWED_HEAD`.
 4. Otherwise, go back to step 3 for the confirmation round. **Commit nothing**, so that HEAD
    stays the same.
 
@@ -285,9 +282,9 @@ P3-only verdict forever.
 ### 4h. Rule-file edits need a person
 
 `VERDICT=needs-human`: the code review itself was clean (or P3-only with
-`CR_LOOP_SKIP_P3=1`), but the branch removes or rewrites lines in a rule file and no person
+`CR_LOOP_SKIP_P3=1`), but the branch removes, rewrites, or changes the type of a rule file and no person
 has approved exactly these edits yet (`RULES_NEED_HUMAN≥1`). It is **not** clean: do not
-touch `CLEAN_STREAK`. It is not dirty either: `dirty_since_step_back` does not grow.
+touch `clean_streak`. It is not dirty either: `dirty_since_step_back` does not grow.
 
 1. Show the user the `RULE|` lines, the `## Rule-file edits that need a person` section of
    `review.md`, and `git diff <BASE_SHA>...<REVIEWED_HEAD> -- <each needs-human path>`.
@@ -295,17 +292,16 @@ touch `CLEAN_STREAK`. It is not dirty either: `dirty_since_step_back` does not g
    later review reads.
 2. Ask through the step-5a surface (the `form-base` radio when loaded, inline A/B/C
    otherwise):
-   - **(A) Approve these edits.** Run `bash "$CR_REVIEW" ack-rules <RULES_FP> "<who / why>"`,
-     then handle this round as **4a clean** (same HEAD; the code review was clean).
+   - **(A) Approve these edits.** Run `bash "$CR_REVIEW" ack-rules <RULES_FP> --base "$BASE" "<who / why>"`. `ack-rules` verifies the pending `needs-human` round matches current `HEAD`, `BASE_SHA`, `SKIP_P3`, and snapshots, then atomically records the approval and updates `CLEAN_STREAK=` using the normal 4a clean rule. Continue with **4a** using the returned `CLEAN_STREAK=`.
    - **(B) Restore the rules.** Revert the removed / rewritten lines (keep additive entries),
-     commit it as a fix (step 6), reset `CLEAN_STREAK=0`, and go back to step 3.
+     commit it as a fix (step 6), and go back to step 3 (HEAD changed, so the streak resets automatically).
    - **(C) Stop.** Handoff with `Stop reason: rule-edits-declined`.
 3. Block on the reply. "No response" is never consent, and an agent never approves its own
    rule edits.
 
-The approval is bound to `RULES_FP`, a hash of the flagged edits. Any further removal or
-rewrite changes the fingerprint and the next round asks again. `ack-rules` refuses a
-fingerprint that is not the one pending.
+The approval is bound to `RULES_FP`, a hash of the flagged edits' modes and full blob OIDs. Any further removal,
+rewrite, or type change produces a new fingerprint and the next round asks again. `ack-rules` refuses a
+stale fingerprint and never grants clean credit for a `dirty` round.
 
 A `dirty` round can also carry `RULES_NEED_HUMAN≥1`. Fix the findings first (4b); the
 rule-file question comes when the code is otherwise clean.
@@ -489,7 +485,7 @@ your own analysis, or a step-back), and of how obvious the change looks.
    invariant-style so it covers every instance. Skip this only for documentation-only or
    purely cosmetic fixes.
 6. **Update `CLAUDE.md`, `AGENTS.md` or other project docs** if the fix changes an invariant
-   they describe.
+   they describe. Note: pure additive entries are reviewed as content and pass automatically, whereas removing, rewriting, or type-changing lines in `REVIEW.md` / `AGENTS.md` / `AGENTS.override.md` / `CLAUDE.md` triggers the **4h human approval gate** (`VERDICT=needs-human`) when the code is otherwise clean.
 7. **Run the affected tests** with the project's documented command until they are green.
 8. **Record the outcome.** After committing (step 6), run
    `bash "$CR_REVIEW" note "<Cn> fixed in <short-sha> (<k> instances)"`.
