@@ -202,7 +202,7 @@ This command adds:
      "No response" is not consent. Never force-push without an answer.
    - **Upstream points elsewhere:** defer with
      `PR status: deferred — upstream points at $UPSTREAM, expected ${CR_PR_REMOTE:-origin}/$FEATURE_BRANCH`.
-   - **Upstream unset:** run `git push -u "${CR_PR_REMOTE:-origin}" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
+   - **Upstream unset:** run `git push "${CR_PR_REMOTE:-origin}" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"` and immediately set and verify the local upstream tracking branch: `git branch --set-upstream-to="${CR_PR_REMOTE:-origin}/$FEATURE_BRANCH" "$FEATURE_BRANCH" && git rev-parse --abbrev-ref --symbolic-full-name '@{u}'` (`git push -u` with a raw SHA refspec does not automatically configure `@{u}`).
    - **Pre-push hook failure:** defer and show the hook output. Never use `--no-verify`.
    - **Push rejected (non-fast-forward, or a failed lease):** defer with
      `PR status: deferred — non-fast-forward push (someone else pushed to ${CR_PR_REMOTE:-origin}/$FEATURE_BRANCH)`.

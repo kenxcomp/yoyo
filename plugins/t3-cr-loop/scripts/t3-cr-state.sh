@@ -1915,10 +1915,22 @@ cmd_cancel_round() {
 
 cmd_finish() {
   resolve_paths; ensure_state
-  explicit_arg="${1:-}"
+  explicit_arg=""; has_explicit=0
+  if [ $# -gt 0 ] && [ -n "${1:-}" ] && [ "${1#--}" = "$1" ]; then
+    explicit_arg="$1"; has_explicit=1; shift
+  fi
   merged_file=""; partial_reason=""; dismissed_file=""; ign_arg=""
-  if [ -n "$explicit_arg" ] && [ "${explicit_arg#--}" = "$explicit_arg" ]; then
-    shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --merged) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --merged requires a non-empty file path"; merged_file="$2"; shift 2 ;;
+      --dismissed-findings) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --dismissed-findings requires a non-empty file path"; dismissed_file="$2"; shift 2 ;;
+      --partial-approved) [ $# -ge 2 ] || die "finish: --partial-approved requires a reason"; partial_reason="$2"; shift 2 ;;
+      --ignore-project-config) ign_arg=1; shift ;;
+      --use-project-config) ign_arg=0; shift ;;
+      *) die "finish: unknown arg $1" ;;
+    esac
+  done
+  if [ "$has_explicit" = "1" ]; then
     d=$(validate_round_dir "$explicit_arg")
     if [ -f "$d/finished" ]; then
       [ -f "$d/verdict" ] || die "round already finished but verdict missing: $d"
@@ -1934,16 +1946,6 @@ cmd_finish() {
     [ -n "$d" ] || die "finish: no round dir given and no active round"
     d=$(validate_round_dir "$d")
   fi
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --merged) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --merged requires a non-empty file path"; merged_file="$2"; shift 2 ;;
-      --dismissed-findings) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --dismissed-findings requires a non-empty file path"; dismissed_file="$2"; shift 2 ;;
-      --partial-approved) [ $# -ge 2 ] || die "finish: --partial-approved requires a reason"; partial_reason="$2"; shift 2 ;;
-      --ignore-project-config) ign_arg=1; shift ;;
-      --use-project-config) ign_arg=0; shift ;;
-      *) die "finish: unknown arg $1" ;;
-    esac
-  done
   resolve_knobs "$ign_arg"
   if [ -n "$dismissed_file" ] && { [ ! -f "$dismissed_file" ] || [ -L "$dismissed_file" ]; }; then
     die "finish: --dismissed-findings file not found or symlink: $dismissed_file"
@@ -2216,6 +2218,26 @@ cmd_finish() {
       exit 0;
     }
 
+    # Map valid slots by slot name and unique provider/model tag BEFORE parsing dismissals so ambiguous tags fail closed.
+    my %slot_by_name;
+    my %slots_by_mtag;
+    for my $vs (@valid_slots) {
+      my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
+      $vs->{mtag} = $mtag;
+      $slot_by_name{$vs->{slot}} = $vs;
+      push @{$slots_by_mtag{$mtag}}, $vs;
+    }
+    my $resolve_slot = sub {
+      my ($ref, $ctx) = @_;
+      return $slot_by_name{$ref} if exists $slot_by_name{$ref};
+      if (exists $slots_by_mtag{$ref}) {
+        die "$ctx cites ambiguous model tag '\''$ref'\'' — use explicit slot id\n"
+          if @{$slots_by_mtag{$ref}} > 1;
+        return $slots_by_mtag{$ref}[0];
+      }
+      die "$ctx cites unknown or non-valid slot '\''$ref'\''\n";
+    };
+
     # Multi-reviewer council: load optional evidenced --dismissed-findings with STRICT typed JSON string validation!
     my @dismissed;
     if (defined $dismissed_path && length $dismissed_path) {
@@ -2245,8 +2267,10 @@ cmd_finish() {
             unless $dh->{index}[0] eq "num" && defined($dh->{index}[1]) && $dh->{index}[1] =~ /\A(?:0|[1-9][0-9]*)\z/;
           $d_index = int($dh->{index}[1]);
         }
+        my $d_so = $resolve_slot->($dh->{slot}[1], "--dismissed-findings[$idx].slot");
         push @dismissed, {
           slot          => $dh->{slot}[1],
+          canon_slot    => $d_so->{slot},
           title         => $dh->{title}[1],
           severity      => $sev,
           code_evidence => $dh->{code_evidence}[1],
@@ -2268,7 +2292,7 @@ cmd_finish() {
           } else {
             next if defined($d->{index});
           }
-          next unless ($d->{slot} eq $slot || $d->{slot} eq $model_tag);
+          next unless $d->{canon_slot} eq $slot;
           next unless $d->{severity} eq $f->{severity};
           next unless $d->{title} eq $f->{title};
           my $f_reo = $f->{reopens} // "";
@@ -2399,26 +2423,6 @@ cmd_finish() {
       return $corresponds->($orig->{approach_change} // "", $msb->{approach_change} // "");
     };
 
-    # Map valid slots by slot name and unique provider/model tag for exact structural provenance.
-    my %slot_by_name;
-    my %slots_by_mtag;
-    for my $vs (@valid_slots) {
-      my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
-      $vs->{mtag} = $mtag;
-      $slot_by_name{$vs->{slot}} = $vs;
-      push @{$slots_by_mtag{$mtag}}, $vs;
-    }
-    my $resolve_slot = sub {
-      my ($ref, $ctx) = @_;
-      return $slot_by_name{$ref} if exists $slot_by_name{$ref};
-      if (exists $slots_by_mtag{$ref}) {
-        die "$ctx cites ambiguous model tag '\''$ref'\'' — use explicit slot id\n"
-          if @{$slots_by_mtag{$ref}} > 1;
-        return $slots_by_mtag{$ref}[0];
-      }
-      die "$ctx cites unknown or non-valid slot '\''$ref'\''\n";
-    };
-
     my @m_findings = @{$merged->{findings} || []};
     my @m_sbs      = @{$merged->{step_back} || []};
     my (%claimed_f, %claimed_blocking_f, %claimed_sb);
@@ -2536,10 +2540,8 @@ cmd_finish() {
     # Reject explicit-index dismissals pointing to already-claimed findings (contradictory claim + dismiss).
     for my $d (@dismissed) {
       next unless defined $d->{index};
-      my $so = eval { $resolve_slot->($d->{slot}, "--dismissed-findings") };
-      next if $@ || !$so;
-      my $ck = "$so->{slot}\0$d->{index}";
-      die "contradictory --dismissed-findings: slot $so->{slot} findings[$d->{index}] is already claimed in merged findings[]\n"
+      my $ck = "$d->{canon_slot}\0$d->{index}";
+      die "contradictory --dismissed-findings: slot $d->{canon_slot} findings[$d->{index}] is already claimed in merged findings[]\n"
         if $claimed_f{$ck};
     }
 

@@ -48,7 +48,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --project)
       [ $# -ge 2 ] && [ -n "${2:-}" ] || die "--project requires a repo path"
-      TARGET_DIR="$(cd -- "$2" && pwd -P)/.agents/skills" || die "invalid --project path: $2"
+      case "$2" in /*) _proj_p="$2" ;; *) _proj_p="./$2" ;; esac
+      TARGET_DIR="$(cd -- "$_proj_p" && pwd -P)/.agents/skills" || die "invalid --project path: $2"
       shift 2
       ;;
     --target)
@@ -111,7 +112,8 @@ case "$MODE" in
         ok=0
         continue
       fi
-      real_skill=$(cd -- "$dst" && pwd -P)
+      case "$dst" in /*) _dst_p="$dst" ;; *) _dst_p="./$dst" ;; esac
+      real_skill=$(cd -- "$_dst_p" && pwd -P)
       real_root=$(cd "$real_skill/../.." && pwd -P)
       if [ -x "$real_root/scripts/t3-cr-state.sh" ] && [ -f "$real_root/references/review-protocol.md" ]; then
         printf 'OK %s (plugin_root=%s)\n' "$s" "$real_root"

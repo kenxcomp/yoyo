@@ -1141,6 +1141,42 @@ expect "council rejects collapsing same-name step_back[] proposals with differen
 out_sbn_ok=$(bash "$ST" finish "$RDSBN" --merged "$F_SB_NAME_OK"); rc=$?
 expect "council accepts keeping same-name step_back[] proposals with distinct approach_change" "0:clean" "$rc:$(printf '%s\n' "$out_sbn_ok" | kv VERDICT)"
 
+# 8h. Round 7 High #1: ambiguous provider/model tag in --dismissed-findings (2 slots sharing same model) MUST be rejected!
+F_AMB_MERGED="$TMP/amb-merged.json"
+cat > "$F_AMB_MERGED" <<'EOF'
+{
+  "summary": "Claimed only s1[0].",
+  "verdict": "findings",
+  "findings": [{
+    "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
+    "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test",
+    "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }]
+  }],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_AMB_DISM_BAD="$TMP/amb-dism-bad.json"
+cat > "$F_AMB_DISM_BAD" <<'EOF'
+[{ "slot": "codex/gpt-6.2-sol", "index": 0, "title": "Input handling bug", "severity": "P1", "code_evidence": "app.txt:1 checked" }]
+EOF
+F_AMB_DISM_OK="$TMP/amb-dism-ok.json"
+cat > "$F_AMB_DISM_OK" <<'EOF'
+[{ "slot": "s2", "index": 0, "title": "Input handling bug", "severity": "P1", "code_evidence": "app.txt:1 verified closed" }]
+EOF
+po_amb=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1,s2 --owner "$OWNER")
+RDAMB=$(printf '%s\n' "$po_amb" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDAMB" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDAMB" --slot s1 --attempt 1 --owner "$OWNER" --task-id tamb1 --child-thread-id ctamb1 >/dev/null
+bash "$ST" record-result "$RDAMB" --slot s1 --attempt 1 --owner "$OWNER" --task-id tamb1 --input "$F_AUTH_S1" >/dev/null
+bash "$ST" claim-slot "$RDAMB" --slot s2 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDAMB" --slot s2 --attempt 1 --owner "$OWNER" --task-id tamb2 --child-thread-id ctamb2 >/dev/null
+bash "$ST" record-result "$RDAMB" --slot s2 --attempt 1 --owner "$OWNER" --task-id tamb2 --input "$F_STREAM_S2" >/dev/null
+out_amb_bad=$(bash "$ST" finish "$RDAMB" --merged "$F_AMB_MERGED" --dismissed-findings "$F_AMB_DISM_BAD"); rc=$?
+expect "council rejects ambiguous model tag in --dismissed-findings when 2 slots share same model" "5:error" "$rc:$(printf '%s\n' "$out_amb_bad" | kv VERDICT)"
+out_amb_ok=$(bash "$ST" finish "$RDAMB" --merged "$F_AMB_MERGED" --dismissed-findings "$F_AMB_DISM_OK"); rc=$?
+expect "council accepts explicit canonical slot id + index in --dismissed-findings" "0:dirty:1" "$rc:$(printf '%s\n' "$out_amb_ok" | kv VERDICT):$(printf '%s\n' "$out_amb_ok" | kv P1)"
+
 # 8e. SIGTERM on submodule git rev-parse HEAD fails closed & unborn nested gitdir leaks ZERO stderr!
 SIG_BIN="$TMP/t3-git-sigterm"
 mkdir -p "$SIG_BIN"

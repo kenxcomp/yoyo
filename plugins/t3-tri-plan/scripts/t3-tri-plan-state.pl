@@ -485,9 +485,13 @@ sub cmd_config_show {
     my $task_lex = _strip_trailing_slashes($opt{task});
     if (-d $task_lex && !-l $task_lex) {
       my $rt = abs_path($task_lex);
-      if (defined $rt && -f "$rt/research/plans/planning-state.json" && !-l "$rt/research/plans/planning-state.json") {
-        my $loaded = eval { load_json_file("$rt/research/plans/planning-state.json") };
-        $st_ro = $loaded if !$@ && ref $loaded eq 'HASH';
+      if (defined $rt) {
+        my $sp = "$rt/research/plans/planning-state.json";
+        my $no_sym = eval { ensure_no_symlink_components($rt, $sp); 1 };
+        if ($no_sym && -f $sp && !-l $sp) {
+          my $loaded = eval { load_json_file($sp) };
+          $st_ro = $loaded if !$@ && ref $loaded eq 'HASH';
+        }
       }
     }
   }
@@ -3129,6 +3133,21 @@ sub _verify_review_slot_binding {
     return;
   }
 
+  # Map valid recorded slots by slot name and unique model tag BEFORE parsing dismissals so ambiguous tags fail closed.
+  my %slot_by_name = map { $_->{slot} => $_ } @slot_objs;
+  my %slots_by_mtag;
+  push @{$slots_by_mtag{$_->{mtag}}}, $_ for @slot_objs;
+  my $resolve_slot = sub {
+    my ($ref, $ctx) = @_;
+    return $slot_by_name{$ref} if exists $slot_by_name{$ref};
+    if (exists $slots_by_mtag{$ref}) {
+      die_err("$ctx cites ambiguous model tag '$ref' — use explicit slot id", 3)
+        if @{$slots_by_mtag{$ref}} > 1;
+      return $slots_by_mtag{$ref}[0];
+    }
+    die_err("$ctx cites unknown or non-valid slot '$ref'", 3);
+  };
+
   # Multi-reviewer council: load optional evidenced --dismissed-findings with strict typed string checks (1-to-1 consumable!).
   my @dismissed;
   if (defined $dismissed_path && length $dismissed_path) {
@@ -3158,8 +3177,10 @@ sub _verify_review_slot_binding {
           unless $dh->{index}[0] eq 'num' && defined($dh->{index}[1]) && $dh->{index}[1] =~ /\A(?:0|[1-9][0-9]*)\z/;
         $d_index = int($dh->{index}[1]);
       }
+      my $d_so = $resolve_slot->($dh->{slot}[1], "--dismissed-findings[$idx].slot");
       push @dismissed, {
         slot          => $dh->{slot}[1],
+        canon_slot    => $d_so->{slot},
         title         => $dh->{title}[1],
         severity      => $sev,
         code_evidence => $dh->{code_evidence}[1],
@@ -3181,7 +3202,7 @@ sub _verify_review_slot_binding {
         } else {
           next if defined($d->{index});
         }
-        next unless $d->{slot} eq $sn || $d->{slot} eq $mtag;
+        next unless $d->{canon_slot} eq $sn;
         next unless $d->{severity} eq $f->{severity};
         next unless $d->{title} eq $f->{title};
         my $f_reo = $f->{reopens} // '';
@@ -3195,11 +3216,6 @@ sub _verify_review_slot_binding {
     }
     return 0;
   };
-
-  # Map valid recorded slots by slot name and unique model tag for strict dispute verification.
-  my %slot_by_name = map { $_->{slot} => $_ } @slot_objs;
-  my %slots_by_mtag;
-  push @{$slots_by_mtag{$_->{mtag}}}, $_ for @slot_objs;
 
   my %disputed_classes;
   for my $dp (@{$merged_obj->{disputes} || []}) {
@@ -3370,31 +3386,21 @@ sub _verify_review_slot_binding {
     my $me = $norm_loc->($merged_ev);
     return 1 unless length $oe;
     return 0 unless length $me;
-    return 1 if index($me, $oe) >= 0;
-    my @cites = ($oe =~ m{([A-Za-z0-9_./-]+:\d+)}g);
-    if (@cites) {
-      for my $c (@cites) {
-        return 0 if index($me, $c) < 0;
+    my @orig_cites = ($oe =~ m{([A-Za-z0-9_./-]+:\d+(?:-\d+)?)}g);
+    if (@orig_cites) {
+      my %merged_cites = map { $_ => 1 } ($me =~ m{([A-Za-z0-9_./-]+:\d+(?:-\d+)?)}g);
+      for my $c (@orig_cites) {
+        return 0 unless $merged_cites{$c};
       }
       return 1;
     }
+    return 1 if index($me, $oe) >= 0;
     return $corresponds->($oe, $me);
   };
 
   my $sb_corresponds = sub {
     my ($orig, $msb) = @_;
     return $corresponds->($orig->{approach_change} // '', $msb->{approach_change} // '');
-  };
-
-  my $resolve_slot = sub {
-    my ($ref, $ctx) = @_;
-    return $slot_by_name{$ref} if exists $slot_by_name{$ref};
-    if (exists $slots_by_mtag{$ref}) {
-      die_err("$ctx cites ambiguous model tag '$ref' — use explicit slot id", 3)
-        if @{$slots_by_mtag{$ref}} > 1;
-      return $slots_by_mtag{$ref}[0];
-    }
-    die_err("$ctx cites unknown or non-valid slot '$ref'", 3);
   };
 
   my @m_findings = @{$merged_obj->{findings} || []};
@@ -3519,10 +3525,8 @@ sub _verify_review_slot_binding {
   # Reject explicit-index dismissals pointing to already-claimed findings (contradictory claim + dismiss).
   for my $d (@dismissed) {
     next unless defined $d->{index};
-    my $so = eval { $resolve_slot->($d->{slot}, '--dismissed-findings') };
-    next if $@ || !$so;
-    my $ck = "$so->{slot}\0$d->{index}";
-    die_err("contradictory --dismissed-findings: slot $so->{slot} findings[$d->{index}] is already claimed in merged findings[]", 3)
+    my $ck = "$d->{canon_slot}\0$d->{index}";
+    die_err("contradictory --dismissed-findings: slot $d->{canon_slot} findings[$d->{index}] is already claimed in merged findings[]", 3)
       if $claimed_f{$ck};
   }
 

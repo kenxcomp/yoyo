@@ -60,7 +60,7 @@ Run the shared T3 Code multi-model review protocol from `<PLUGIN_ROOT>/reference
 
    ### Push (Always Explicit Reviewed SHA Refspec)
    - Never `--no-verify`, never bare `--force`, never push `$CR_PR_BASE`.
-   - **Upstream unset**: `git push -u "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
+   - **Upstream unset**: `git push "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`, then immediately configure and verify local upstream tracking: `git branch --set-upstream-to="$REMOTE/$FEATURE_BRANCH" "$FEATURE_BRANCH" && git rev-parse --abbrev-ref --symbolic-full-name '@{u}'` (`git push -u` with a raw SHA refspec does not set `@{u}`).
    - **Upstream is `$REMOTE/$FEATURE_BRANCH` and `REBASED_IN_8_0=0`**: `git push "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.
    - **Upstream is `$REMOTE/$FEATURE_BRANCH` and `REBASED_IN_8_0=1`**: block for explicit user confirmation quoting BOTH `PINNED_REMOTE_HEAD_SHA` and `LAST_REVIEWED_HEAD`:
      - **(A) Force-update PR**: immediately AFTER user confirms and BEFORE pushing, **re-verify preconditions (a), (b), and (e)** (`tree-clean`, `HEAD == $LAST_REVIEWED_HEAD`, and re-fetched PR target tip coverage against immutable `$REVIEWED_BASE_SHA` — defer if anything drifted while awaiting consent), then run `git push --force-with-lease="refs/heads/$FEATURE_BRANCH:$PINNED_REMOTE_HEAD_SHA" "$REMOTE" "$LAST_REVIEWED_HEAD:refs/heads/$FEATURE_BRANCH"`.

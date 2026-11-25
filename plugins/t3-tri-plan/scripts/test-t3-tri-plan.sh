@@ -2488,6 +2488,91 @@ mkdir -p "$INST_TRI_DASH"
   [ ! -e "INJECTED_TRI" ] && [ ! -L "$POC_DIR/t3-tri-plan" ] || exit 57
 ) && ok "t3-tri-plan install-skills.sh handles leading-dash and -e target dirs safely" || fail "t3-tri-plan install-skills.sh failed or executed Perl switch code"
 
+# K9. Round 7 High #1: ambiguous provider/model tag in --dismissed-findings (2 slots sharing same model) MUST be rejected!
+cat > "$TMP/two-same-model.json" <<'EOF'
+[
+  { "slot": "slot1", "providerInstanceId": "codex", "model": "gpt-6.2-sol", "options": {} },
+  { "slot": "slot2", "providerInstanceId": "codex", "model": "gpt-6.2-sol", "options": {} }
+]
+EOF
+REPO_AMB="$TMP/repo-amb-dism"
+make_repo "$REPO_AMB"
+TASK_AMB="$REPO_AMB/.trellis/tasks/01-amb"
+mkdir -p "$TASK_AMB"
+printf '# PRD\n' > "$TASK_AMB/prd.md"
+cat > "$TASK_AMB/task.json" <<'EOF'
+{ "id": "01-amb", "title": "Ambiguous Tag", "status": "planning" }
+EOF
+bash "$STATE" commit-phase0 --task "$TASK_AMB" --repo "$REPO_AMB" >/dev/null
+pd_amb=$(bash "$STATE" prepare-design --task "$TASK_AMB" --repo "$REPO_AMB" --slots-json "$TMP/designers.json" --owner "o-amb")
+PDAMB=$(printf '%s\n' "$pd_amb" | sed -n 's/^RUN_ID=//p')
+for sn in candidate-a candidate-b candidate-c; do
+  bash "$STATE" claim-slot --task "$TASK_AMB" --run-id "$PDAMB" --slot "$sn" --owner "o-amb" --owner-gen 1 --generation 1 >/dev/null
+  bash "$STATE" record-dispatch --task "$TASK_AMB" --run-id "$PDAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot "$sn" --attempt 1 --task-id "ta-$sn" --child-thread-id "cta-$sn" --child-run-id "cra-$sn" >/dev/null
+  bash "$STATE" record-result --task "$TASK_AMB" --run-id "$PDAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot "$sn" --attempt 1 --task-id "ta-$sn" --child-run-id "cra-$sn" --input "$TMP/cand-ok.md" >/dev/null
+done
+bash "$STATE" commit-phase1 --task "$TASK_AMB" --repo "$REPO_AMB" >/dev/null
+pj_amb=$(bash "$STATE" prepare-judge --task "$TASK_AMB" --repo "$REPO_AMB" --target-json "$TMP/judge-target.json" --owner "o-amb")
+PJAMB=$(printf '%s\n' "$pj_amb" | sed -n 's/^RUN_ID=//p')
+bash "$STATE" claim-slot --task "$TASK_AMB" --run-id "$PJAMB" --slot judge --owner "o-amb" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_AMB" --run-id "$PJAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot judge --attempt 1 --task-id "ta-j" --child-thread-id "cta-j" --child-run-id "cra-j" >/dev/null
+bash "$STATE" record-result --task "$TASK_AMB" --run-id "$PJAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot judge --attempt 1 --task-id "ta-j" --child-run-id "cra-j" --input "$TMP/judge-k.json" >/dev/null
+bash "$STATE" commit-phase2a --task "$TASK_AMB" --repo "$REPO_AMB" >/dev/null
+bash "$STATE" commit-phase2b --task "$TASK_AMB" --repo "$REPO_AMB" --assemble >/dev/null
+pr_amb=$(bash "$STATE" prepare-review --task "$TASK_AMB" --repo "$REPO_AMB" --purpose initial-full --mode full --slots-json "$TMP/two-same-model.json" --owner "o-amb")
+PRAMB=$(printf '%s\n' "$pr_amb" | sed -n 's/^RUN_ID=//p')
+PRAMB_DSHA=$(printf '%s\n' "$pr_amb" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+cat > "$TMP/rev-amb-s1.json" <<EOF
+{
+  "summary": "Auth check missing", "mode": "full", "reviewed_design_sha256": "$PRAMB_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-amb-s2.json" <<EOF
+{
+  "summary": "Stream not closed", "mode": "full", "reviewed_design_sha256": "$PRAMB_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
+    "pattern": "file stream leaks descriptor on error return path", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "close stream handle in finally block", "prevent": "add leak test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-amb-m.json" <<EOF
+{
+  "summary": "Claimed only slot1[0]", "mode": "full", "reviewed_design_sha256": "$PRAMB_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+    "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }]
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/dism-amb-bad.json" <<'EOF'
+[{ "slot": "codex/gpt-6.2-sol", "index": 0, "title": "Input handling bug", "severity": "BLOCKER", "code_evidence": "src/app.py:1" }]
+EOF
+cat > "$TMP/dism-amb-ok.json" <<'EOF'
+[{ "slot": "slot2", "index": 0, "title": "Input handling bug", "severity": "BLOCKER", "code_evidence": "src/app.py:1 verified closed" }]
+EOF
+bash "$STATE" claim-slot --task "$TASK_AMB" --run-id "$PRAMB" --slot slot1 --owner "o-amb" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_AMB" --run-id "$PRAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot slot1 --attempt 1 --task-id "ta-r1" --child-thread-id "cta-r1" --child-run-id "cra-r1" >/dev/null
+bash "$STATE" record-result --task "$TASK_AMB" --run-id "$PRAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot slot1 --attempt 1 --task-id "ta-r1" --child-run-id "cra-r1" --input "$TMP/rev-amb-s1.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_AMB" --run-id "$PRAMB" --slot slot2 --owner "o-amb" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_AMB" --run-id "$PRAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot slot2 --attempt 1 --task-id "ta-r2" --child-thread-id "cta-r2" --child-run-id "cra-r2" >/dev/null
+bash "$STATE" record-result --task "$TASK_AMB" --run-id "$PRAMB" --generation 1 --owner "o-amb" --owner-gen 1 --slot slot2 --attempt 1 --task-id "ta-r2" --child-run-id "cra-r2" --input "$TMP/rev-amb-s2.json" >/dev/null
+out=$(bash "$STATE" finish-review-round --task "$TASK_AMB" --repo "$REPO_AMB" --merged-input "$TMP/rev-amb-m.json" --dismissed-findings "$TMP/dism-amb-bad.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan rejects ambiguous model tag in --dismissed-findings when 2 slots share same model (exit 3)" "$rc" 3
+out=$(bash "$STATE" finish-review-round --task "$TASK_AMB" --repo "$REPO_AMB" --merged-input "$TMP/rev-amb-m.json" --dismissed-findings "$TMP/dism-amb-ok.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan accepts explicit canonical slot id + index in --dismissed-findings" "$rc" 0
+
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '========================================\n'
