@@ -1,0 +1,86 @@
+{
+  "description": "User configuration schema (~/.config/t3-tri-plan/config.json) for t3-tri-plan v1.0.0.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "authorizedProviders", "designers", "defaultReviewer", "reviewCouncil"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "authorizedProviders": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "User config ONLY: providerInstanceIds explicitly authorized by the user to receive repository context. Project .t3-tri-plan.json overrides referencing any provider outside this list require explicit user confirmation before dispatch."
+    },
+    "designers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effortMode", "members"],
+      "properties": {
+        "effortMode": {
+          "type": "string",
+          "enum": ["unified", "per-model"]
+        },
+        "unifiedEffort": {
+          "type": "string",
+          "description": "Required when effortMode is unified: value from the strict intersection of allowed effort options across all designers; applied to every designer."
+        },
+        "members": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/modelSpec" }
+        }
+      }
+    },
+    "defaultReviewer": {
+      "$ref": "#/$defs/modelSpec",
+      "description": "Default single reviewer for Phase 3 incremental and confirmation-full rounds. Also inherited by Phase 2a blind judge when top-level judge is omitted."
+    },
+    "judge": {
+      "$ref": "#/$defs/modelSpec",
+      "description": "Optional explicit Phase 2a blind judge model. When omitted, inherits config defaultReviewer (never indirectly modified by per-call single= or model= overrides)."
+    },
+    "reviewCouncil": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effortMode", "members"],
+      "properties": {
+        "effortMode": {
+          "type": "string",
+          "enum": ["unified", "per-model"]
+        },
+        "unifiedEffort": {
+          "type": "string",
+          "description": "Required when effortMode is unified: value from the strict intersection of allowed effort options across all council reviewers; applied to every member."
+        },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/modelSpec" }
+        }
+      }
+    },
+    "knobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roundCap": { "type": "integer", "minimum": 0 },
+        "maxStepBacks": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "modelSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providerInstanceId", "model", "effortKey", "effort"],
+      "properties": {
+        "providerInstanceId": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "effortKey": { "type": "string" },
+        "effort": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "description": "Strict JSON contract for one t3-tri-plan Phase 3 design-review output (individual reviewer or merged council round).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "mode",
+    "reviewed_design_sha256",
+    "verdict",
+    "findings",
+    "verified",
+    "step_back",
+    "out_of_scope"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["full", "incremental", "step-back"]
+    },
+    "reviewed_design_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["clean", "findings"],
+      "description": "clean ONLY when complete and zero BLOCKER/SHOULD_FIX findings and zero unresolved disputes exist. OPTIONAL-only still uses findings (treated as clean by orchestrator)."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "reopens",
+          "title",
+          "location",
+          "pattern",
+          "still_wrong",
+          "instances",
+          "fix",
+          "prevent",
+          "evidence",
+          "violates_review_md_rule"
+        ],
+        "properties": {
+          "severity": { "type": "string", "enum": ["BLOCKER", "SHOULD_FIX", "OPTIONAL"] },
+          "reopens": {
+            "type": "string",
+            "description": "Existing frozen ledger class id (e.g. D3) if incomplete or regressed; empty string for a new class."
+          },
+          "title": { "type": "string", "minLength": 1 },
+          "location": { "type": "string", "minLength": 1 },
+          "pattern": { "type": "string", "minLength": 1 },
+          "still_wrong": {
+            "type": "string",
+            "description": "Required non-empty when reopens is non-empty; empty string otherwise."
+          },
+          "instances": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "fix": { "type": "string", "minLength": 1 },
+          "prevent": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "string", "minLength": 1 },
+          "violates_review_md_rule": {
+            "type": "string",
+            "description": "Empty string if none; otherwise exact rule citation matching a frozen baseline REVIEW.md path and anchor (e.g. REVIEW.md#section-slug)."
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Merged council output only: contributing reviewer slots."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council output only (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical findings[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council output only (required non-empty when merged_from references >= 2 distinct slots): code-verified explanation of why the merged items share the same root cause."
+          },
+          "dispute_note": {
+            "type": "string",
+            "description": "Merged council output only: resolution summary when reviewers disagreed."
+          }
+        }
+      }
+    },
+    "verified": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "note"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "note": { "type": "string", "minLength": 1 },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+          },
+          "dispute_note": { "type": "string" }
+        }
+      }
+    },
+    "step_back": {
+      "type": "array",
+      "description": "Must be empty when mode != step-back.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["classes", "name", "invites_because", "approach_change", "prevent"],
+        "properties": {
+          "classes": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "name": { "type": "string", "minLength": 1 },
+          "invites_because": { "type": "string", "minLength": 1 },
+          "approach_change": { "type": "string", "minLength": 1 },
+          "prevent": { "type": "string", "minLength": 1 },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Merged council output only (rejected in single-slot reviewer output): slot id(s) or provider/model tags attributing this proposal."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council output only (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical step_back[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council output only (required non-empty when merged_from references >= 2 distinct slots): why the merged proposals express the same structural change."
+          }
+        }
+      }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["location", "note"],
+        "properties": {
+          "location": { "type": "string", "minLength": 1 },
+          "note": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "disputes": {
+      "type": "array",
+      "description": "Merged council output only: disagreements between reviewers on the same ledger class Dn (e.g. verified vs reopens). Any entry with resolution=unresolved blocks clean.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class_id", "reviewer_positions", "resolution", "code_evidence"],
+        "properties": {
+          "class_id": { "type": "string", "minLength": 1 },
+          "reviewer_positions": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "position", "evidence"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1 },
+                "position": { "type": "string", "enum": ["reopen", "verified", "finding"] },
+                "evidence": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "resolution": { "type": "string", "enum": ["reopen", "verified", "unresolved"] },
+          "code_evidence": { "type": "string" }
+        }
+      }
+    }
+  }
+}

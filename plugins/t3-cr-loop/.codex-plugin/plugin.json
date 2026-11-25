@@ -1,0 +1,38 @@
+{
+  "name": "t3-cr-loop",
+  "version": "1.0.0",
+  "description": "T3 Code-native multi-model code review convergence loops: council review (e.g. Gemini 4 Neon + Claude Opus 5.5 + GPT 6.2 Sol) on Round 1 and step-back rounds via parallel delegate_task, default single model on incremental and confirmation rounds, live model discovery via orchestrator_capabilities, persistent user config with per-invocation model/effort overrides, and three completion modes (stop, local merge, PR).",
+  "author": {
+    "name": "kenxcomp",
+    "url": "https://github.com/kenxcomp"
+  },
+  "repository": "https://github.com/kenxcomp/yoyo",
+  "license": "MIT",
+  "keywords": [
+    "t3-code",
+    "code-review",
+    "multi-model",
+    "council",
+    "review-loop",
+    "pull-request",
+    "merge"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "T3 CR Loop",
+    "shortDescription": "Multi-model T3 Code review loop with council first/step-back rounds and stop/merge/PR modes.",
+    "longDescription": "T3 Code-native convergence review loop forked from codex-cr-loop v1.8.1. Discovers available providers and models via orchestrator_capabilities, guides first-time setup of default and multi-model council reviewers, runs parallel delegate_task council reviews on Round 1 and step-back rounds, enforces base-sourced rule gates, interaction guards, strict JSON validation, and two-clean-round convergence.",
+    "developerName": "kenxcomp",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Review",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run t3-cr-loop on this branch.",
+      "Run t3-cr-loop-merge into local main.",
+      "Run t3-cr-loop-pr and open a PR."
+    ],
+    "brandColor": "#0F766E"
+  }
+}

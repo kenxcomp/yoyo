@@ -1,0 +1,193 @@
+{
+  "description": "Strict structured output of Phase 2a zero-history Blind Judge. Frozen before model attribution is revealed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate_set",
+    "fact_checks",
+    "axis_matrix",
+    "primary_winner",
+    "winner_rationale",
+    "eliminated",
+    "cherry_picks",
+    "rejected_ideas",
+    "product_forks",
+    "product_decisions",
+    "synthesis_body_markdown",
+    "initial_design_markdown"
+  ],
+  "properties": {
+    "candidate_set": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slot", "sha256"],
+        "properties": {
+          "slot": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "fact_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "candidate_slot", "claim", "status", "file_line_evidence"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "candidate_slot": { "type": "string", "minLength": 1 },
+          "claim": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["CONFIRMED", "REFUTED", "UNVERIFIED"] },
+          "file_line_evidence": { "type": "string" }
+        }
+      }
+    },
+    "axis_matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture_fit",
+        "ssot_invariants",
+        "hidden_callers",
+        "migration_compat",
+        "real_entrypoint_tests",
+        "abstraction_restraint",
+        "prd_scope_fidelity",
+        "rollback_viability",
+        "unique_risks",
+        "key_assumptions",
+        "dependency_order",
+        "failure_recovery_acceptance"
+      ],
+      "properties": {
+        "architecture_fit": { "$ref": "#/$defs/axisRow" },
+        "ssot_invariants": { "$ref": "#/$defs/axisRow" },
+        "hidden_callers": { "$ref": "#/$defs/axisRow" },
+        "migration_compat": { "$ref": "#/$defs/axisRow" },
+        "real_entrypoint_tests": { "$ref": "#/$defs/axisRow" },
+        "abstraction_restraint": { "$ref": "#/$defs/axisRow" },
+        "prd_scope_fidelity": { "$ref": "#/$defs/axisRow" },
+        "rollback_viability": { "$ref": "#/$defs/axisRow" },
+        "unique_risks": { "$ref": "#/$defs/axisRow" },
+        "key_assumptions": { "$ref": "#/$defs/axisRow" },
+        "dependency_order": { "$ref": "#/$defs/axisRow" },
+        "failure_recovery_acceptance": { "$ref": "#/$defs/axisRow" }
+      }
+    },
+    "primary_winner": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Must match one slot in candidate_set."
+    },
+    "winner_rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "eliminated": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slot", "rationale"],
+        "properties": {
+          "slot": { "type": "string", "minLength": 1 },
+          "rationale": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "cherry_picks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_slot",
+          "gap_description",
+          "evidence_fact_check_id",
+          "evidence_quote",
+          "compatible_with_winner_architecture"
+        ],
+        "properties": {
+          "source_slot": { "type": "string", "minLength": 1 },
+          "gap_description": { "type": "string", "minLength": 1 },
+          "evidence_fact_check_id": { "type": "string", "minLength": 1 },
+          "evidence_quote": { "type": "string", "minLength": 1 },
+          "compatible_with_winner_architecture": { "type": "boolean", "enum": [true] }
+        }
+      }
+    },
+    "rejected_ideas": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_slot", "idea", "reason"],
+        "properties": {
+          "source_slot": { "type": "string", "minLength": 1 },
+          "idea": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "product_forks": {
+      "type": "array",
+      "description": "Unresolved product or external-contract forks requiring user input. Must be empty before commit-phase2a locks.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question", "options", "trade_offs"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "question": { "type": "string", "minLength": 1 },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "trade_offs": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "product_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fork_id", "chosen_option", "user_answer"],
+        "properties": {
+          "fork_id": { "type": "string", "minLength": 1 },
+          "chosen_option": { "type": "string", "minLength": 1 },
+          "user_answer": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "synthesis_body_markdown": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Anonymous synthesis report (no model/provider names). Frozen verbatim as the prefix of synthesis.md before attribution reveal."
+    },
+    "initial_design_markdown": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Complete initial design.md built strictly on primary_winner + cherry_picks + product_decisions (no model/provider names). Frozen verbatim as initial-design.md before attribution reveal."
+    }
+  },
+  "$defs": {
+    "axisRow": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rating", "evidence_note"],
+        "properties": {
+          "rating": { "type": "string", "enum": ["strong", "acceptable", "weak"] },
+          "evidence_note": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,177 @@
+{
+  "description": "Strict JSON output schema for a t3-cr-loop reviewer (single model) or merged council verdict. No prose is parsed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "verdict",
+    "findings",
+    "step_back",
+    "out_of_scope"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One concise paragraph summarizing the review."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "findings"
+      ],
+      "description": "\"clean\" only when the review is complete and findings is empty; otherwise \"findings\". Never \"clean\" for an incomplete review."
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per bug CLASS (not per line).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "reopens",
+          "title",
+          "location",
+          "pattern",
+          "still_wrong",
+          "instances",
+          "fix",
+          "prevent"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["P0", "P1", "P2", "P3"]
+          },
+          "reopens": {
+            "type": "string",
+            "description": "Ledger class id (e.g. \"C3\") when this is an incomplete or regressed fix of that ledger class; empty string for a new class."
+          },
+          "title": {
+            "type": "string",
+            "description": "Class title."
+          },
+          "location": {
+            "type": "string",
+            "description": "Primary file:line."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "The root pattern and why it is wrong."
+          },
+          "still_wrong": {
+            "type": "string",
+            "description": "For a reopened class: what the previous fix missed. Empty string otherwise."
+          },
+          "instances": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "EVERY instance in the reviewed scope, as file:line."
+          },
+          "fix": {
+            "type": "string",
+            "description": "The systematic fix that removes all instances in one pass."
+          },
+          "prevent": {
+            "type": "string",
+            "description": "How to prevent recurrence at the source: lint rule, source-guard / regression test, REVIEW.md entry."
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Allowed ONLY in merged council results (parsed with --allow-sources): list of contributing reviewer slots or provider/model tags."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council results ONLY (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical findings[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council results ONLY (required non-empty when merged_from references >= 2 distinct slots): code-verified explanation of why the merged items share the same root cause."
+          }
+        }
+      }
+    },
+    "step_back": {
+      "type": "array",
+      "description": "Step-back rounds only (empty otherwise): one entry per recurring class.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "classes",
+          "name",
+          "invites_because",
+          "approach_change",
+          "prevent"
+        ],
+        "properties": {
+          "classes": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "name": { "type": "string" },
+          "invites_because": { "type": "string" },
+          "approach_change": { "type": "string" },
+          "prevent": { "type": "string" },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Allowed ONLY in merged council results."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council results ONLY (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical step_back[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council results ONLY (required non-empty when merged_from references >= 2 distinct slots): why the merged proposals express the same structural change."
+          }
+        }
+      }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "description": "Pre-existing issues outside this change; not counted.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["location", "note"],
+        "properties": {
+          "location": { "type": "string" },
+          "note": { "type": "string" },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Allowed ONLY in merged council results."
+          }
+        }
+      }
+    }
+  }
+}

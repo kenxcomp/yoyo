@@ -15,6 +15,30 @@
         "authentication": "ON_INSTALL"
       },
       "category": "Developer Tools"
+    },
+    {
+      "name": "t3-cr-loop",
+      "source": {
+        "source": "local",
+        "path": "./plugins/t3-cr-loop"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
+      "name": "t3-tri-plan",
+      "source": {
+        "source": "local",
+        "path": "./plugins/t3-tri-plan"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
     }
   ]
 }

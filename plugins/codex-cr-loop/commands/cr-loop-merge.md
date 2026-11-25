@@ -113,7 +113,7 @@ that v1.7.0 removed are mapped. This command adds two:
        - **(B) Abort.**
 
        Block on the reply. "No response" is not consent.
-   - **Initialize** `ROUND_NUM=0`, `CLEAN_STREAK=0`, and leave `LAST_CLEAN_HEAD` empty.
+   - **Initialize** `ROUND_NUM=0`. The persisted counters (including `clean_streak`) and ledger belong to `cr-review.sh`.
 
 2. **Run the review loop: protocol steps 2–7.** Follow them exactly as written, using
    `BASE` from step 1.
@@ -136,42 +136,48 @@ that v1.7.0 removed are mapped. This command adds two:
      `git log --oneline "$LAST_REVIEWED_HEAD"..HEAD`.
    - **(c) The current branch is not the merge target:**
      `[ "$FEATURE_BRANCH" != "${CR_MERGE_TARGET:-main}" ]`.
-   - **(d) Every commit being merged was reviewed.** Compute
-     `MERGE_BASE=$(git merge-base "${CR_MERGE_TARGET:-main}" HEAD)`. Then require
-     `git merge-base --is-ancestor "$BASE" "$MERGE_BASE"` or
-     `[ "$BASE" = "$MERGE_BASE" ]`. Diagnostic: `git log --oneline "$BASE"..HEAD` plus
-     `git log --oneline "$MERGE_BASE".."$BASE"`.
-   - **(e) The target has no diverged commits.** Check
-     `[ "$MERGE_BASE" = "$(git rev-parse "${CR_MERGE_TARGET:-main}")" ]`. If the target
-     has diverged, `auto` and `no-ff` create a merge commit, while `ff-only` **defers**.
-     Diagnostic: `git log --oneline "$MERGE_BASE".."${CR_MERGE_TARGET:-main}"`.
+   - **(d) Every commit being merged was reviewed.** Obtain the **immutable** `REVIEWED_BASE_SHA` (40-char commit SHA) from the convergence record (`mark-converged`'s `BASE_SHA=` or `cr-review.sh release-state get`'s `CONVERGED_BASE_SHA=`) — **never** re-resolve a mutable branch ref such as `${CR_MERGE_TARGET:-main}` after convergence (if the local target rewound to an ancestor `B` behind the reviewed baseline `A`, re-resolving the branch name would silently skip `B..A`). Pin the target's current tip SHA once: `EXPECTED_TARGET_SHA=$(git rev-parse --verify "refs/heads/${CR_MERGE_TARGET:-main}")`. Compute `MERGE_BASE=$(git merge-base "$EXPECTED_TARGET_SHA" "$LAST_REVIEWED_HEAD")`. Then require `git merge-base --is-ancestor "$REVIEWED_BASE_SHA" "$MERGE_BASE"`. Diagnostic: `git log --oneline "$REVIEWED_BASE_SHA".."$LAST_REVIEWED_HEAD"` plus `git log --oneline "$MERGE_BASE".."$REVIEWED_BASE_SHA"`.
+   - **(e) The target has no diverged commits.** First check whether `${CR_MERGE_TARGET:-main}` already contains `$LAST_REVIEWED_HEAD`: `git merge-base --is-ancestor "$LAST_REVIEWED_HEAD" "$EXPECTED_TARGET_SHA"`. If so (`Already up to date`), all `CR_MERGE_FF` modes (including `ff-only`) pass precondition (e). Otherwise check `[ "$MERGE_BASE" = "$EXPECTED_TARGET_SHA" ]`: if the target has diverged, `auto` and `no-ff` create a merge commit, while `ff-only` **defers**.
+     Diagnostic: `git log --oneline "$MERGE_BASE".."$EXPECTED_TARGET_SHA"`.
 
-   **Merge,** once (a)–(e) hold:
+   **Merge,** once (a)–(e) hold — **always run worktree detection, target checkout, and merge inside a shared repo-common serial lock** (`COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir)` → exclusive `flock` on `"$COMMON_DIR/cr-loop-merge.lock"`, held across worktree detection, merge, and post-merge verification) AND keep the target branch checkout attached throughout so Git itself preserves exclusive branch-checkout ownership while every merge is verified against `$EXPECTED_TARGET_SHA`:
 
-   - **Find out whether another worktree has the target checked out:**
-     `MAIN_WT=$(git worktree list --porcelain | awk -v t="refs/heads/${CR_MERGE_TARGET:-main}" '/^worktree / {wt=$2} $0=="branch "t {print wt; exit}')`.
-   - **Path A: the target is not checked out anywhere.** Map `CR_MERGE_FF` to a flag:
-     `auto` → no flag, `ff-only` → `--ff-only`, `no-ff` → `--no-ff`. Then run:
-     ```bash
-     git checkout "${CR_MERGE_TARGET:-main}"
-     git merge $MERGE_FLAG "$FEATURE_BRANCH"
-     git checkout "$FEATURE_BRANCH"
-     ```
+   - **Under the repo-common lock (`"$COMMON_DIR/cr-loop-merge.lock"`), check whether another worktree has the target checked out (space-safe):**
+     `MAIN_WT=$(git worktree list --porcelain | awk -v t="refs/heads/${CR_MERGE_TARGET:-main}" '/^worktree / {wt=$0; sub(/^worktree /, "", wt)} $0=="branch "t {print wt; exit}')`.
+   - Map `CR_MERGE_FF` to a flag: `auto` → no flag, `ff-only` → `--ff-only`, `no-ff` → `--no-ff`.
+   - **Shared 3-case post-merge check** (pure commit-graph topology — no reflog dependency, handles fast-forwarding onto existing merge commits cleanly; run on the merged worktree right after `git merge`, capturing `NEW_TARGET_SHA=$(git rev-parse HEAD)`):
+     - **Already up to date**: `[ "$NEW_TARGET_SHA" = "$EXPECTED_TARGET_SHA" ] && git merge-base --is-ancestor "$LAST_REVIEWED_HEAD" "$NEW_TARGET_SHA"`
+     - **Fast-forward**: `[ "$NEW_TARGET_SHA" = "$LAST_REVIEWED_HEAD" ] && git merge-base --is-ancestor "$EXPECTED_TARGET_SHA" "$NEW_TARGET_SHA"`
+     - **Newly created merge commit**: `[ "$NEW_TARGET_SHA" != "$LAST_REVIEWED_HEAD" ] && [ "$(git rev-parse HEAD^1)" = "$EXPECTED_TARGET_SHA" ] && [ "$(git rev-parse HEAD^2)" = "$LAST_REVIEWED_HEAD" ]`
+     If none of the three hold (target ref moved unexpectedly outside the lock), defer and instruct the user to inspect target history and re-run `/cr-loop-merge`.
+   - **Path A: the target is not checked out anywhere.**
+     Do **not** call bare `git update-ref` without owning the branch checkout (if another worktree concurrently checks out `${CR_MERGE_TARGET:-main}`, bare `update-ref` would advance the ref behind that worktree's index and working tree). Instead, while holding the repo-common lock:
+     1. Claim `${CR_MERGE_TARGET:-main}` exclusively via `git checkout "${CR_MERGE_TARGET:-main}"` (Git refuses atomically if another worktree checked it out in the meantime — if refused, defer and re-run `/cr-loop-merge`).
+     2. Immediately re-verify the checked-out tip and cleanliness using the shared clean check (which ignores only untracked repo-root `.cr-loop-handoff-round-*.md` files): `[ "$(git rev-parse HEAD)" = "$EXPECTED_TARGET_SHA" ]` and `bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean` prints `TREE=clean`. If the tip moved/rewound from `$EXPECTED_TARGET_SHA` or the tree is dirty, run `git checkout "$FEATURE_BRANCH"` and defer (never merging unreviewed commits).
+     3. Run `git merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"` (honoring hooks; never `--no-verify`).
+     4. Run the **shared 3-case post-merge check** above, then return to `git checkout "$FEATURE_BRANCH"`.
    - **Path B: another worktree at `$MAIN_WT` has the target checked out.**
-     - **If a fast-forward is possible,** run
-       `git fetch . "HEAD:refs/heads/${CR_MERGE_TARGET:-main}"`. This is a local fetch with
-       no network and no push.
-     - **If a true merge is needed,** defer with `Merge status: deferred — target locked by
-       worktree at $MAIN_WT and merge is not fast-forward`. Include the command
-       `cd "$MAIN_WT" && git merge $MERGE_FLAG "$FEATURE_BRANCH"`.
-   - **Hook failure:** defer and show the hook output. Never use `--no-verify`.
-   - **Conflict in Path A:** run `git merge --abort`, then defer with
+     Never run `git fetch . HEAD:refs/heads/<target>` into a checked-out branch, and **never `--detach` `$MAIN_WT`** (detaching releases Git's exclusive checkout ownership of `${CR_MERGE_TARGET:-main}`, allowing another worktree to check it out before ref update). Instead, while holding the repo-common lock and keeping `$MAIN_WT` attached to `${CR_MERGE_TARGET:-main}`:
+     1. Verify `$MAIN_WT` is still attached to `${CR_MERGE_TARGET:-main}` (`[ "$(git -C "$MAIN_WT" branch --show-current)" = "${CR_MERGE_TARGET:-main}" ]`), at the exact pinned tip (`[ "$(git -C "$MAIN_WT" rev-parse HEAD)" = "$EXPECTED_TARGET_SHA" ]`), and clean (`(cd "$MAIN_WT" && bash "${CLAUDE_PLUGIN_ROOT}/scripts/cr-review.sh" tree-clean)` prints `TREE=clean`).
+     2. If `$MAIN_WT` is dirty or drifted, defer with `Merge status: deferred — target worktree at $MAIN_WT is dirty or drifted from $EXPECTED_TARGET_SHA` and instruct the user to inspect/clean `$MAIN_WT` and **re-run `/cr-loop-merge`** (never print a blind `git merge` command when the target tip may have moved/rewound!).
+     3. While `$MAIN_WT` remains attached to `${CR_MERGE_TARGET:-main}`, run:
+        ```bash
+        git -C "$MAIN_WT" merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"
+        ```
+        Then run the **shared 3-case post-merge check** inside `$MAIN_WT` (checking `Already up to date`, fast-forward `NEW == LAST_REVIEWED && is-ancestor(EXPECTED, NEW)`, or newly created merge commit `HEAD^1 == EXPECTED && HEAD^2 == LAST_REVIEWED`). On conflict, run `git -C "$MAIN_WT" merge --abort` and defer with `Merge status: deferred — conflicts on <files>`. On post-merge mismatch (target ref moved unexpectedly), report the discrepancy and defer to inspect target history and re-run `/cr-loop-merge`.
+   - **Hook failure:** defer (returning to `$FEATURE_BRANCH` in Path A; keeping `$MAIN_WT` attached to `${CR_MERGE_TARGET:-main}` in Path B) and show the hook output. Never use `--no-verify`.
+   - **Conflict in Path A:** run `git merge --abort`, return to `$FEATURE_BRANCH`, then defer with
      `Merge status: deferred — conflicts on <files>`.
 
    **After a successful merge:**
 
-   - Run `rm -f .cr-loop-handoff-round-*.md` and report "Cleaned up N stale handoff
-     file(s)". If the merge was deferred, do **not** delete them.
+   - Remove **only untracked repo-root handoff files** matching `tree-clean` (never removing any Git-tracked file):
+     ```bash
+     git -C "$(git rev-parse --show-toplevel)" ls-files --others --exclude-standard -- '.cr-loop-handoff-round-*.md' \
+       | grep -E '^\.cr-loop-handoff-round-[0-9]+\.md$' \
+       | while IFS= read -r f; do rm -f -- "$(git rev-parse --show-toplevel)/$f"; done
+     ```
+     and report "Cleaned up N stale handoff file(s)". If the merge was deferred, do **not** delete them.
    - Keep the ledger.
    - **Do not remove the worktree.** When the user is done, they run
      `cd <main-checkout> && git worktree remove <path> && git branch -d "$FEATURE_BRANCH"`
@@ -187,8 +193,7 @@ that v1.7.0 removed are mapped. This command adds two:
    For a merge stop reason, the handoff also includes:
    - the precondition that failed
    - its diagnostic
-   - the exact manual command to run, for example
-     `cd <main-worktree> && git merge --no-ff <feature-branch>`
+   - next steps to re-run the full merge gate (`/cr-loop-merge $ARGUMENTS`) after resolving the blocker (for example, cleaning a dirty target worktree, inspecting a moved/rewound target branch, or re-reviewing against a new base). **Never** suggest a bare `git merge` command when precondition (d) or the `$EXPECTED_TARGET_SHA` check failed, as a blind merge could pull in unreviewed commits!
 
    The resume instructions name `/cr-loop-merge $ARGUMENTS`.
 
@@ -210,13 +215,10 @@ The shared guardrails from the protocol apply. In addition:
   pending.
 - **Base-currency gate.** The preflight is hard by default. It is local only, and it never
   auto-rebases. Disable it with `CR_LOOP_REQUIRE_REBASED=0`.
-- **Never `git push`.** If you need to push, you are in the wrong command; use `/cr-loop`
-  or `/cr-loop-pr`.
+- **Never `git push`.** If you need to push, you are in the wrong command; use `/cr-loop-pr` (or `/cr-loop` to stop locally and push manually).
 - **Never `--force` the merge.** `--ff-only` is allowed. `--force`, `--force-with-lease`,
   `-X theirs` and `-X ours` are forbidden.
-- **Worktree-aware.** When another worktree has the target checked out, the only automatic
-  path is a fast-forward through `git fetch . HEAD:refs/heads/<target>`. Anything else is
-  deferred with a manual command. Never force-checkout a locked branch.
+- **Worktree-aware serialized attached merge.** Pin `EXPECTED_TARGET_SHA` during precondition (d) and hold an exclusive repo-common lock (`"$(git rev-parse --path-format=absolute --git-common-dir)/cr-loop-merge.lock"`) across worktree detection, merge, and post-merge verification. In Path A, claim `${CR_MERGE_TARGET:-main}` via `git checkout` (refusing concurrent worktree checkouts), re-verify `HEAD == $EXPECTED_TARGET_SHA` and shared `tree-clean` (`TREE=clean`, ignoring leftover untracked handoff files), merge, verify the 3-case graph-topology post-merge check (`Already up to date`, fast-forward `NEW == LAST_REVIEWED && is-ancestor(EXPECTED, NEW)`, or newly created merge commit `HEAD^1 == EXPECTED && HEAD^2 == LAST_REVIEWED`), and return to `$FEATURE_BRANCH`; in Path B, **never `--detach` `$MAIN_WT`** — keep `$MAIN_WT` attached to `${CR_MERGE_TARGET:-main}` so Git retains exclusive checkout ownership, verify `$MAIN_WT` is at `$EXPECTED_TARGET_SHA` and clean via `tree-clean`, run `git -C "$MAIN_WT" merge $MERGE_FLAG "$LAST_REVIEWED_HEAD"`, and verify the same 3-case post-merge check. If `$MAIN_WT` is dirty/drifted, conflicts occur, or the target ref moved, defer to re-run `/cr-loop-merge` (never printing a blind `git merge` when the target moved). Never force-checkout a locked branch or fetch into a checked-out ref.
 
 ## Differences from `/cr-loop`
 

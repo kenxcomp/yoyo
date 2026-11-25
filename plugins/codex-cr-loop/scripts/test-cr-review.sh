@@ -125,8 +125,17 @@ for i in 4 5 6; do
 done
 expect "second cap -> stop" "stop" "$(bash "$CR" next | kv MODE)"
 expect "extra step-back authorized" "step-back" "$(CR_LOOP_MAX_STEP_BACKS=2 bash "$CR" next | kv MODE)"
-bash "$CR" mark-converged >/dev/null
+bash "$CR" mark-converged >/dev/null 2>&1; expect "mark-converged refused when not clean" "2" "$?"
+run_round "$F_CLEAN" full >/dev/null
+expect "cap still wins over streak 1 when exhausted" "stop" "$(bash "$CR" next --base main | kv MODE)"
+run_round "$F_CLEAN" full >/dev/null
+expect "persisted streak 2 -> converged" "converged" "$(bash "$CR" next --base main | kv MODE)"
+bash "$CR" mark-converged --base main >/dev/null; expect "mark-converged succeeds after 2 clean" "0" "$?"
 expect "converged resets counters" "full" "$(bash "$CR" next --clean-streak 1 | kv MODE)"
+echo postconv >> a.txt && git commit -qam postconv
+out=$(run_round "$F_REOPEN" full)
+expect "RECURRING resets after ## Converged" "" "$(printf '%s\n' "$out" | kv RECURRING)"
+expect "historical class id still reopened after convergence" "C1" "$(printf '%s\n' "$out" | kv REOPENED)"
 
 # --- head drift
 FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
@@ -161,13 +170,19 @@ printf 'garbage' > "$TMP/bad-index"
 out=$(GIT_INDEX_FILE="$TMP/bad-index" bash "$CR" tree-clean); rc=$?
 expect "git status failure is never clean" "2:error" "$rc:$(printf '%s\n' "$out" | kv TREE)"
 
-# --- cancel stops the whole round process group (no orphans)
-FAKE_SLEEP=30 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+# --- cancel stops the whole round process group (no orphans; isolated to this round's PGID)
+out_c=$(FAKE_SLEEP=30 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main)
+CPID=$(printf '%s\n' "$out_c" | kv PID)
 sleep 1
+PG=$(ps -o pgid= -p "$CPID" 2>/dev/null | tr -d ' ')
 bash "$CR" cancel >/dev/null
 sleep 1
 expect "cancel exit code" "130" "$(bash "$CR" status | kv EXIT)"
-if ps -axo command | grep -v grep | grep -q 'sleep 30$'; then bad "cancel left an orphaned reviewer child"; else ok; fi
+if [ -n "$PG" ] && ps -axo pgid=,pid= | awk -v pg="$PG" '$1 == pg { found=1 } END { exit !found }'; then
+  bad "cancel left an orphaned process in round process group $PG"
+else
+  ok
+fi
 
 # --- C5: one branch lock serializes state transactions
 bash "$CR" reset >/dev/null
@@ -326,6 +341,383 @@ expect "HEAD moved and came back during the round" "3:head-moved-and-returned" "
 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; bash "$CR" wait --timeout 30 >/dev/null
 sed -i.bak '/^head_moves=/d; /^tree_fp=/d' "$(last_round)/meta"
 expect "pre-1.8.0 round meta still finishes" "clean" "$(bash "$CR" finish | kv VERDICT)"
+
+# --- v1.8.1: strict JSON validation (duplicate keys, extra keys, non-string scalars, duplicate non-empty reopens)
+new_branch v181/strict
+F_DUP_KEY=$(fixture dupkey '{"summary":"s","verdict":"findings","verdict":"clean","findings":[],"step_back":[],"out_of_scope":[]}')
+F_EXTRA_KEY=$(fixture extrakey '{"summary":"s","verdict":"clean","findings":[],"step_back":[],"out_of_scope":[],"extra":1}')
+F_NUM_STR=$(fixture numstr '{"summary":123,"verdict":"clean","findings":[],"step_back":[],"out_of_scope":[]}')
+F_DUP_REOPEN=$(fixture dupreopen "$(result findings "[$(find_obj P1 C1 'Dup A' 'x'),$(find_obj P2 C1 'Dup B' 'y')]")")
+F_TWO_NEW=$(fixture twonew "$(result findings "[$(find_obj P1 '' 'New A'),$(find_obj P2 '' 'New B')]")")
+for f in "$F_DUP_KEY" "$F_EXTRA_KEY" "$F_NUM_STR" "$F_DUP_REOPEN"; do
+  out=$(run_round "$f" full); rc=$?
+  expect "v1.8.1 strict fails closed: $(basename "$f")" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+done
+expect "multiple new findings with empty reopens succeed" "dirty" "$(run_round "$F_TWO_NEW" full | kv VERDICT)"
+
+# --- v1.8.1: atomic pending.tx recovery, writer barrier, idempotent explicit finish & superseded round guard
+new_branch v181/tx
+out_s=$(FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main)
+RD1=$(printf '%s\n' "$out_s" | kv ROUND_DIR)
+bash "$CR" wait --timeout 30 >/dev/null
+out_f1=$(bash "$CR" finish "$RD1")
+expect "first explicit finish clean" "clean" "$(printf '%s\n' "$out_f1" | kv VERDICT)"
+out_f1_again=$(bash "$CR" finish "$RD1"); rc=$?
+expect "explicit retry on finished round is idempotent" "0:clean" "$rc:$(printf '%s\n' "$out_f1_again" | kv VERDICT)"
+expect "idempotent finish did not double-append ledger" "1" "$(grep -c '^## Round ' "$(bash "$CR" paths | kv LEDGER)")"
+# Simulate crash right after pending.tx was published (before ledger/state/finished applied)
+out_s2=$(FAKE_OUT="$F_DIRTY" bash "$CR" start --mode full --base main)
+RD2=$(printf '%s\n' "$out_s2" | kv ROUND_DIR)
+bash "$CR" wait --timeout 30 >/dev/null
+bash "$CR" finish "$RD2" >/dev/null
+# Restore pre-RD2 ledger/state while leaving RD2/tx + pending.tx active to simulate mid-commit crash, then call `add` first (writer barrier)
+SD_TX=$(bash "$CR" paths | kv STATE_DIR)
+rm -f "$RD2/finished" "$RD2/verdict"
+sed -i.bak '/^## Round 2 /,$d' "$SD_TX/ledger.md" && rm -f "$SD_TX/ledger.md.bak"
+printf 'tx_dir=%s/tx\ntx_branch=%s\ntx_kind=finish\ntx_round_dir=%s\n' "$RD2" "v181/tx" "$RD2" > "$SD_TX/pending.tx"
+add_id=$(bash "$CR" add P2 "after crash — app.txt:1" | kv ID)
+expect "writer barrier replayed pending finish before add" "C3" "$add_id"
+expect "pending.tx cleared after recovery" "0" "$([ -f "$SD_TX/pending.tx" ] && echo 1 || echo 0)"
+expect "recovered finish marked finished" "1" "$([ -f "$RD2/finished" ] && echo 1 || echo 0)"
+expect "ledger has both recovered Round 2 and external finding" "1:1" "$(grep -c '^## Round 2 ' "$SD_TX/ledger.md"):$(grep -c '^### C3 ' "$SD_TX/ledger.md")"
+# Out-of-order stale round cannot commit after a newer round starts
+out_a=$(FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main); RDA=$(printf '%s\n' "$out_a" | kv ROUND_DIR)
+bash "$CR" wait --timeout 30 >/dev/null
+out_b=$(FAKE_OUT="$F_DIRTY" bash "$CR" start --mode full --base main); RDB=$(printf '%s\n' "$out_b" | kv ROUND_DIR)
+bash "$CR" wait --timeout 30 >/dev/null
+bash "$CR" finish "$RDB" >/dev/null
+bash "$CR" finish "$RDA" >/dev/null 2>&1; expect "superseded older round refused" "2" "$?"
+
+# --- v1.8.1: .gitattributes-immune binary rule check, symlink A/M, diff.relative=true
+new_branch v181/rules-bin
+printf 'CLAUDE.md diff\n' > .gitattributes
+printf 'hello\0world\n' > CLAUDE.md
+git add .gitattributes CLAUDE.md && git commit -qm "add binary CLAUDE.md with diff text attr"
+expect "added binary rule file with diff attr is needs-human" "needs-human:1" "$(run_round "$F_CLEAN" full | sed -n 's/^VERDICT=//p;s/^RULES_NEED_HUMAN=//p' | paste -sd: -)"
+rm -f CLAUDE.md && ln -s /etc/hosts CLAUDE.md && git add CLAUDE.md && git commit -qm "symlink CLAUDE.md"
+expect "symlink rule file is needs-human" "needs-human" "$(run_round "$F_CLEAN" full | kv VERDICT)"
+rm -f CLAUDE.md && ln -s /etc/passwd CLAUDE.md && git add CLAUDE.md && git commit -qm "modify symlink CLAUDE.md"
+expect "modified symlink rule file is needs-human" "needs-human" "$(run_round "$F_CLEAN" full | kv VERDICT)"
+# diff.relative=true from subdir must not hide root rule files
+expect "diff.relative=true from subdir still detects root rule edit" "needs-human" "$(cd sub && git -c diff.relative=true rev-parse --show-toplevel >/dev/null && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.relative GIT_CONFIG_VALUE_0=true bash "$HERE/review-rules.sh" list "$BASE_SHA" HEAD | awk -F '\t' '$4=="CLAUDE.md" {print $1}')"
+
+# --- v1.8.1: persisted clean_streak, dirty non-credit on ack-rules, full-mode convergence & post-rebase proof
+new_branch v181/streak
+sed -i.bak 's/^Never build SQL/Prefer not to build SQL/' REVIEW.md && rm -f REVIEW.md.bak && git commit -qam "relax for streak"
+out_d=$(run_round "$F_DIRTY" full)
+FP_D=$(printf '%s\n' "$out_d" | kv RULES_FP)
+bash "$CR" ack-rules "$FP_D" "should fail on dirty" >/dev/null 2>&1
+expect "dirty round never gets ack-rules clean credit" "2" "$?"
+out_nh=$(run_round "$F_CLEAN" full)
+FP_NH=$(printf '%s\n' "$out_nh" | kv RULES_FP)
+out_ack=$(bash "$CR" ack-rules "$FP_NH" --base main "approved")
+expect "ack-rules grants clean streak 1 once" "1" "$(printf '%s\n' "$out_ack" | kv CLEAN_STREAK)"
+bash "$CR" ack-rules "$FP_NH" --base main "duplicate" >/dev/null 2>&1
+expect "duplicate ack-rules refused" "2" "$?"
+# Incremental clean round as 2nd round cannot satisfy mark-converged (needs full)
+echo inc1 >> app.txt && git commit -qam inc1
+run_round "$F_CLEAN" full >/dev/null
+# Reset head to confirm non-full 2nd round check using step-back mode
+run_round "$F_CLEAN" step-back >/dev/null
+bash "$CR" mark-converged --base main >/dev/null 2>&1
+expect "mark-converged rejects non-full 2nd clean round" "2" "$?"
+run_round "$F_CLEAN" full >/dev/null
+bash "$CR" mark-converged --base main >/dev/null
+expect "mark-converged succeeds after full 2nd clean round" "0" "$?"
+# Base change invalidates persisted streak
+git branch other-base HEAD~1
+expect "base change invalidates persisted streak" "full" "$(bash "$CR" next --base other-base | kv MODE)"
+# Post-rebase confirmation proof recorded cleanly
+run_round "$F_CLEAN" full >/dev/null
+bash "$CR" mark-converged --post-rebase --base main --round "$(last_round)" >/dev/null
+expect "mark-converged --post-rebase succeeds with prior 2-round proof" "0" "$?"
+grep -q '^## Converged (post-rebase 1-round full confirmation)' "$(bash "$CR" paths | kv LEDGER)" && ok || bad "post-rebase convergence logged"
+
+# --- v1.8.1: fail-closed tree_fp v2 (untracked files caught, handoffs ignored, bad index fails closed)
+new_branch v181/drift-v2
+FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+echo stray > stray-untracked.txt
+bash "$CR" wait --timeout 30 >/dev/null
+out=$(bash "$CR" finish); rc=$?
+expect "untracked file added during round is tree-changed" "3:tree-changed" "$rc:$(printf '%s\n' "$out" | kv REASON)"
+rm -f stray-untracked.txt
+FAKE_SLEEP=2 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+echo h > .cr-loop-handoff-round-9.md
+bash "$CR" wait --timeout 30 >/dev/null
+expect "untracked root handoff file ignored by tree_fp v2" "clean" "$(bash "$CR" finish | kv VERDICT)"
+rm -f .cr-loop-handoff-round-9.md
+FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null; bash "$CR" wait --timeout 30 >/dev/null
+out=$(GIT_INDEX_FILE="$TMP/bad-index" bash "$CR" finish 2>/dev/null); rc=$?
+expect "corrupt index at finish fails closed as error (not clean)" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+
+# --- v1.8.1: ps -ww handles long worktree paths without truncating _run <round-dir>
+LONG_WT="$TMP/very-long-worktree-directory-name-exceeding-standard-eighty-column-ps-width-limit/nested"
+mkdir -p "$(dirname "$LONG_WT")"
+git worktree add -q "$LONG_WT" -b v181/longpath >/dev/null 2>&1
+(
+  cd "$LONG_WT" || exit 2
+  out_lp=$(FAKE_SLEEP=5 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main)
+  sleep 1
+  st_lp=$(bash "$CR" status | kv STATE)
+  bash "$CR" cancel >/dev/null
+  [ "$st_lp" = "running" ]
+) && ok || bad "runner_pid failed on long worktree path (ps -ww)"
+
+# --- Post-review hardening: P0\n bypass, release-state, staged-only tree_fp, cr-tx dir conflict ---
+
+# 1. Trailing newline in severity / verdict / reopens MUST fail closed (never clean!)
+F_SEV_NL=$(fixture sevnl '{"summary":"s","verdict":"findings","findings":[{"severity":"P0\n","reopens":"","title":"P0 drop","location":"a.txt:1","pattern":"p","still_wrong":"","instances":["a.txt:1"],"fix":"f","prevent":"t"}],"step_back":[],"out_of_scope":[]}')
+F_VERD_NL=$(fixture verdnl '{"summary":"s","verdict":"clean\n","findings":[],"step_back":[],"out_of_scope":[]}')
+F_REO_NL=$(fixture reonl '{"summary":"s","verdict":"findings","findings":[{"severity":"P1","reopens":"C1\n","title":"Re","location":"a.txt:1","pattern":"p","still_wrong":"still","instances":["a.txt:1"],"fix":"f","prevent":"t"}],"step_back":[],"out_of_scope":[]}')
+for f in "$F_SEV_NL" "$F_VERD_NL" "$F_REO_NL"; do
+  out=$(run_round "$f" full); rc=$?
+  expect "fails closed on trailing newline: $(basename "$f")" "5:error" "$rc:$(printf '%s\n' "$out" | kv VERDICT)"
+done
+
+# 2. release-state get | set | clear (and disallow arbitrary keys)
+bash "$CR" release-state set rel_pre_rebase_head="$(git rev-parse HEAD)" rel_pinned_remote_head_sha="deadbeef" rel_target_base_sha="cafebabe" rel_rebased_in_8_0=1 >/dev/null
+expect "release-state set succeeded" "0" "$?"
+out_rs=$(bash "$CR" release-state get)
+expect "release-state persisted values" "deadbeef:cafebabe:1" "$(printf '%s\n' "$out_rs" | kv PINNED_REMOTE_HEAD_SHA):$(printf '%s\n' "$out_rs" | kv TARGET_BASE_SHA):$(printf '%s\n' "$out_rs" | kv REBASED_IN_8_0)"
+bash "$CR" release-state set clean_streak=99 >/dev/null 2>&1
+expect "release-state rejects disallowed key" "2" "$?"
+bash "$CR" release-state clear >/dev/null
+out_rsc=$(bash "$CR" release-state get)
+expect "release-state cleared" "::0" "$(printf '%s\n' "$out_rsc" | kv PINNED_REMOTE_HEAD_SHA):$(printf '%s\n' "$out_rsc" | kv TARGET_BASE_SHA):$(printf '%s\n' "$out_rsc" | kv REBASED_IN_8_0)"
+
+# 3. Staged-only index edit (working tree restored to HEAD) caught by tree_fp_v2!
+FAKE_SLEEP=1 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+printf 'staged-only-change\n' >> app.txt
+git add app.txt
+git show HEAD:app.txt > app.txt
+[ -z "$(git diff HEAD)" ] && [ -n "$(git diff --cached)" ] && ok || bad "staged-only setup failed"
+bash "$CR" wait --timeout 30 >/dev/null
+out_st=$(bash "$CR" finish); rc=$?
+expect "staged-only index change caught as head-drift (tree-changed)" "3:head-drift:tree-changed" "$rc:$(printf '%s\n' "$out_st" | kv VERDICT):$(printf '%s\n' "$out_st" | kv REASON)"
+git reset -q HEAD app.txt
+
+# 4. cr-tx.sh directory-target conflict fails closed AND preserves pending.tx!
+SD_CR=$(bash "$CR" paths | kv STATE_DIR)
+TX_DIR_BAD="$SD_CR/tx-dir-conflict"
+mkdir -p "$TX_DIR_BAD" "$SD_CR/rounds/999-full/verdict"
+cp "$SD_CR/ledger.md" "$TX_DIR_BAD/ledger.full"
+cp "$SD_CR/state" "$TX_DIR_BAD/state.full"
+printf 'VERDICT=clean\n' > "$TX_DIR_BAD/verdict.out"
+{
+  printf 'tx_dir=%s\n' "$TX_DIR_BAD"
+  printf 'tx_branch=%s\n' "$(git branch --show-current)"
+  printf 'tx_kind=finish\n'
+  printf 'tx_round_dir=%s/rounds/999-full\n' "$SD_CR"
+} > "$SD_CR/pending.tx"
+bash "$CR" init >/dev/null 2>&1
+expect "cr-tx directory target conflict fails closed" "2" "$?"
+[ -f "$SD_CR/pending.tx" ] && ok || bad "cr-tx deleted pending.tx despite directory target conflict!"
+rm -rf "$SD_CR/pending.tx" "$TX_DIR_BAD" "$SD_CR/rounds/999-full"
+
+# --- Round 2 hardening regressions: immutable BASE_SHA rewind check, dirty submodule 2nd edit, PR preflight ahead check, space worktree ---
+
+# 5. mark-converged & release-state expose immutable CONVERGED_BASE_SHA (catches target rewind B..A!)
+B_SHA=$(git rev-parse main)
+git switch -qc r2/rewind-base main
+printf 'base-a\n' > rewind-base.txt && git add rewind-base.txt && git commit -qm "base A"
+A_SHA=$(git rev-parse HEAD)
+git switch -qc r2/rewind-check "$A_SHA"
+printf 'feat-f\n' > rewind-feat.txt && git add rewind-feat.txt && git commit -qm "feat F"
+for _i in 1 2; do
+  FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base r2/rewind-base >/dev/null
+  bash "$CR" wait --timeout 30 >/dev/null
+  bash "$CR" finish >/dev/null
+done
+out_mc=$(bash "$CR" mark-converged --base r2/rewind-base)
+expect "mark-converged emits immutable BASE_SHA" "$A_SHA" "$(printf '%s\n' "$out_mc" | kv BASE_SHA)"
+expect "release-state get exposes CONVERGED_BASE_SHA" "$A_SHA" "$(bash "$CR" release-state get | kv CONVERGED_BASE_SHA)"
+# Simulate target rewind to ancestor B: mutable ref passes, immutable CONVERGED_BASE_SHA catches B..A!
+REV_BASE_SHA=$(bash "$CR" release-state get | kv CONVERGED_BASE_SHA)
+git branch -f r2/rewind-base "$B_SHA"
+PR_MB_REWIND=$(git merge-base r2/rewind-base HEAD)
+git merge-base --is-ancestor "$(git rev-parse r2/rewind-base)" "$PR_MB_REWIND" && ok || bad "rewind setup sanity failed"
+if git merge-base --is-ancestor "$REV_BASE_SHA" "$PR_MB_REWIND" 2>/dev/null; then
+  bad "immutable CONVERGED_BASE_SHA failed to detect target rewind"
+else
+  ok
+fi
+git branch -D r2/rewind-base >/dev/null 2>&1
+
+# 6. tree_fp_v2 catches a SECOND edit to an already-dirty tracked submodule file!
+SUB_REPO="$TMP/submod-src"
+mkdir -p "$SUB_REPO"
+(
+  cd "$SUB_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'sub-v1\n' > sub.txt && git add sub.txt && git commit -qm sub1
+)
+SUB_HOST="$TMP/submod-host"
+mkdir -p "$SUB_HOST"
+(
+  cd "$SUB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'host-v1\n' > host.txt && git add host.txt && git commit -qm host1
+  git -c protocol.file.allow=always submodule -q add "$SUB_REPO" vendor/sub >/dev/null 2>&1
+  git commit -qm "add submodule"
+  git switch -qc feat/submod
+  printf 'feat\n' >> host.txt && git commit -qam "feat edit"
+  # Dirty tracked submodule file BEFORE review starts!
+  printf 'dirty-1\n' >> vendor/sub/sub.txt
+  FAKE_SLEEP=1 FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null
+  # Make a SECOND edit to the SAME already-dirty submodule file mid-round!
+  printf 'dirty-2\n' >> vendor/sub/sub.txt
+  bash "$CR" wait --timeout 30 >/dev/null
+  out_sub=$(bash "$CR" finish); rc_sub=$?
+  [ "$rc_sub" -eq 3 ] && [ "$(printf '%s\n' "$out_sub" | kv REASON)" = "tree-changed" ]
+) && ok || bad "tree_fp_v2 missed 2nd edit inside already-dirty tracked submodule!"
+
+# 7. PR preflight: default target ahead does NOT trip coverage check before Base-currency rebase prompt;
+#    explicit intermediate BASE (PR_TARGET -> E -> HEAD) STILL fails coverage check!
+PRE_REPO="$TMP/preflight-ahead"
+mkdir -p "$PRE_REPO"
+(
+  cd "$PRE_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf '1\n' > f.txt && git add f.txt && git commit -qm c1
+  git switch -qc feat/ahead
+  printf 'e\n' >> f.txt && git commit -qam e1
+  E_SHA=$(git rev-parse HEAD)
+  printf 'f\n' >> f.txt && git commit -qam f1
+  git switch -q main && printf 'm2\n' > m.txt && git add m.txt && git commit -qm m2
+  git switch -q feat/ahead
+  # Default BASE=main (ahead of HEAD): Base-currency fails (offering rebase), while BASE_MB==PR_MB passes coverage!
+  PR_MB=$(git merge-base main HEAD)
+  BASE_MB=$(git merge-base main HEAD)
+  ! git merge-base --is-ancestor main HEAD &&
+    git merge-base --is-ancestor "$BASE_MB" "$PR_MB" &&
+    ! git merge-base --is-ancestor "$(git merge-base "$E_SHA" HEAD)" "$PR_MB"
+) && ok || bad "PR preflight coverage math failed for ahead target / intermediate base"
+
+# 8. Space-safe worktree parsing preserves full worktree path containing spaces!
+SPACE_WT="$TMP/main checkout with spaces"
+git branch space-target main
+git worktree add -q "$SPACE_WT" space-target >/dev/null 2>&1
+PARSED_WT=$(git worktree list --porcelain | awk -v t="refs/heads/space-target" '/^worktree / {wt=$0; sub(/^worktree /, "", wt)} $0=="branch "t {print wt; exit}')
+REAL_SPACE_WT=$(cd "$SPACE_WT" && pwd -P)
+expect "space-safe worktree parser preserves spaces in path" "$REAL_SPACE_WT" "$PARSED_WT"
+git worktree remove -f "$SPACE_WT" >/dev/null 2>&1
+git branch -D space-target >/dev/null 2>&1
+
+# --- Round 3 hardening regressions: CAS merge TOCTOU, git SIGTERM UNBORN trap, unborn stderr silence ---
+
+# 9. Round 5 High #2: Path B attached merge retains exclusive Git checkout ownership (no detach!),
+#    blocking concurrent branch checkouts while verifying fast-forward / merge-commit / Already-up-to-date!
+ATT_REPO="$TMP/attached-merge-repo"
+ATT_MAIN_WT="$TMP/attached-main-wt"
+ATT_OTHER_WT="$TMP/attached-other-wt"
+mkdir -p "$ATT_REPO"
+(
+  cd "$ATT_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'a\n' > f.txt && git add f.txt && git commit -qm "commit A"
+  A_SHA=$(git rev-parse HEAD)
+  git switch -qc feat/att
+  printf 'f\n' >> f.txt && git commit -qam "commit F"
+  F_SHA=$(git rev-parse HEAD)
+  git worktree add -q "$ATT_MAIN_WT" main >/dev/null 2>&1
+  EXPECTED_TARGET_SHA=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
+  [ "$EXPECTED_TARGET_SHA" = "$A_SHA" ] || exit 11
+  # Because Path B NEVER detaches ATT_MAIN_WT, another worktree attempting to check out main MUST be refused by Git!
+  if git worktree add -q "$ATT_OTHER_WT" main 2>/dev/null; then
+    exit 12
+  fi
+  # Path B runs merge directly while attached -> fast-forward HEAD@{1} == EXPECTED_TARGET_SHA!
+  git -C "$ATT_MAIN_WT" merge -q --ff-only "$F_SHA"
+  NEW_TARGET_SHA=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
+  [ "$NEW_TARGET_SHA" = "$F_SHA" ] || exit 13
+  [ "$(git -C "$ATT_MAIN_WT" rev-parse HEAD@{1})" = "$EXPECTED_TARGET_SHA" ] || exit 14
+  # Re-merging when Already up to date satisfies Case 1 (NEW_TARGET_SHA == EXPECTED && LAST_REVIEWED ancestor of NEW)!
+  EXPECTED_TARGET_SHA="$NEW_TARGET_SHA"
+  git -C "$ATT_MAIN_WT" merge -q "$F_SHA"
+  POST_UP2DATE=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
+  [ "$POST_UP2DATE" = "$EXPECTED_TARGET_SHA" ] && git -C "$ATT_MAIN_WT" merge-base --is-ancestor "$F_SHA" "$POST_UP2DATE" || exit 15
+) && ok || bad "Path B attached merge failed to retain branch checkout ownership or verify 3-case post-merge"
+
+# 9b. Round 4 High #4 + Round 5 High #2/M1: Path A git checkout refuses concurrent target checkout,
+#     and both merge protocols enforce repo-common lock, attached Path B (no --detach), tree-clean, and 3-case post-merge.
+PA_REPO="$TMP/patha-race-repo"
+PA_OTHER_WT="$TMP/patha-other-wt"
+mkdir -p "$PA_REPO"
+(
+  cd "$PA_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'a\n' > f.txt && git add f.txt && git commit -qm "commit A"
+  A_SHA=$(git rev-parse HEAD)
+  git switch -qc feat/patha
+  printf 'f\n' >> f.txt && git commit -qam "commit F"
+  git worktree add -q "$PA_OTHER_WT" main >/dev/null 2>&1
+  if git checkout -q main 2>/dev/null; then
+    exit 21
+  fi
+  [ "$(git rev-parse refs/heads/main)" = "$A_SHA" ] || exit 22
+  [ "$(git -C "$PA_OTHER_WT" rev-parse HEAD)" = "$A_SHA" ] || exit 23
+  [ -z "$(git -C "$PA_OTHER_WT" status --porcelain)" ] || exit 24
+) && ok || bad "Path A git checkout failed to abort cleanly against concurrent target worktree checkout"
+
+CODEX_MERGE_DOC="$HERE/../commands/cr-loop-merge.md"
+T3_MERGE_DOC="$HERE/../../t3-cr-loop/skills/t3-cr-loop-merge/SKILL.md"
+(
+  grep -q 'cr-loop-merge.lock' "$CODEX_MERGE_DOC" &&
+  grep -q 'cr-loop-merge.lock' "$T3_MERGE_DOC" &&
+  grep -q 'git checkout "${CR_MERGE_TARGET:-main}"' "$CODEX_MERGE_DOC" &&
+  grep -q 'git checkout "$CR_MERGE_TARGET"' "$T3_MERGE_DOC" &&
+  grep -q 'Already up to date' "$CODEX_MERGE_DOC" &&
+  grep -q 'Already up to date' "$T3_MERGE_DOC" &&
+  ! grep -q 'checkout --detach' "$CODEX_MERGE_DOC" &&
+  ! grep -q 'checkout --detach' "$T3_MERGE_DOC" &&
+  ! grep -q 'git checkout main && git merge' "$CODEX_MERGE_DOC" &&
+  ! grep -q 'git checkout main && git merge' "$T3_MERGE_DOC"
+) && ok || bad "merge protocol docs missing attached Path B, tree-clean/Already-up-to-date, or safe defer guidance"
+
+# 10. SIGTERM on submodule git rev-parse HEAD fails closed (NEVER misclassified as UNBORN)!
+SIG_GIT_BIN="$TMP/codex-git-sigterm"
+mkdir -p "$SIG_GIT_BIN"
+REAL_GIT=$(command -v git)
+cat > "$SIG_GIT_BIN/git" <<EOF
+#!/usr/bin/env bash
+is_sub=0; is_rp=0; is_head=0
+for arg in "\$@"; do
+  case "\$arg" in
+    *vendor/sub*) is_sub=1 ;;
+    rev-parse) is_rp=1 ;;
+    HEAD) is_head=1 ;;
+  esac
+done
+if [ "\$is_sub" = 1 ] && [ "\$is_rp" = 1 ] && [ "\$is_head" = 1 ]; then
+  kill -TERM \$\$
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$SIG_GIT_BIN/git"
+(
+  cd "$SUB_HOST" || exit 2
+  PATH="$SIG_GIT_BIN:$PATH" FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null 2>&1
+)
+rc_sig=$?
+[ "$rc_sig" -ne 0 ] && ok || bad "cr-review.sh start exited 0 despite SIGTERM on submodule rev-parse HEAD!"
+
+# 11. Unborn nested gitdir produces ZERO 'fatal: Needed a single revision' stderr leakage in tree_fp_v2!
+UNB_HOST="$TMP/unborn-nested-host"
+mkdir -p "$UNB_HOST/nested-unborn"
+(
+  cd "$UNB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'h1\n' > h.txt && git add h.txt && git commit -qm h1
+  git switch -qc feat/unb
+  printf 'h2\n' >> h.txt && git commit -qam h2
+  (cd nested-unborn && git init -q -b main .)
+  printf 'unb-1\n' > nested-unborn/x.txt
+  err_unb=$(FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main 2>&1 >/dev/null)
+  rc_u=$?
+  bash "$CR" wait --timeout 30 >/dev/null 2>&1
+  bash "$CR" cancel >/dev/null 2>&1 || true
+  [ "$rc_u" -eq 0 ] && ! printf '%s' "$err_unb" | grep -q "fatal: Needed a single revision"
+) && ok || bad "unborn nested gitdir leaked stderr or failed start in cr-review.sh"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
