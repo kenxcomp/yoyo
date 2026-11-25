@@ -132,7 +132,51 @@ rm -f "$R/.t3-cr-loop.json"
 F_CLEAN="$TMP/clean.json"
 printf '{"summary":"all good","verdict":"clean","findings":[],"step_back":[],"out_of_scope":[]}\n' > "$F_CLEAN"
 F_FENCED="$TMP/fenced.txt"
-printf '```json\n{"summary":"all good","verdict":"clean","findings":[],"step_back":[],"out_of_scope":[]}\n```\n' > "$F_FENCED"
+cat > "$F_FENCED" <<'EOF'
+```json
+{
+  "summary": "Found missing null guard at line 1.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1",
+      "reopens": "",
+      "title": "Missing null guard",
+      "location": "app.txt:1",
+      "pattern": "Unchecked access on input",
+      "still_wrong": "",
+      "instances": ["app.txt:1"],
+      "fix": "Validate at boundary",
+      "prevent": "Add invariant test"
+    }
+  ],
+  "step_back": [],
+  "out_of_scope": []
+}
+```
+EOF
+F_DIRTY_S2="$TMP/dirty-s2.json"
+cat > "$F_DIRTY_S2" <<'EOF'
+{
+  "summary": "Found missing null guard at line 2.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P2",
+      "reopens": "",
+      "title": "Unchecked null guard",
+      "location": "app.txt:2",
+      "pattern": "Unchecked access at second site",
+      "still_wrong": "",
+      "instances": ["app.txt:2"],
+      "fix": "Validate at boundary",
+      "prevent": "Add invariant test"
+    }
+  ],
+  "step_back": [],
+  "out_of_scope": []
+}
+EOF
 F_PROSE_WRAP="$TMP/prose.txt"
 printf 'Here is my review:\n```json\n{"summary":"s","verdict":"clean","findings":[],"step_back":[],"out_of_scope":[]}\n```\n' > "$F_PROSE_WRAP"
 F_DUPKEY="$TMP/dupkey.json"
@@ -148,12 +192,17 @@ cat > "$F_DIRTY_MERGED" <<'EOF'
       "reopens": "",
       "title": "Missing null guard",
       "location": "app.txt:1",
-      "pattern": "Unchecked access",
+      "pattern": "Unchecked access on input at both sites",
       "still_wrong": "",
       "instances": ["app.txt:1", "app.txt:2"],
       "fix": "Validate at boundary",
       "prevent": "Add invariant test",
-      "sources": ["antigravity/gemini-4-neon", "claudeAgent/claude-opus-5-5"]
+      "sources": ["antigravity/gemini-4-neon", "claudeAgent/claude-opus-5-5"],
+      "merged_from": [
+        { "slot": "s1", "index": 0 },
+        { "slot": "s2", "index": 0 }
+      ],
+      "merge_rationale": "Both slots report the same missing null guard across app.txt:1 and app.txt:2"
     }
   ],
   "step_back": [],
@@ -242,7 +291,7 @@ bash "$ST" record-dispatch "$RD1" --slot s2 --attempt 2 --owner "$OWNER" --task-
 # Stale attempt 1 result rejected by CAS
 bash "$ST" record-result "$RD1" --slot s2 --attempt 1 --owner "$OWNER" --input "$F_CLEAN" >/dev/null 2>&1
 expect "stale attempt 1 result rejected" "2" "$?"
-bash "$ST" record-result "$RD1" --slot s2 --attempt 2 --owner "$OWNER" --input "$F_CLEAN" >/dev/null
+bash "$ST" record-result "$RD1" --slot s2 --attempt 2 --owner "$OWNER" --input "$F_DIRTY_S2" >/dev/null
 expect "attempt 2 valid JSON accepted" "0" "$?"
 
 # s3 hits waiting (cannot retry while waiting), then interrupted (terminal -> allows retry -> fails again -> partial failure gate)
@@ -744,12 +793,14 @@ cat > "$F_TWO_P1_MERGED" <<'EOF'
     {
       "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
       "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
-      "sources": ["codex/gpt-6.2-sol"]
+      "sources": ["codex/gpt-6.2-sol"],
+      "merged_from": [{ "slot": "s1", "index": 0 }]
     },
     {
       "severity": "P1", "reopens": "", "title": "Bug Two", "location": "app.txt:2",
       "pattern": "p2", "still_wrong": "", "instances": ["app.txt:2"], "fix": "f2", "prevent": "t2",
-      "sources": ["codex/gpt-6.2-sol"]
+      "sources": ["codex/gpt-6.2-sol"],
+      "merged_from": [{ "slot": "s1", "index": 1 }]
     }
   ],
   "step_back": [], "out_of_scope": []
@@ -846,8 +897,8 @@ cat > "$F_TWO_SB_MERGED" <<'EOF'
   "verdict": "clean",
   "findings": [],
   "step_back": [
-    { "classes": ["C1"], "name": "Proposal A", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["s1"] },
-    { "classes": ["C2"], "name": "Proposal B", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["s1"] }
+    { "classes": ["C1"], "name": "Proposal A", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }] },
+    { "classes": ["C2"], "name": "Proposal B", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 1 }] }
   ],
   "out_of_scope": []
 }
@@ -899,8 +950,8 @@ cat > "$F_TWO_SB_SAME_OK" <<'EOF'
   "verdict": "clean",
   "findings": [],
   "step_back": [
-    { "classes": ["C1"], "name": "Split FSM table", "invites_because": "a", "approach_change": "extract explicit state table", "prevent": "t1", "sources": ["s1"] },
-    { "classes": ["C1"], "name": "Enforce lock order", "invites_because": "b", "approach_change": "acquire repo lock before task lock", "prevent": "t2", "sources": ["s1"] }
+    { "classes": ["C1"], "name": "Split FSM table", "invites_because": "a", "approach_change": "extract explicit state table", "prevent": "t1", "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }] },
+    { "classes": ["C1"], "name": "Enforce lock order", "invites_because": "b", "approach_change": "acquire repo lock before task lock", "prevent": "t2", "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 1 }] }
   ],
   "out_of_scope": []
 }
@@ -917,6 +968,162 @@ out_sbs_dup=$(bash "$ST" finish "$RD2SBS" --merged "$F_TWO_SB_SAME_DUP"); rc=$?
 expect "council rejects substituting 2 copies of Proposal 1 for 2 independent same-class step_back[] proposals" "5:error" "$rc:$(printf '%s\n' "$out_sbs_dup" | kv VERDICT)"
 out_sbs_ok=$(bash "$ST" finish "$RD2SBS" --merged "$F_TWO_SB_SAME_OK"); rc=$?
 expect "council accepts preserving both independent same-class step_back[] proposals" "0:clean" "$rc:$(printf '%s\n' "$out_sbs_ok" | kv VERDICT)"
+
+# 8f. Round 5 High #1: leading '-' filename and Perl '-e...' switch-injection filename MUST NOT execute code or fail!
+DASH_REPO="$TMP/dash-input-repo"
+mkdir -p "$DASH_REPO"
+(
+  cd "$DASH_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'x\n' > app.txt && git add app.txt && git commit -qm init
+  git switch -qc feat/dash
+  printf 'y\n' >> app.txt && git commit -qam change
+  bash "$ST" init >/dev/null
+  po_d=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1,s2 --owner "$OWNER")
+  RDD=$(printf '%s\n' "$po_d" | kv ROUND_DIR)
+  bash "$ST" claim-slot "$RDD" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+  bash "$ST" record-dispatch "$RDD" --slot s1 --attempt 1 --owner "$OWNER" --task-id td1 --child-thread-id ctd1 >/dev/null
+  cp -- "$F_CLEAN" "-review.json"
+  bash "$ST" record-result "$RDD" --slot s1 --attempt 1 --owner "$OWNER" --task-id td1 --input "-review.json" >/dev/null || exit 31
+  bash "$ST" claim-slot "$RDD" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+  bash "$ST" record-dispatch "$RDD" --slot s2 --attempt 1 --owner "$OWNER" --task-id td2 --child-thread-id ctd2 >/dev/null
+  POC_NAME='-eBEGIN{open(my $f,">","INJECTED_RCE");print $f "bad";close $f;exit 9}'
+  cp -- "$F_CLEAN" "$POC_NAME"
+  bash "$ST" record-result "$RDD" --slot s2 --attempt 1 --owner "$OWNER" --task-id td2 --input "$POC_NAME" >/dev/null || exit 32
+  [ ! -e "INJECTED_RCE" ] || exit 33
+) && ok || bad "leading-dash or -e switch filename failed or executed Perl code in record-result"
+
+# 8g. Round 5 High #3: different root causes on the SAME line CANNOT merge into one entry; same-name distinct step_back[] proposals CAN coexist!
+F_AUTH_S1="$TMP/auth-s1.json"
+cat > "$F_AUTH_S1" <<'EOF'
+{
+  "summary": "Missing auth check.",
+  "verdict": "findings",
+  "findings": [{
+    "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
+    "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test"
+  }],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_STREAM_S2="$TMP/stream-s2.json"
+cat > "$F_STREAM_S2" <<'EOF'
+{
+  "summary": "Stream leak on error path.",
+  "verdict": "findings",
+  "findings": [{
+    "severity": "P1", "reopens": "", "title": "Stream not closed", "location": "app.txt:1",
+    "pattern": "file stream leaks descriptor on error return path", "still_wrong": "",
+    "instances": ["app.txt:1"], "fix": "close stream handle in finally block", "prevent": "add leak test"
+  }],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_BAD_CROSS_MERGE="$TMP/bad-cross-merge.json"
+cat > "$F_BAD_CROSS_MERGE" <<'EOF'
+{
+  "summary": "Improperly collapsed auth and stream leak.",
+  "verdict": "findings",
+  "findings": [{
+    "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
+    "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test",
+    "sources": ["s1", "s2"],
+    "merged_from": [{ "slot": "s1", "index": 0 }, { "slot": "s2", "index": 0 }],
+    "merge_rationale": "same line app.txt:1"
+  }],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_GOOD_CROSS_SEP="$TMP/good-cross-sep.json"
+cat > "$F_GOOD_CROSS_SEP" <<'EOF'
+{
+  "summary": "Kept both distinct root causes on app.txt:1.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+      "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
+      "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test",
+      "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }]
+    },
+    {
+      "severity": "P1", "reopens": "", "title": "Stream not closed", "location": "app.txt:1",
+      "pattern": "file stream leaks descriptor on error return path", "still_wrong": "",
+      "instances": ["app.txt:1"], "fix": "close stream handle in finally block", "prevent": "add leak test",
+      "sources": ["s2"], "merged_from": [{ "slot": "s2", "index": 0 }]
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+po_h3=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1,s2 --owner "$OWNER")
+RDH3=$(printf '%s\n' "$po_h3" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDH3" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDH3" --slot s1 --attempt 1 --owner "$OWNER" --task-id th3a --child-thread-id cth3a >/dev/null
+bash "$ST" record-result "$RDH3" --slot s1 --attempt 1 --owner "$OWNER" --task-id th3a --input "$F_AUTH_S1" >/dev/null
+bash "$ST" claim-slot "$RDH3" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDH3" --slot s2 --attempt 1 --owner "$OWNER" --task-id th3b --child-thread-id cth3b >/dev/null
+bash "$ST" record-result "$RDH3" --slot s2 --attempt 1 --owner "$OWNER" --task-id th3b --input "$F_STREAM_S2" >/dev/null
+out_h3_bad=$(bash "$ST" finish "$RDH3" --merged "$F_BAD_CROSS_MERGE"); rc=$?
+expect "council rejects merging different root causes (auth vs stream leak) on the same line" "5:error" "$rc:$(printf '%s\n' "$out_h3_bad" | kv VERDICT)"
+out_h3_ok=$(bash "$ST" finish "$RDH3" --merged "$F_GOOD_CROSS_SEP"); rc=$?
+expect "council accepts keeping both distinct same-line root causes separately" "0:dirty:2" "$rc:$(printf '%s\n' "$out_h3_ok" | kv VERDICT):$(printf '%s\n' "$out_h3_ok" | kv P1)"
+
+F_SB_NAME_S1="$TMP/sb-same-name-s1.json"
+cat > "$F_SB_NAME_S1" <<'EOF'
+{
+  "summary": "Centralize HTTP error handling.", "verdict": "clean", "findings": [],
+  "step_back": [{ "classes": ["C1"], "name": "Refactor error handling", "invites_because": "scattered", "approach_change": "centralize error middleware at HTTP gateway boundary", "prevent": "t1" }],
+  "out_of_scope": []
+}
+EOF
+F_SB_NAME_S2="$TMP/sb-same-name-s2.json"
+cat > "$F_SB_NAME_S2" <<'EOF'
+{
+  "summary": "Worker boundary retries.", "verdict": "clean", "findings": [],
+  "step_back": [{ "classes": ["C1"], "name": "Refactor error handling", "invites_because": "retries lost", "approach_change": "handle retries explicitly at each worker queue boundary", "prevent": "t2" }],
+  "out_of_scope": []
+}
+EOF
+F_SB_NAME_BAD="$TMP/sb-same-name-bad.json"
+cat > "$F_SB_NAME_BAD" <<'EOF'
+{
+  "summary": "Collapsed same-name proposals.", "verdict": "clean", "findings": [],
+  "step_back": [{
+    "classes": ["C1"], "name": "Refactor error handling", "invites_because": "scattered",
+    "approach_change": "centralize error middleware at HTTP gateway boundary", "prevent": "t1",
+    "sources": ["s1", "s2"],
+    "merged_from": [{ "slot": "s1", "index": 0 }, { "slot": "s2", "index": 0 }],
+    "merge_rationale": "same proposal name"
+  }],
+  "out_of_scope": []
+}
+EOF
+F_SB_NAME_OK="$TMP/sb-same-name-ok.json"
+cat > "$F_SB_NAME_OK" <<'EOF'
+{
+  "summary": "Kept both same-name proposals with distinct approaches.", "verdict": "clean", "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Refactor error handling", "invites_because": "scattered", "approach_change": "centralize error middleware at HTTP gateway boundary", "prevent": "t1", "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }] },
+    { "classes": ["C1"], "name": "Refactor error handling", "invites_because": "retries lost", "approach_change": "handle retries explicitly at each worker queue boundary", "prevent": "t2", "sources": ["s2"], "merged_from": [{ "slot": "s2", "index": 0 }] }
+  ],
+  "out_of_scope": []
+}
+EOF
+po_sbn=$(bash "$ST" prepare --purpose step-back --mode step-back --base main --slots s1,s2 --owner "$OWNER")
+RDSBN=$(printf '%s\n' "$po_sbn" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDSBN" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDSBN" --slot s1 --attempt 1 --owner "$OWNER" --task-id tsbn1 --child-thread-id ctsbn1 >/dev/null
+bash "$ST" record-result "$RDSBN" --slot s1 --attempt 1 --owner "$OWNER" --task-id tsbn1 --input "$F_SB_NAME_S1" >/dev/null
+bash "$ST" claim-slot "$RDSBN" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDSBN" --slot s2 --attempt 1 --owner "$OWNER" --task-id tsbn2 --child-thread-id ctsbn2 >/dev/null
+bash "$ST" record-result "$RDSBN" --slot s2 --attempt 1 --owner "$OWNER" --task-id tsbn2 --input "$F_SB_NAME_S2" >/dev/null
+out_sbn_bad=$(bash "$ST" finish "$RDSBN" --merged "$F_SB_NAME_BAD"); rc=$?
+expect "council rejects collapsing same-name step_back[] proposals with different approach_change" "5:error" "$rc:$(printf '%s\n' "$out_sbn_bad" | kv VERDICT)"
+out_sbn_ok=$(bash "$ST" finish "$RDSBN" --merged "$F_SB_NAME_OK"); rc=$?
+expect "council accepts keeping same-name step_back[] proposals with distinct approach_change" "0:clean" "$rc:$(printf '%s\n' "$out_sbn_ok" | kv VERDICT)"
 
 # 8e. SIGTERM on submodule git rev-parse HEAD fails closed & unborn nested gitdir leaks ZERO stderr!
 SIG_BIN="$TMP/t3-git-sigterm"

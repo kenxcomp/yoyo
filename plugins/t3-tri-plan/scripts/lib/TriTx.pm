@@ -102,13 +102,20 @@ sub _norm_os_bytes {
 }
 
 # Check path stays strictly inside $root and no existing component is a symlink.
+sub _strip_trailing_slashes {
+  my ($p) = @_;
+  return $p unless defined $p && length $p;
+  1 while $p =~ s{(?:/\.|/)\z}{} && length($p) > 0;
+  return length($p) ? $p : '/';
+}
+
 sub ensure_no_symlink_components {
   my ($root, $target) = @_;
-  $root   = _norm_os_bytes($root);
+  $root   = _strip_trailing_slashes(_norm_os_bytes($root));
   $target = _norm_os_bytes($target) if defined $target;
+  die "EXTERNAL_CONFLICT: symlink forbidden at root '$root'\n" if -l $root;
   my $r = abs_path($root) // die "EXTERNAL_CONFLICT: cannot resolve root '$root'\n";
   $r = _norm_os_bytes($r);
-  die "EXTERNAL_CONFLICT: symlink forbidden at root '$root'\n" if -l $root;
   return if !defined $target || !length $target;
   die "EXTERNAL_CONFLICT: NUL byte in managed path\n" if index($target, "\0") >= 0;
 
@@ -164,6 +171,7 @@ sub _fs_cat {
 # Rejects any symlink inside the directory.
 sub dir_tree_manifest {
   my ($dir) = @_;
+  $dir = _strip_trailing_slashes(_norm_os_bytes($dir));
   die "EXTERNAL_CONFLICT: symlink forbidden at directory $dir\n" if -l $dir;
   die "not a directory: $dir\n" unless -d $dir;
   my $abs_dir = abs_path($dir);
@@ -204,7 +212,7 @@ sub dir_tree_manifest {
 # Acquire exclusive flock on canonicalized <TASK>/research/plans/.tri-plan.lock.
 sub with_task_lock {
   my ($task_dir, $code) = @_;
-  $task_dir = _norm_os_bytes($task_dir);
+  $task_dir = _strip_trailing_slashes(_norm_os_bytes($task_dir));
   die "EXTERNAL_CONFLICT: symlink forbidden at task dir $task_dir\n" if -l $task_dir;
   my $real_task = abs_path($task_dir);
   $real_task = _norm_os_bytes($real_task) if defined $real_task;

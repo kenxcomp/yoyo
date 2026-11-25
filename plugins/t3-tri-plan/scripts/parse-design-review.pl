@@ -103,9 +103,31 @@ if (defined $expected_sha && $rsha ne $expected_sha) {
 my $verdict = req_str($top->{verdict}, 'verdict', 1);
 fail("invalid verdict '$verdict'") unless $verdict eq 'clean' || $verdict eq 'findings';
 
+sub req_nonneg_int {
+  my ($node, $ctx) = @_;
+  fail("$ctx must be a non-negative integer")
+    unless $node && $node->[0] eq 'num' && defined($node->[1]) && $node->[1] =~ /\A(?:0|[1-9][0-9]*)\z/;
+  return int($node->[1]);
+}
+
+sub validate_merged_provenance {
+  my ($obj, $ctx) = @_;
+  if (exists $obj->{merged_from}) {
+    my $refs = req_arr($obj->{merged_from}, "$ctx.merged_from", 1);
+    for my $j (0 .. $#$refs) {
+      my $ro = req_obj($refs->[$j], "$ctx.merged_from[$j]", [qw(slot index)], []);
+      req_str($ro->{slot}, "$ctx.merged_from[$j].slot", 1);
+      req_nonneg_int($ro->{index}, "$ctx.merged_from[$j].index");
+    }
+  }
+  if (exists $obj->{merge_rationale}) {
+    req_str($obj->{merge_rationale}, "$ctx.merge_rationale", 0);
+  }
+}
+
 my %VALID_SEV = map { $_ => 1 } qw(BLOCKER SHOULD_FIX OPTIONAL);
 my @F_REQ = qw(severity reopens title location pattern still_wrong instances fix prevent evidence violates_review_md_rule);
-my @F_OPT = $is_merged ? qw(sources dispute_note) : ();
+my @F_OPT = $is_merged ? qw(sources merged_from merge_rationale dispute_note) : ();
 
 my $findings_arr = req_arr($top->{findings}, 'findings', 0);
 my %reopened_seen;
@@ -163,6 +185,9 @@ for my $i (0 .. $#$findings_arr) {
     my $srcs = req_arr($f->{sources}, "findings[$i].sources", 1);
     for my $j (0 .. $#$srcs) { req_str($srcs->[$j], "findings[$i].sources[$j]", 1); }
   }
+  if ($is_merged) {
+    validate_merged_provenance($f, "findings[$i]");
+  }
   if ($is_merged && exists $f->{dispute_note}) {
     req_str($f->{dispute_note}, "findings[$i].dispute_note", 0);
   }
@@ -197,7 +222,7 @@ my $sb_arr = req_arr($top->{step_back}, 'step_back', 0);
 if ($mode ne 'step-back' && @$sb_arr > 0) {
   fail("step_back must be empty when mode is '$mode'");
 }
-my @SB_OPT = $is_merged ? ('sources') : ();
+my @SB_OPT = $is_merged ? qw(sources merged_from merge_rationale) : ();
 for my $i (0 .. $#$sb_arr) {
   my $sb = req_obj($sb_arr->[$i], "step_back[$i]", [qw(classes name invites_because approach_change prevent)], \@SB_OPT);
   my $cls = req_arr($sb->{classes}, "step_back[$i].classes", 1);
@@ -213,6 +238,9 @@ for my $i (0 .. $#$sb_arr) {
   if ($is_merged && exists $sb->{sources}) {
     my $srcs = req_arr($sb->{sources}, "step_back[$i].sources", 1);
     for my $j (0 .. $#$srcs) { req_str($srcs->[$j], "step_back[$i].sources[$j]", 1); }
+  }
+  if ($is_merged) {
+    validate_merged_provenance($sb, "step_back[$i]");
   }
 }
 

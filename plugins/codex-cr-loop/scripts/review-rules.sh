@@ -250,7 +250,7 @@ cmd_scan() {
         $cls, $st, $stat, $om, $nm, $oo, $no, esc_path($path);
     }
     close $fh;
-  ' "$tmp"
+  ' -- "$tmp"
   rc=$?
   rm -f "$tmp"
   [ "$rc" -eq 0 ] || exit 2

@@ -2034,13 +2034,13 @@ cat > "$TMP/rev-k1-both.json" <<EOF
       "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
       "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
       "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
-      "sources": ["slot1"]
+      "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }]
     },
     {
       "severity": "BLOCKER", "reopens": "", "title": "Blocker Two", "location": "design.md:2",
       "pattern": "p2", "still_wrong": "", "instances": ["design.md:2"],
       "fix": "f2", "prevent": "t2", "evidence": "src/app.py:1", "violates_review_md_rule": "",
-      "sources": ["slot1"]
+      "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 1 }]
     }
   ],
   "verified": [], "step_back": [], "out_of_scope": []
@@ -2188,7 +2188,7 @@ cat > "$TMP/rev-k2-reopen-downgrade.json" <<EOF
     "severity": "OPTIONAL", "reopens": "D1", "title": "D1 downgraded", "location": "design.md:1",
     "pattern": "p1", "still_wrong": "minor", "instances": ["design.md:1"],
     "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "",
-    "sources": ["slot1"]
+    "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }]
   }],
   "verified": [], "step_back": [], "out_of_scope": [],
   "disputes": [{
@@ -2273,8 +2273,8 @@ cat > "$TMP/rev-ksb-both.json" <<EOF
   "summary": "Kept both proposals", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
   "findings": [], "verified": [],
   "step_back": [
-    { "classes": ["D1"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["slot1"] },
-    { "classes": ["D2"], "name": "Prop 2", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["slot1"] }
+    { "classes": ["D1"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }] },
+    { "classes": ["D2"], "name": "Prop 2", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 1 }] }
   ],
   "out_of_scope": []
 }
@@ -2304,12 +2304,85 @@ assert_rc "t3-tri-plan council rejects substituting 2 copies of Prop 1 (superset
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-both.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council accepts preserving both step_back[] proposals 1-to-1" "$rc" 0
 
+# K4d. Round 5 High #3: different root causes on SAME line CANNOT collapse into 1 merged finding; same-name distinct step_back[] CAN coexist!
+pr_kh3=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose full --mode full --slots-json "$TMP/two-rev.json" --owner "owner-k1")
+PRKH3_RUN=$(printf '%s\n' "$pr_kh3" | sed -n 's/^RUN_ID=//p')
+PRKH3_DSHA=$(printf '%s\n' "$pr_kh3" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+cat > "$TMP/rev-kh3-s1.json" <<EOF
+{
+  "summary": "Auth check missing", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-kh3-s2.json" <<EOF
+{
+  "summary": "Stream not closed", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Stream not closed", "location": "design.md:1",
+    "pattern": "file stream leaks descriptor on error return path", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "close stream handle in finally block", "prevent": "add leak test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-kh3-bad-merge.json" <<EOF
+{
+  "summary": "Collapsed distinct root causes", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+    "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
+    "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+    "sources": ["slot1", "slot2"],
+    "merged_from": [{ "slot": "slot1", "index": 0 }, { "slot": "slot2", "index": 0 }],
+    "merge_rationale": "same line design.md:1"
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-kh3-good-sep.json" <<EOF
+{
+  "summary": "Preserved both distinct same-line root causes", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+      "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+      "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }]
+    },
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Stream not closed", "location": "design.md:1",
+      "pattern": "file stream leaks descriptor on error return path", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "close stream handle in finally block", "prevent": "add leak test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+      "sources": ["slot2"], "merged_from": [{ "slot": "slot2", "index": 0 }]
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRKH3_RUN" --slot slot1 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKH3_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-h3a" --child-thread-id "ctk-h3a" --child-run-id "crk-h3a" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKH3_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-h3a" --child-run-id "crk-h3a" --input "$TMP/rev-kh3-s1.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRKH3_RUN" --slot slot2 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKH3_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-h3b" --child-thread-id "ctk-h3b" --child-run-id "crk-h3b" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKH3_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-h3b" --child-run-id "crk-h3b" --input "$TMP/rev-kh3-s2.json" >/dev/null
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-kh3-bad-merge.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects merging different root causes on the same line (exit 3)" "$rc" 3
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-kh3-good-sep.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council accepts keeping distinct same-line root causes separately" "$rc" 0
+
 # Finish convergence on TASK_K for K6b Phase 5 numeric JSON rejection!
-# (D2 was promoted to recurring by K4c step_back[], so codify D2 cleanly in Phase 4c!)
+# (D2 was promoted to recurring by K4c step_back[], and D3/D4 were opened by K4d, so dispose D2/D3/D4 cleanly!)
 printf '\n- I-K2: centralize guard (guard: test_k2).\n' >> "$TASK_K/design.md"
 cat > "$TMP/disp-k-sb.json" <<'EOF'
 [
-  { "id": "D2", "disposition": "adopted", "note": "codified after step-back", "codified": { "invariant_id": "I-K2", "guard_test": "test_k2" } }
+  { "id": "D2", "disposition": "adopted", "note": "codified after step-back", "codified": { "invariant_id": "I-K2", "guard_test": "test_k2" } },
+  { "id": "D3", "disposition": "adopted", "note": "fixed auth check" },
+  { "id": "D4", "disposition": "adopted", "note": "fixed stream close" }
 ]
 EOF
 bash "$STATE" commit-phase4-revision --task "$TASK_K" --repo "$REPO_K" --step-back-assessment-done --dispositions-json "$TMP/disp-k-sb.json" >/dev/null

@@ -605,39 +605,41 @@ git branch -D space-target >/dev/null 2>&1
 
 # --- Round 3 hardening regressions: CAS merge TOCTOU, git SIGTERM UNBORN trap, unborn stderr silence ---
 
-# 9. CAS merge protocol aborts atomically when target ref rewinds A -> B after coverage check!
-CAS_REPO="$TMP/cas-merge-repo"
-CAS_MAIN_WT="$TMP/cas-main-wt"
-mkdir -p "$CAS_REPO"
+# 9. Round 5 High #2: Path B attached merge retains exclusive Git checkout ownership (no detach!),
+#    blocking concurrent branch checkouts while verifying fast-forward / merge-commit / Already-up-to-date!
+ATT_REPO="$TMP/attached-merge-repo"
+ATT_MAIN_WT="$TMP/attached-main-wt"
+ATT_OTHER_WT="$TMP/attached-other-wt"
+mkdir -p "$ATT_REPO"
 (
-  cd "$CAS_REPO" || exit 2
+  cd "$ATT_REPO" || exit 2
   git init -q -b main . && git config user.email t@example.invalid && git config user.name t
-  printf 'b\n' > f.txt && git add f.txt && git commit -qm "commit B"
-  B_SHA=$(git rev-parse HEAD)
-  printf 'a\n' >> f.txt && git commit -qam "commit A"
+  printf 'a\n' > f.txt && git add f.txt && git commit -qm "commit A"
   A_SHA=$(git rev-parse HEAD)
-  git switch -qc feat/cas
+  git switch -qc feat/att
   printf 'f\n' >> f.txt && git commit -qam "commit F"
   F_SHA=$(git rev-parse HEAD)
-  git worktree add -q "$CAS_MAIN_WT" main >/dev/null 2>&1
-  # Coverage check pins EXPECTED_TARGET_SHA=A_SHA
-  EXPECTED_TARGET_SHA=$(git rev-parse --verify refs/heads/main)
+  git worktree add -q "$ATT_MAIN_WT" main >/dev/null 2>&1
+  EXPECTED_TARGET_SHA=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
   [ "$EXPECTED_TARGET_SHA" = "$A_SHA" ] || exit 11
-  # Concurrent rewind moves main from A -> B right before ref update!
-  git -C "$CAS_MAIN_WT" checkout -q --detach "$EXPECTED_TARGET_SHA"
-  git -C "$CAS_MAIN_WT" merge -q --ff-only "$F_SHA"
-  NEW_TARGET_SHA=$(git -C "$CAS_MAIN_WT" rev-parse HEAD)
-  git update-ref refs/heads/main "$B_SHA" "$A_SHA"
-  # Atomic CAS update-ref MUST FAIL because refs/heads/main is now B_SHA != EXPECTED_TARGET_SHA!
-  if git -C "$CAS_MAIN_WT" update-ref refs/heads/main "$NEW_TARGET_SHA" "$EXPECTED_TARGET_SHA" 2>/dev/null; then
+  # Because Path B NEVER detaches ATT_MAIN_WT, another worktree attempting to check out main MUST be refused by Git!
+  if git worktree add -q "$ATT_OTHER_WT" main 2>/dev/null; then
     exit 12
   fi
-  git -C "$CAS_MAIN_WT" checkout -q main
-  [ "$(git rev-parse refs/heads/main)" = "$B_SHA" ] || exit 13
-) && ok || bad "CAS merge failed to abort on concurrent target rewind A -> B"
+  # Path B runs merge directly while attached -> fast-forward HEAD@{1} == EXPECTED_TARGET_SHA!
+  git -C "$ATT_MAIN_WT" merge -q --ff-only "$F_SHA"
+  NEW_TARGET_SHA=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
+  [ "$NEW_TARGET_SHA" = "$F_SHA" ] || exit 13
+  [ "$(git -C "$ATT_MAIN_WT" rev-parse HEAD@{1})" = "$EXPECTED_TARGET_SHA" ] || exit 14
+  # Re-merging when Already up to date satisfies Case 1 (NEW_TARGET_SHA == EXPECTED && LAST_REVIEWED ancestor of NEW)!
+  EXPECTED_TARGET_SHA="$NEW_TARGET_SHA"
+  git -C "$ATT_MAIN_WT" merge -q "$F_SHA"
+  POST_UP2DATE=$(git -C "$ATT_MAIN_WT" rev-parse HEAD)
+  [ "$POST_UP2DATE" = "$EXPECTED_TARGET_SHA" ] && git -C "$ATT_MAIN_WT" merge-base --is-ancestor "$F_SHA" "$POST_UP2DATE" || exit 15
+) && ok || bad "Path B attached merge failed to retain branch checkout ownership or verify 3-case post-merge"
 
-# 9b. Round 4 High #4: Path A git checkout refuses atomically when target is concurrently checked out in another worktree,
-#     and both merge protocols enforce repo-common lock + re-run defer guidance (no bare git merge on target move/rewind).
+# 9b. Round 4 High #4 + Round 5 High #2/M1: Path A git checkout refuses concurrent target checkout,
+#     and both merge protocols enforce repo-common lock, attached Path B (no --detach), tree-clean, and 3-case post-merge.
 PA_REPO="$TMP/patha-race-repo"
 PA_OTHER_WT="$TMP/patha-other-wt"
 mkdir -p "$PA_REPO"
@@ -648,9 +650,7 @@ mkdir -p "$PA_REPO"
   A_SHA=$(git rev-parse HEAD)
   git switch -qc feat/patha
   printf 'f\n' >> f.txt && git commit -qam "commit F"
-  # Simulate concurrent checkout of main in another worktree right after Path A detection:
   git worktree add -q "$PA_OTHER_WT" main >/dev/null 2>&1
-  # Path A claims main via git checkout (NOT bare update-ref) -> Git MUST reject atomically, leaving PA_OTHER_WT intact!
   if git checkout -q main 2>/dev/null; then
     exit 21
   fi
@@ -666,9 +666,13 @@ T3_MERGE_DOC="$HERE/../../t3-cr-loop/skills/t3-cr-loop-merge/SKILL.md"
   grep -q 'cr-loop-merge.lock' "$T3_MERGE_DOC" &&
   grep -q 'git checkout "${CR_MERGE_TARGET:-main}"' "$CODEX_MERGE_DOC" &&
   grep -q 'git checkout "$CR_MERGE_TARGET"' "$T3_MERGE_DOC" &&
+  grep -q 'Already up to date' "$CODEX_MERGE_DOC" &&
+  grep -q 'Already up to date' "$T3_MERGE_DOC" &&
+  ! grep -q 'checkout --detach' "$CODEX_MERGE_DOC" &&
+  ! grep -q 'checkout --detach' "$T3_MERGE_DOC" &&
   ! grep -q 'git checkout main && git merge' "$CODEX_MERGE_DOC" &&
   ! grep -q 'git checkout main && git merge' "$T3_MERGE_DOC"
-) && ok || bad "merge protocol docs missing repo-common lock, Path A checkout claim, or safe defer guidance"
+) && ok || bad "merge protocol docs missing attached Path B, tree-clean/Already-up-to-date, or safe defer guidance"
 
 # 10. SIGTERM on submodule git rev-parse HEAD fails closed (NEVER misclassified as UNBORN)!
 SIG_GIT_BIN="$TMP/codex-git-sigterm"

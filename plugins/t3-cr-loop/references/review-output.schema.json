@@ -81,8 +81,26 @@
           "sources": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
-            "description": "Allowed ONLY in merged council results (parsed with --allow-sources): list of provider/model reviewers that reported this class."
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+            "description": "Allowed ONLY in merged council results (parsed with --allow-sources): list of contributing reviewer slots or provider/model tags."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council results ONLY (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical findings[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council results ONLY (required non-empty when merged_from references >= 2 distinct slots): code-verified explanation of why the merged items share the same root cause."
           }
         }
       }
@@ -112,8 +130,26 @@
           "sources": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
             "description": "Allowed ONLY in merged council results."
+          },
+          "merged_from": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["slot", "index"],
+              "properties": {
+                "slot": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "index": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "description": "Merged council results ONLY (required when >= 2 valid slots): exact 0-based (slot, index) provenance entries from each contributing reviewer's canonical step_back[]."
+          },
+          "merge_rationale": {
+            "type": "string",
+            "description": "Merged council results ONLY (required non-empty when merged_from references >= 2 distinct slots): why the merged proposals express the same structural change."
           }
         }
       }
@@ -131,7 +167,7 @@
           "sources": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
+            "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
             "description": "Allowed ONLY in merged council results."
           }
         }

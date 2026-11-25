@@ -137,7 +137,7 @@ with_branch_lock() {
     defined fcntl($nine, F_SETFD, 0) or do { print STDERR "cr-review: fcntl(F_SETFD): $!\n"; exit 2 };
     $ENV{CR_REVIEW_LOCK_HELD} = 1;
     exec @ARGV or do { print STDERR "cr-review: exec: $!\n"; exit 2 };
-  ' "$lockfile" bash "$(self_path)" "$@"
+  ' -- "$lockfile" bash "$(self_path)" "$@"
 }
 
 # ---------------------------------------------------------------- knobs ----
@@ -434,7 +434,7 @@ tree_fp_v2() {
       }
     }
     close $mf or exit 1;
-  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  ' -- "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   vh=$(git -C "$ROOT" hash-object --stdin < "$tman" 2>/dev/null)
   rc=$?
   rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"
@@ -502,7 +502,7 @@ compute_recurring() {
       $an <=> $bn;
     } grep { $counts{$_} >= 2 } keys %counts;
     print join(",", @rec);
-  ' "$ledger_file"
+  ' -- "$ledger_file"
 }
 
 write_prompt() {
@@ -648,7 +648,7 @@ launch_detached() {
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   elif command -v perl >/dev/null 2>&1; then
-    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' -- bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   else
     nohup bash "$self" _run "$d" </dev/null >/dev/null 2>&1 9>&- &
   fi
@@ -734,7 +734,7 @@ sleep_bounded() {
     my ($d, $rem) = @ARGV;
     $d = $rem if $rem < $d;
     select(undef, undef, undef, $d) if $d > 0;
-  ' "$1" "$2"
+  ' -- "$1" "$2"
 }
 
 cmd_wait() {

@@ -101,7 +101,7 @@ snapshot_regular_file() {
     close $ofh or do { unlink $dst; die "cannot close snapshot $dst: $!\n"; };
     chmod(0400, $dst);
     print "SNAP_PATH=$dst\nSNAP_SHA=$sha\n";
-  ' "$_srf_src" "$_srf_dir" "$_srf_pfx"
+  ' -- "$_srf_src" "$_srf_dir" "$_srf_pfx"
 }
 
 resolve_paths() {
@@ -166,7 +166,7 @@ with_branch_lock() {
     defined fcntl($nine, F_SETFD, 0) or do { print STDERR "t3-cr-state: fcntl(F_SETFD): $!\n"; exit 2 };
     $ENV{T3_CR_LOCK_HELD} = 1;
     exec @ARGV or do { print STDERR "t3-cr-state: exec: $!\n"; exit 2 };
-  ' "$lockfile" bash "$(self_path)" "$@"
+  ' -- "$lockfile" bash "$(self_path)" "$@"
 }
 
 # ---------------------------------------------------------------- knobs ----
@@ -229,7 +229,7 @@ resolve_knobs() {
       print "P3=$k{skipP3}\n" if defined $k{skipP3};
       print "RR=$k{requireRebased}\n" if defined $k{requireRebased};
       print "PRAR=$k{prAutoRebase}\n" if defined $k{prAutoRebase};
-    ' "$ucfg" "$pcfg" 2>/dev/null || true)
+    ' -- "$ucfg" "$pcfg" 2>/dev/null || true)
     cfg_rc=$(printf '%s\n' "$kv_out" | sed -n 's/^RC=//p' | tail -n 1)
     cfg_sb=$(printf '%s\n' "$kv_out" | sed -n 's/^SB=//p' | tail -n 1)
     cfg_p3=$(printf '%s\n' "$kv_out" | sed -n 's/^P3=//p' | tail -n 1)
@@ -275,7 +275,7 @@ cmd_config_set() {
   in_tmp="$cfg.in.$$"
   if [ -n "$infile" ]; then
     [ -f "$infile" ] || die "config-set: file not found: $infile"
-    cat "$infile" > "$in_tmp" || { rm -f "$in_tmp"; die "cannot copy $infile"; }
+    cat -- "$infile" > "$in_tmp" || { rm -f -- "$in_tmp"; die "cannot copy $infile"; }
   else
     cat > "$in_tmp" || { rm -f "$in_tmp"; die "cannot read config JSON from stdin"; }
   fi
@@ -462,7 +462,7 @@ cmd_config_set() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh JSON::PP->new->utf8->pretty->canonical->encode($j);
     close $oh or die "cannot close $out\n";
-  ' "$in_tmp" "$tmp" || { rm -f "$in_tmp" "$tmp"; die "config-set: invalid config JSON"; }
+  ' -- "$in_tmp" "$tmp" || { rm -f "$in_tmp" "$tmp"; die "config-set: invalid config JSON"; }
   rm -f "$in_tmp"
   chmod 0600 "$tmp" || { rm -f "$tmp"; die "config-set: cannot chmod $tmp"; }
   mv "$tmp" "$cfg" || { rm -f "$tmp"; die "config-set: failed to write $cfg"; }
@@ -488,7 +488,7 @@ cmd_config_authorize_provider() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh JSON::PP->new->utf8->pretty->canonical->encode($j);
     close $oh or die "cannot close $out\n";
-  ' "$cfg" "$tmp" "$prov" || { rm -f "$tmp"; die "failed to update authorizedProviders"; }
+  ' -- "$cfg" "$tmp" "$prov" || { rm -f "$tmp"; die "failed to update authorizedProviders"; }
   chmod 0600 "$tmp" || { rm -f "$tmp"; die "failed to chmod $tmp"; }
   mv "$tmp" "$cfg" || { rm -f "$tmp"; die "failed to replace $cfg"; }
   printf 'AUTHORIZED_PROVIDER=%s\n' "$prov"
@@ -1004,7 +1004,7 @@ cmd_config_show() {
       $val = ($val ? 1 : 0) if JSON::PP::is_bool($val);
       print "KNOB_$k=$val\n";
     }
-  ' "$ucfg" "$pcfg" "$pcfg_disk" "$ignore_proj" "$caps_file" "$ov_model" "$ov_effort" "$ov_council" "$ov_single"
+  ' -- "$ucfg" "$pcfg" "$pcfg_disk" "$ignore_proj" "$caps_file" "$ov_model" "$ov_effort" "$ov_council" "$ov_single"
 }
 
 # ------------------------------------------------------------- snapshots ----
@@ -1224,7 +1224,7 @@ tree_fp_v2() {
       } else { print $mf "other\t$ep\n"; }
     }
     close $mf or exit 1;
-  ' "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
+  ' -- "$ROOT" "$dh" "$ih" "$wh" "$tuntr" "$tstage" "$tman" || { rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"; return 1; }
   vh=$(git -C "$ROOT" hash-object --stdin < "$tman" 2>/dev/null)
   rc=$?
   rm -f "$tdiff" "$tidx" "$twt" "$tuntr" "$tstage" "$tman"
@@ -1250,7 +1250,7 @@ compute_recurring() {
     my @rec = sort { my ($a1)=($a=~/(\d+)/); my ($b1)=($b=~/(\d+)/); $a1 <=> $b1 }
       grep { $counts{$_} >= 2 } keys %counts;
     print join(",", @rec);
-  ' "$1"
+  ' -- "$1"
 }
 
 effective_persisted_streak() {
@@ -1525,7 +1525,7 @@ cmd_prepare() {
     open(my $fh, ">:raw", $out) or die "cannot write $out\n";
     print $fh JSON::PP->new->utf8->pretty->canonical->encode($obj);
     close $fh or die "cannot close $out\n";
-  ' "$atmp" "$n" "$purpose" "$mode" "$base" "$base_sha" "$head" "$owner" "$slots" "$(now_utc)" \
+  ' -- "$atmp" "$n" "$purpose" "$mode" "$base" "$base_sha" "$head" "$owner" "$slots" "$(now_utc)" \
     || { rm -rf "$d"; die "prepare: cannot write active_round.json"; }
   mv "$atmp" "$d/active_round.json" || { rm -rf "$d"; die "prepare: cannot move active_round.json"; }
 
@@ -1598,7 +1598,7 @@ cmd_claim_slot() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$prov" "$model" "$opts" "$crid" "$(now_utc)" \
+  ' -- "$af" "$atmp" "$slot" "$attempt" "$owner" "$prov" "$model" "$opts" "$crid" "$(now_utc)" \
     || { rm -f "$atmp"; die "claim-slot CAS failed"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "claim-slot: failed replacing $af"; }
   printf 'CLAIMED=%s\nATTEMPT=%s\nCLIENT_REQUEST_ID=%s\n' "$slot" "$attempt" "$crid"
@@ -1640,7 +1640,7 @@ cmd_record_dispatch() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$tid" "$ctid" "$crid" \
+  ' -- "$af" "$atmp" "$slot" "$attempt" "$owner" "$tid" "$ctid" "$crid" \
     || { rm -f "$atmp"; die "record-dispatch CAS failed"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "record-dispatch: failed replacing $af"; }
   printf 'RECORDED=%s\nSTATE=running\nTASK_ID=%s\n' "$slot" "$tid"
@@ -1689,7 +1689,7 @@ cmd_update_slot() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$st" "$reason" \
+  ' -- "$af" "$atmp" "$slot" "$attempt" "$owner" "$st" "$reason" \
     || { rm -f "$atmp"; die "update-slot CAS failed"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "update-slot: failed replacing $af"; }
   printf 'SLOT=%s\nATTEMPT=%s\nSLOT_STATE=%s\n' "$slot" "$attempt" "$st"
@@ -1752,7 +1752,7 @@ cmd_record_result() {
     die "CAS failed: slot $slot in state '\''$st'\'', expected running or waiting\n"
       unless $st eq "running" || $st eq "waiting";
     print "ACTION=proceed\nIN_SHA=$in_sha\n";
-  ' "$af" "$slot" "$attempt" "$owner" "$tid" "$snap_in" "$snap_in_sha") || { rm -f -- "$snap_in"; die "record-result CAS failed"; }
+  ' -- "$af" "$slot" "$attempt" "$owner" "$tid" "$snap_in" "$snap_in_sha") || { rm -f -- "$snap_in"; die "record-result CAS failed"; }
 
   act=$(printf '%s\n' "$pre_chk" | sed -n 's/^ACTION=//p' | head -n 1)
   in_sha=$(printf '%s\n' "$pre_chk" | sed -n 's/^IN_SHA=//p' | head -n 1)
@@ -1772,14 +1772,14 @@ cmd_record_result() {
   vout=$(perl "$PARSER" --validate-only "$snap_in" --write-canonical "$tmp_canon")
   vrc=$?
   # Re-verify snapshot digest after parsing so parser & digest are strictly bound to identical bytes!
-  post_in_sha=$(perl -MDigest::SHA=sha256_hex -e 'open(my $f, "<:raw", $ARGV[0]) or exit 1; local $/; my $b = <$f>; close $f or exit 1; print sha256_hex(defined $b ? $b : "");' "$snap_in") || { rm -f -- "$snap_in" "$tmp_canon"; die "record-result: snapshot verification failed"; }
+  post_in_sha=$(perl -MDigest::SHA=sha256_hex -e 'open(my $f, "<:raw", $ARGV[0]) or exit 1; local $/; my $b = <$f>; close $f or exit 1; print sha256_hex(defined $b ? $b : "");' -- "$snap_in") || { rm -f -- "$snap_in" "$tmp_canon"; die "record-result: snapshot verification failed"; }
   [ "$post_in_sha" = "$snap_in_sha" ] || { rm -f -- "$snap_in" "$tmp_canon"; die "record-result: snapshot mutated during validation"; }
 
   new_st="completed_valid"; err_reason=""; res_path="$canon_out"; staged_art="$tmp_canon"
   if [ "$vrc" -ne 0 ]; then
     rm -f -- "$tmp_canon"
-    mv -- "$snap_in" "$tmp_inv" || { rm -f -- "$snap_in" "$tmp_inv"; die "cannot stage invalid result"; }
-    chmod 0644 "$tmp_inv" 2>/dev/null || true
+    mv -f -- "$snap_in" "$tmp_inv" || { rm -f -- "$snap_in" "$tmp_inv"; die "cannot stage invalid result"; }
+    chmod 0600 -- "$tmp_inv" 2>/dev/null || true
     new_st="completed_invalid"
     err_reason=$(printf '%s\n' "$vout" | sed -n 's/^ERROR=//p' | head -n 1)
     res_path="$invalid_out"
@@ -1801,7 +1801,7 @@ cmd_record_result() {
     open(my $fh, "<:raw", $ARGV[0]) or exit 1;
     local $/; my $b = <$fh>; close $fh or exit 1;
     print sha256_hex(defined $b ? $b : "");
-  ' "$staged_art") || { rm -f "$tmp_canon" "$tmp_inv"; die "record-result: cannot hash staged artifact"; }
+  ' -- "$staged_art") || { rm -f "$tmp_canon" "$tmp_inv"; die "record-result: cannot hash staged artifact"; }
 
   # 3. Stage active_round.json, then move artifact, post-verify regular file + byte hash, and commit active_round.json.
   atmp="$af.tmp.$$"
@@ -1822,7 +1822,7 @@ cmd_record_result() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$slot" "$attempt" "$owner" "$new_st" "$res_path" "$in_sha" "$art_sha" "$err_reason" \
+  ' -- "$af" "$atmp" "$slot" "$attempt" "$owner" "$new_st" "$res_path" "$in_sha" "$art_sha" "$err_reason" \
     || { rm -f "$atmp" "$tmp_canon" "$tmp_inv"; die "record-result CAS failed"; }
 
   mv "$staged_art" "$res_path" || { rm -f "$atmp" "$staged_art"; die "record-result: failed moving $res_path"; }
@@ -1835,7 +1835,7 @@ cmd_record_result() {
     open(my $fh, "<:raw", $ARGV[0]) or exit 1;
     local $/; my $b = <$fh>; close $fh or exit 1;
     print sha256_hex(defined $b ? $b : "");
-  ' "$res_path") || { rm -f "$atmp"; die "record-result: post-move hash failed on $res_path"; }
+  ' -- "$res_path") || { rm -f "$atmp"; die "record-result: post-move hash failed on $res_path"; }
   [ "$post_sha" = "$art_sha" ] || { rm -f "$atmp"; die "record-result: post-move byte verification failed on $res_path"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "record-result: failed replacing $af"; }
 
@@ -1870,7 +1870,7 @@ cmd_round_summary() {
         $k, $s->{attempt}, $s->{state}, $s->{providerInstanceId}, $s->{model}, $s->{taskId}, $s->{childThreadId}, $s->{resultFile};
     }
     print "VALID_SLOTS=$valid\nFAILED_SLOTS=$term_fail\nPENDING_SLOTS=$pending\nTOTAL_SLOTS=" . scalar(@{$obj->{slotOrder}}) . "\n";
-  ' "$af"
+  ' -- "$af"
 }
 
 cmd_cancel_round() {
@@ -1903,7 +1903,7 @@ cmd_cancel_round() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$atmp" "$owner" "$reason" || { rm -f "$atmp"; die "cancel-round failed"; }
+  ' -- "$af" "$atmp" "$owner" "$reason" || { rm -f "$atmp"; die "cancel-round failed"; }
   mv "$atmp" "$af" || { rm -f "$atmp"; die "cancel-round: failed replacing $af"; }
   if [ "$(sget active_round_dir)" = "$d" ]; then
     stmp="$STATE.tmp.$$"
@@ -1979,7 +1979,7 @@ cmd_finish() {
     print "VALID_COUNT=$valid\n";
     print "SINGLE_FILE=" . ($valid == 1 ? $vfiles[0] : "") . "\n";
     print "ABSENT=" . join(",", @absent) . "\n";
-  ' "$af" "$partial_reason") || die "finish: slot precondition failed"
+  ' -- "$af" "$partial_reason") || die "finish: slot precondition failed"
   valid_cnt=$(printf '%s\n' "$slot_meta" | sed -n 's/^VALID_COUNT=//p' | head -n 1)
   single_slot_file=$(printf '%s\n' "$slot_meta" | sed -n 's/^SINGLE_FILE=//p' | head -n 1)
   slot_chk=$(printf '%s\n' "$slot_meta" | sed -n 's/^ABSENT=//p' | head -n 1)
@@ -2023,7 +2023,7 @@ cmd_finish() {
       open(my $oh, ">:raw", $out) or die "cannot write $out\n";
       print $oh $J->pretty->canonical->encode($obj);
       close $oh or die "cannot close $out\n";
-    ' "$af" "$atmp" "$drift" && mv "$atmp" "$af" || rm -f "$atmp"
+    ' -- "$af" "$atmp" "$drift" && mv "$atmp" "$af" || rm -f "$atmp"
     if [ "$(sget active_round_dir)" = "$d" ]; then
       stmp="$STATE.tmp.$$"
       build_state_file "$stmp" "active_round_dir="
@@ -2059,14 +2059,14 @@ cmd_finish() {
   parsed=$(perl "$PARSER" "$snap_merged" "$(snum next_class_id)" "$LEDGER" "$frag" "$md" --allow-sources)
   prc=$?
   # Re-verify snapshot digest immediately after parsing so parser & verification read identical fixed bytes!
-  mid_msha=$(perl -MDigest::SHA=sha256_hex -e 'exit 1 if -l $ARGV[0] || !-f $ARGV[0]; open(my $f, "<:raw", $ARGV[0]) or exit 1; local $/; my $b = <$f>; close $f or exit 1; print sha256_hex(defined $b ? $b : "");' "$snap_merged") || { rm -f -- "$snap_merged" "$snap_dism"; die "finish: merged snapshot unreadable after parse"; }
+  mid_msha=$(perl -MDigest::SHA=sha256_hex -e 'exit 1 if -l $ARGV[0] || !-f $ARGV[0]; open(my $f, "<:raw", $ARGV[0]) or exit 1; local $/; my $b = <$f>; close $f or exit 1; print sha256_hex(defined $b ? $b : "");' -- "$snap_merged") || { rm -f -- "$snap_merged" "$snap_dism"; die "finish: merged snapshot unreadable after parse"; }
   if [ "$mid_msha" != "$snap_merged_sha" ]; then
     rm -f -- "$snap_merged" "$snap_dism"
     printf 'VERDICT=error\nREASON=merged snapshot mutated during parse\nRESULT=%s\n' "$res"
     exit 5
   fi
   if [ "$prc" -ne 0 ]; then
-    mv -- "$snap_merged" "$res" 2>/dev/null && chmod 0644 "$res" 2>/dev/null || rm -f -- "$snap_merged"
+    mv -f -- "$snap_merged" "$res" 2>/dev/null && chmod 0600 -- "$res" 2>/dev/null || rm -f -- "$snap_merged"
     rm -f -- "$snap_dism"
     printf 'VERDICT=error\n%s\nRESULT=%s\n' "$(printf '%s\n' "$parsed" | sed -n 's/^ERROR=/REASON=/p')" "$res"
     exit 5
@@ -2199,14 +2199,16 @@ cmd_finish() {
       my $copy = {
         summary => $o->{summary},
         verdict => $o->{verdict},
-        findings => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{findings} || []} ],
-        step_back => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{step_back} || []} ],
+        findings => [ map { my %x = %$_; delete @x{qw(sources merged_from merge_rationale)}; \%x } @{$o->{findings} || []} ],
+        step_back => [ map { my %x = %$_; delete @x{qw(sources merged_from merge_rationale)}; \%x } @{$o->{step_back} || []} ],
         out_of_scope => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{out_of_scope} || []} ],
       };
       return $JC->encode($copy);
     };
 
     if (@valid_slots == 1) {
+      die "single-reviewer round does not allow --dismissed-findings\n"
+        if defined $dismissed_path && length $dismissed_path;
       my $vs = $valid_slots[0];
       if ($strip_sources->($merged) ne $strip_sources->($vs->{obj})) {
         die "single-reviewer merged JSON does not match recorded canonical slot result ($vs->{slot})\n";
@@ -2308,181 +2310,264 @@ cmd_finish() {
       return ($long =~ /(?:\A|[^a-z0-9])\Q$short\E(?:[^a-z0-9]|\z)/) ? 1 : 0;
     };
 
-    # Reject duplicate copies in merged findings[] and step_back[] (prevents padding duplicates to drop independent items!).
+    my $extract_tokens = sub {
+      my ($text) = @_;
+      my $n = $norm->($text);
+      my %tok;
+      my %stop = map { $_ => 1 } qw(
+        this that with from into over under when where what which while have been were will would
+        could should must does done make made used using only also more most very just than then
+        they them their there these those here some such each same both onto about after
+        before between through during without within across against along around
+        code file line function method class check error issue problem change update fix
+      );
+      while ($n =~ /([a-z0-9_]{3,})/g) {
+        my $w = $1;
+        next if $stop{$w};
+        $tok{"w:$w"} = 1;
+      }
+      while ($n =~ /([^\x00-\x7f]+)/g) {
+        my $run = $1;
+        $run =~ s/[\p{P}\p{S}\s]+//g;
+        my $rl = length($run);
+        if ($rl == 1) {
+          $tok{"c:$run"} = 1;
+        } elsif ($rl >= 2) {
+          for my $k (0 .. $rl - 2) {
+            $tok{"c:" . substr($run, $k, 2)} = 1;
+          }
+        }
+      }
+      return \%tok;
+    };
+
+    my $corresponds = sub {
+      my ($orig_str, $merged_str) = @_;
+      return 1 if $text_matches->($orig_str, $merged_str);
+      my $ta = $extract_tokens->($orig_str);
+      my $tb = $extract_tokens->($merged_str);
+      my $na = scalar(keys %$ta);
+      return 0 unless $na > 0;
+      my $shared = 0;
+      for my $k (keys %$ta) {
+        $shared++ if $tb->{$k};
+      }
+      my $need = ($na >= 2) ? 2 : 1;
+      return ($shared >= $need) ? 1 : 0;
+    };
+
+    my $finding_corresponds = sub {
+      my ($orig, $mf) = @_;
+      return 1 if $text_matches->($orig->{title}, $mf->{title})
+               || $text_matches->($orig->{pattern}, $mf->{pattern});
+      return $corresponds->(
+        join(" ", $orig->{title} // "", $orig->{pattern} // "", $orig->{fix} // ""),
+        join(" ", $mf->{title}   // "", $mf->{pattern}   // "", $mf->{fix}   // "")
+      );
+    };
+
+    my $sb_corresponds = sub {
+      my ($orig, $msb) = @_;
+      return $corresponds->($orig->{approach_change} // "", $msb->{approach_change} // "");
+    };
+
+    # Map valid slots by slot name and unique provider/model tag for exact structural provenance.
+    my %slot_by_name;
+    my %slots_by_mtag;
+    for my $vs (@valid_slots) {
+      my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
+      $vs->{mtag} = $mtag;
+      $slot_by_name{$vs->{slot}} = $vs;
+      push @{$slots_by_mtag{$mtag}}, $vs;
+    }
+    my $resolve_slot = sub {
+      my ($ref, $ctx) = @_;
+      return $slot_by_name{$ref} if exists $slot_by_name{$ref};
+      if (exists $slots_by_mtag{$ref}) {
+        die "$ctx cites ambiguous model tag '\''$ref'\'' — use explicit slot id\n"
+          if @{$slots_by_mtag{$ref}} > 1;
+        return $slots_by_mtag{$ref}[0];
+      }
+      die "$ctx cites unknown or non-valid slot '\''$ref'\''\n";
+    };
+
     my @m_findings = @{$merged->{findings} || []};
     my @m_sbs      = @{$merged->{step_back} || []};
-    my (%seen_mf_tl, %seen_mf_lp, %seen_mf_tpf);
-    for my $mf (@m_findings) {
-      my $nreo = $norm->($mf->{reopens});
-      my $k_tl  = join("\0", $nreo, $norm->($mf->{title}), $norm->($mf->{location}));
-      die "duplicate merged finding detected: $mf->{title} ($mf->{location})\n" if $seen_mf_tl{$k_tl}++;
-      my $k_lp  = join("\0", $nreo, $norm->($mf->{location}), $norm->($mf->{pattern}));
-      die "duplicate merged finding location/pattern detected: $mf->{title} ($mf->{location})\n" if $seen_mf_lp{$k_lp}++;
-      my $k_tpf = join("\0", $nreo, $norm->($mf->{title}), $norm->($mf->{pattern}), $norm->($mf->{fix}));
-      die "duplicate merged finding title/pattern/fix detected: $mf->{title} ($mf->{location})\n" if $seen_mf_tpf{$k_tpf}++;
-    }
-    my (%seen_sb_name, %seen_sb_app);
-    for my $msb (@m_sbs) {
-      my $ckey = join(",", sort map { $norm->($_) } @{$msb->{classes} || []});
-      my $kn = join("\0", $ckey, $norm->($msb->{name}));
-      my $ka = join("\0", $ckey, $norm->($msb->{approach_change}));
-      die "duplicate merged step_back[] proposal detected: $msb->{name}\n" if $seen_sb_name{$kn}++ || $seen_sb_app{$ka}++;
-    }
+    my (%claimed_f, %claimed_blocking_f, %claimed_sb);
 
-    # Bipartite maximum matching helper (Kuhn) for 1-to-1 per-slot binding.
-    my $has_perfect_matching = sub {
-      my ($n_left, $n_right, $adj) = @_;
-      my @match_r = (-1) x $n_right;
-      my $dfs;
-      $dfs = sub {
-        my ($u, $vis) = @_;
-        for my $v (@{$adj->[$u] || []}) {
-          next if $vis->[$v];
-          $vis->[$v] = 1;
-          if ($match_r[$v] == -1 || $dfs->($match_r[$v], $vis)) {
-            $match_r[$v] = $u;
-            return 1;
-          }
+    # 1. Validate explicit merged_from[] provenance, location/instance union, and root-cause correspondence on findings[].
+    for my $mi (0 .. $#m_findings) {
+      my $mf = $m_findings[$mi];
+      my $mfrom = $mf->{merged_from};
+      die "merged findings[$mi] requires non-empty merged_from[] provenance in multi-reviewer council mode\n"
+        unless ref($mfrom) eq "ARRAY" && @$mfrom >= 1;
+      my $srcs = $mf->{sources};
+      die "merged findings[$mi] requires non-empty sources[] in multi-reviewer council mode\n"
+        unless ref($srcs) eq "ARRAY" && @$srcs >= 1;
+      my $mf_locs = $finding_locs->($mf);
+      my $mrk = $rank{$mf->{severity}} // 0;
+      my %in_this_item;
+      for my $ri (0 .. $#$mfrom) {
+        my $ref = $mfrom->[$ri];
+        my $so  = $resolve_slot->($ref->{slot}, "findings[$mi].merged_from[$ri]");
+        my $sn  = $so->{slot};
+        my $idx = $ref->{index};
+        my $s_findings = $so->{obj}{findings} || [];
+        die "findings[$mi].merged_from[$ri].index ($idx) out of bounds for slot $sn\n"
+          unless defined($idx) && $idx =~ /\A(?:0|[1-9][0-9]*)\z/ && $idx < scalar(@$s_findings);
+        die "findings[$mi].merged_from cites slot $sn more than once (cannot collapse multiple findings from one slot)\n"
+          if $in_this_item{$sn}++;
+        my $ckey = "$sn\0$idx";
+        die "slot $sn findings[$idx] is claimed by more than one merged finding (duplicate substitution forbidden)\n"
+          if $claimed_f{$ckey}++;
+        my $orig = $s_findings->[$idx];
+        my $ork  = $rank{$orig->{severity}} // 0;
+        die "findings[$mi] severity ($mf->{severity}) downgrades slot $sn findings[$idx] ($orig->{severity})\n"
+          if $mrk < $ork;
+        my $oreo = $orig->{reopens} // "";
+        if (length $oreo) {
+          die "findings[$mi] drops or alters reopens '\''$oreo'\'' from slot $sn findings[$idx]\n"
+            unless ($mf->{reopens} // "") eq $oreo;
         }
-        return 0;
-      };
-      for my $u (0 .. $n_left - 1) {
-        my @vis = (0) x $n_right;
-        return 0 unless $dfs->($u, \@vis);
+        my $olocs = $finding_locs->($orig);
+        for my $loc (sort keys %$olocs) {
+          die "findings[$mi] omits location/instance '\''$loc'\'' from slot $sn findings[$idx]\n"
+            unless $mf_locs->{$loc};
+        }
+        if (!(length($oreo) && ($mf->{reopens} // "") eq $oreo)) {
+          die "findings[$mi] lacks root-cause correspondence with slot $sn findings[$idx] (\x27$orig->{title}\x27)\n"
+            unless $finding_corresponds->($orig, $mf);
+        }
+        $claimed_blocking_f{$ckey} = 1 if $is_blocking->($mf->{severity});
       }
-      return 1;
-    };
-
-    my $has_src = sub {
-      my ($item, $sn, $mtag) = @_;
-      for my $src (@{$item->{sources} || []}) {
-        return 1 if $src eq $sn || $src eq $mtag;
+      if (@$mfrom >= 2) {
+        die "findings[$mi] merges " . scalar(@$mfrom) . " slots and requires non-empty merge_rationale\n"
+          unless defined($mf->{merge_rationale}) && $mf->{merge_rationale} =~ /\S/;
       }
-      return 0;
-    };
+      my %src_slots;
+      for my $s (@$srcs) {
+        my $so = $resolve_slot->($s, "findings[$mi].sources");
+        $src_slots{$so->{slot}} = 1;
+      }
+      for my $sn (keys %in_this_item) {
+        die "findings[$mi].sources omits contributing slot $sn from merged_from[]\n" unless $src_slots{$sn};
+      }
+      for my $sn (keys %src_slots) {
+        die "findings[$mi].sources cites slot $sn not present in merged_from[]\n" unless $in_this_item{$sn};
+      }
+    }
 
+    # 2. Validate explicit merged_from[] provenance, class union, and approach_change correspondence on step_back[].
+    for my $si (0 .. $#m_sbs) {
+      my $msb = $m_sbs[$si];
+      my $mfrom = $msb->{merged_from};
+      die "merged step_back[$si] requires non-empty merged_from[] provenance in multi-reviewer council mode\n"
+        unless ref($mfrom) eq "ARRAY" && @$mfrom >= 1;
+      my $srcs = $msb->{sources};
+      die "merged step_back[$si] requires non-empty sources[] in multi-reviewer council mode\n"
+        unless ref($srcs) eq "ARRAY" && @$srcs >= 1;
+      my %got_cls = map { $_ => 1 } @{$msb->{classes} || []};
+      my %in_this_item;
+      for my $ri (0 .. $#$mfrom) {
+        my $ref = $mfrom->[$ri];
+        my $so  = $resolve_slot->($ref->{slot}, "step_back[$si].merged_from[$ri]");
+        my $sn  = $so->{slot};
+        my $idx = $ref->{index};
+        my $s_sbs = $so->{obj}{step_back} || [];
+        die "step_back[$si].merged_from[$ri].index ($idx) out of bounds for slot $sn\n"
+          unless defined($idx) && $idx =~ /\A(?:0|[1-9][0-9]*)\z/ && $idx < scalar(@$s_sbs);
+        die "step_back[$si].merged_from cites slot $sn more than once (cannot collapse multiple proposals from one slot)\n"
+          if $in_this_item{$sn}++;
+        my $ckey = "$sn\0$idx";
+        die "slot $sn step_back[$idx] is claimed by more than one merged proposal (duplicate substitution forbidden)\n"
+          if $claimed_sb{$ckey}++;
+        my $orig = $s_sbs->[$idx];
+        for my $c (@{$orig->{classes} || []}) {
+          die "step_back[$si] omits class '\''$c'\'' from slot $sn step_back[$idx]\n" unless $got_cls{$c};
+        }
+        die "step_back[$si].approach_change does not correspond to slot $sn step_back[$idx] (\x27$orig->{name}\x27)\n"
+          unless $sb_corresponds->($orig, $msb);
+      }
+      if (@$mfrom >= 2) {
+        die "step_back[$si] merges " . scalar(@$mfrom) . " slots and requires non-empty merge_rationale\n"
+          unless defined($msb->{merge_rationale}) && $msb->{merge_rationale} =~ /\S/;
+      }
+      my %src_slots;
+      for my $s (@$srcs) {
+        my $so = $resolve_slot->($s, "step_back[$si].sources");
+        $src_slots{$so->{slot}} = 1;
+      }
+      for my $sn (keys %in_this_item) {
+        die "step_back[$si].sources omits contributing slot $sn from merged_from[]\n" unless $src_slots{$sn};
+      }
+      for my $sn (keys %src_slots) {
+        die "step_back[$si].sources cites slot $sn not present in merged_from[]\n" unless $in_this_item{$sn};
+      }
+    }
+
+    # 3. Verify 100% coverage of EVERY undismissed blocking finding and EVERY step_back[] proposal across all valid slots.
     my @unaccounted;
     for my $vs (@valid_slots) {
-      my $sn = $vs->{slot};
-      my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
-
-      # 1. Per-finding 1-to-1 identity-bound blocking matching (severity >=, reopens, AND location/instance/title identity!).
-      my @need_f;
-      for my $f (@{$vs->{obj}{findings} || []}) {
+      my $sn   = $vs->{slot};
+      my $mtag = $vs->{mtag};
+      my $s_findings = $vs->{obj}{findings} || [];
+      for my $idx (0 .. $#$s_findings) {
+        my $f = $s_findings->[$idx];
         next unless $is_blocking->($f->{severity});
         next if $consume_dismissal->($sn, $mtag, $f);
-        push @need_f, $f;
-      }
-      if (@need_f) {
-        my @cand_mf = grep { $is_blocking->($_->{severity}) && $has_src->($_, $sn, $mtag) } @m_findings;
-        my @need_locs = map { $finding_locs->($_) } @need_f;
-        my @cand_locs = map { $finding_locs->($_) } @cand_mf;
-        # Detect if multiple undismissed findings in this slot share overlapping locations (require title/pattern identity too).
-        my @same_loc_peer = (0) x scalar(@need_f);
-        for my $i (0 .. $#need_f) {
-          for my $k ($i + 1 .. $#need_f) {
-            if ($locs_overlap->($need_locs[$i], $need_locs[$k])) {
-              $same_loc_peer[$i] = 1;
-              $same_loc_peer[$k] = 1;
-            }
-          }
-        }
-        my @adj;
-        for my $i (0 .. $#need_f) {
-          my $nf = $need_f[$i];
-          my $nrk = $rank{$nf->{severity}} // 0;
-          my $nreo = $nf->{reopens} // "";
-          my @edges;
-          for my $j (0 .. $#cand_mf) {
-            my $mf = $cand_mf[$j];
-            my $mrk = $rank{$mf->{severity}} // 0;
-            next if $mrk < $nrk;
-            if (length $nreo) {
-              next unless ($mf->{reopens} // "") eq $nreo;
-            } else {
-              my $loc_ok = $locs_overlap->($need_locs[$i], $cand_locs[$j]);
-              my $id_ok  = $text_matches->($nf->{title}, $mf->{title}) || $text_matches->($nf->{pattern}, $mf->{pattern});
-              next unless $loc_ok || $text_matches->($nf->{title}, $mf->{title});
-              next if $same_loc_peer[$i] && !$id_ok;
-            }
-            push @edges, $j;
-          }
-          push @adj, \@edges;
-        }
-        if (!$has_perfect_matching->(scalar(@need_f), scalar(@cand_mf), \@adj)) {
-          my @titles = map { "$_->{severity}:" . (length($_->{reopens} // "") ? "$_->{reopens}:" : "") . $_->{title} } @need_f;
-          push @unaccounted, "slot $sn ($mtag) has " . scalar(@need_f) . " undismissed blocking finding(s) [" . join(", ", @titles) . "] not matched 1-to-1 by identity/instances in merged findings[].sources at >= severity without evidenced --dismissed-findings";
+        if (!$claimed_blocking_f{"$sn\0$idx"}) {
+          push @unaccounted, "slot $sn ($mtag) blocking finding[$idx] ($f->{severity}:$f->{title}) not claimed by any merged blocking finding via merged_from[] without evidenced --dismissed-findings";
         }
       }
-
-      # 2. Per-proposal 1-to-1 identity-bound step_back[] binding (sources, class-set superset, AND proposal identity!).
-      my @slot_sbs = @{$vs->{obj}{step_back} || []};
-      if (@slot_sbs) {
-        my @cand_sbs = grep { $has_src->($_, $sn, $mtag) } @m_sbs;
-        my @adj;
-        for my $i (0 .. $#slot_sbs) {
-          my $sb = $slot_sbs[$i];
-          my %need_cls = map { $_ => 1 } @{$sb->{classes} || []};
-          my @edges;
-          for my $j (0 .. $#cand_sbs) {
-            my $msb = $cand_sbs[$j];
-            my %got_cls = map { $_ => 1 } @{$msb->{classes} || []};
-            my $ok_cls = 1;
-            for my $c (keys %need_cls) {
-              if (!$got_cls{$c}) { $ok_cls = 0; last; }
-            }
-            next unless $ok_cls;
-            next unless $text_matches->($sb->{name}, $msb->{name}) || $text_matches->($sb->{approach_change}, $msb->{approach_change});
-            push @edges, $j;
-          }
-          push @adj, \@edges;
-        }
-        if (!$has_perfect_matching->(scalar(@slot_sbs), scalar(@cand_sbs), \@adj)) {
-          push @unaccounted, "slot $sn ($mtag) reported " . scalar(@slot_sbs) . " step_back[] proposal(s) not preserved 1-to-1 by class/proposal identity in merged step_back[]";
+      my $s_sbs = $vs->{obj}{step_back} || [];
+      for my $idx (0 .. $#$s_sbs) {
+        my $sb = $s_sbs->[$idx];
+        if (!$claimed_sb{"$sn\0$idx"}) {
+          push @unaccounted, "slot $sn ($mtag) step_back[$idx] ($sb->{name}) not claimed by any merged step_back[] via merged_from[]";
         }
       }
     }
     if (@unaccounted) {
       die join("; ", @unaccounted) . "\n";
     }
-  ' "$af" "$d" "$snap_merged" "$SKIP_P3" "$mode" "$snap_dism" "$snap_merged_sha" "$snap_dism_sha" 2>&1)
+  ' -- "$af" "$d" "$snap_merged" "$SKIP_P3" "$mode" "$snap_dism" "$snap_merged_sha" "$snap_dism_sha" 2>&1)
   brc=$?
   if [ "$brc" -ne 0 ]; then
-    mv -- "$snap_merged" "$res" 2>/dev/null && chmod 0644 "$res" 2>/dev/null || rm -f -- "$snap_merged"
+    mv -f -- "$snap_merged" "$res" 2>/dev/null && chmod 0600 -- "$res" 2>/dev/null || rm -f -- "$snap_merged"
     rm -f -- "$snap_dism"
     bind_err=$(printf '%s' "$bind_err" | tr '\n' ' ')
     printf 'VERDICT=error\nREASON=%s\nRESULT=%s\n' "$bind_err" "$res"
     exit 5
   fi
 
-  # Atomically commit the exact verified snapshot to $res (and dismissed-findings.json) + post-verify!
+  # Atomically commit the exact verified private snapshot (owner-only 0600) to $res (and dismissed-findings.json) + post-verify!
   if [ -d "$res" ] || [ -L "$res" ]; then
     rm -f -- "$snap_merged" "$snap_dism"
     printf 'VERDICT=error\nREASON=refusing directory or symlink at %s\n' "$res"
     exit 5
   fi
-  mv -- "$snap_merged" "$res" || { rm -f -- "$snap_merged" "$snap_dism"; die "cannot commit merged result to $res"; }
-  chmod 0644 "$res" 2>/dev/null || true
+  mv -f -- "$snap_merged" "$res" || { rm -f -- "$snap_merged" "$snap_dism"; die "cannot commit merged result to $res"; }
+  chmod 0600 -- "$res" 2>/dev/null || true
   post_msha=$(perl -MDigest::SHA=sha256_hex -e '
     exit 1 if -l $ARGV[0] || !-f $ARGV[0];
     open(my $fh, "<:raw", $ARGV[0]) or exit 1;
     local $/; my $b = <$fh>; close $fh or exit 1;
     print sha256_hex(defined $b ? $b : "");
-  ' "$res") || { rm -f -- "$snap_dism"; die "finish: post-move hash failed on $res"; }
+  ' -- "$res") || { rm -f -- "$snap_dism"; die "finish: post-move hash failed on $res"; }
   [ "$post_msha" = "$snap_merged_sha" ] || { rm -f -- "$snap_dism"; die "finish: post-move byte verification failed on $res"; }
   if [ -n "$snap_dism" ]; then
     if [ -d "$dism_archive" ] || [ -L "$dism_archive" ]; then
       rm -f -- "$snap_dism"
       die "finish: refusing directory or symlink at $dism_archive"
     fi
-    mv -- "$snap_dism" "$dism_archive" || { rm -f -- "$snap_dism"; die "cannot archive dismissed findings"; }
-    chmod 0644 "$dism_archive" 2>/dev/null || true
+    mv -f -- "$snap_dism" "$dism_archive" || { rm -f -- "$snap_dism"; die "cannot archive dismissed findings"; }
+    chmod 0600 -- "$dism_archive" 2>/dev/null || true
     post_dsha=$(perl -MDigest::SHA=sha256_hex -e '
       exit 1 if -l $ARGV[0] || !-f $ARGV[0];
       open(my $fh, "<:raw", $ARGV[0]) or exit 1;
       local $/; my $b = <$fh>; close $fh or exit 1;
       print sha256_hex(defined $b ? $b : "");
-    ' "$dism_archive") || die "finish: post-move hash failed on $dism_archive"
+    ' -- "$dism_archive") || die "finish: post-move hash failed on $dism_archive"
     [ "$post_dsha" = "$snap_dism_sha" ] || die "finish: post-move byte verification failed on $dism_archive"
   fi
   pv() { printf '%s\n' "$parsed" | sed -n "s/^$1=//p"; }
@@ -2570,7 +2655,7 @@ cmd_finish() {
     open(my $oh, ">:raw", $out) or die "cannot write $out\n";
     print $oh $J->pretty->canonical->encode($obj);
     close $oh or die "cannot close $out\n";
-  ' "$af" "$tx_dir/active_round.json" "$verdict" "$partial_reason" || die "cannot prepare tx active_round.json"
+  ' -- "$af" "$tx_dir/active_round.json" "$verdict" "$partial_reason" || die "cannot prepare tx active_round.json"
 
   {
     cat "$LEDGER"
@@ -2881,7 +2966,7 @@ cmd_tree_clean() {
   printf 'TREE=clean\nIGNORED_HANDOFFS=%s\n' "$ignored"
 }
 
-cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
+cmd_paths() { resolve_paths; validate_branch_ownership; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
 
 sub="${1:-}"
 case "$sub" in

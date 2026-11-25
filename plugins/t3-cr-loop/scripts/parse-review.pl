@@ -189,8 +189,30 @@ sub parse_sources {
   return () unless exists $obj->{sources};
   my @srcs = map { one_line(str_node($_, "$what.sources[]")) } arr_node($obj->{sources}, "$what.sources");
   @srcs or fail("$what.sources must not be empty when present");
-  for my $s (@srcs) { length($s) or fail("$what.sources[] must not be empty"); }
+  for my $s (@srcs) { $s =~ /\S/ or fail("$what.sources[] must not be blank"); }
   return @srcs;
+}
+
+sub validate_merged_meta {
+  my ($obj, $what) = @_;
+  if (exists $obj->{merged_from}) {
+    my @refs = arr_node($obj->{merged_from}, "$what.merged_from");
+    @refs or fail("$what.merged_from must not be empty when present");
+    my $ri = 0;
+    for my $rn (@refs) {
+      $ri++;
+      my $ro = obj_node($rn, "$what.merged_from[$ri]");
+      check_keys($ro, "$what.merged_from[$ri]", [qw(slot index)], []);
+      my $rs = one_line(str_node($ro->{slot}, "$what.merged_from[$ri].slot"));
+      $rs =~ /\S/ or fail("$what.merged_from[$ri].slot must not be blank");
+      my $idx_n = $ro->{index};
+      (defined $idx_n && $idx_n->[0] eq 'num' && $idx_n->[1] =~ /\A(?:0|[1-9][0-9]*)\z/)
+        or fail("$what.merged_from[$ri].index must be a non-negative integer");
+    }
+  }
+  if (exists $obj->{merge_rationale}) {
+    str_node($obj->{merge_rationale}, "$what.merge_rationale");
+  }
 }
 
 check_keys($r, 'root', [qw(summary verdict findings step_back out_of_scope)], []);
@@ -204,7 +226,8 @@ my @oos       = arr_node($r->{out_of_scope}, 'out_of_scope');
 if ($verdict eq 'clean' && @findings)     { fail('verdict is clean but findings is not empty'); }
 if ($verdict eq 'findings' && !@findings) { fail('verdict is findings but findings is empty'); }
 
-my @opt_src = $allow_sources ? ('sources') : ();
+my @opt_src    = $allow_sources ? ('sources') : ();
+my @opt_merged = $allow_sources ? ('sources', 'merged_from', 'merge_rationale') : ();
 my %known;
 if (!$validate_only && open(my $lf, '<:encoding(UTF-8)', $ledger)) {
   while (<$lf>) { $known{$1} = 1 if /^### (C\d+)\b/; }
@@ -218,7 +241,7 @@ my $i = 0;
 for my $fn (@findings) {
   $i++;
   my $f = obj_node($fn, "findings[$i]");
-  check_keys($f, "findings[$i]", [qw(severity reopens title location pattern still_wrong instances fix prevent)], \@opt_src);
+  check_keys($f, "findings[$i]", [qw(severity reopens title location pattern still_wrong instances fix prevent)], \@opt_merged);
   my $sev = str_node($f->{severity}, "findings[$i].severity");
   exists $count{$sev} or fail("findings[$i].severity must be P0..P3 (got '$sev')");
   my $reopens = str_node($f->{reopens}, "findings[$i].reopens");
@@ -234,6 +257,7 @@ for my $fn (@findings) {
   my @inst = map { one_line(str_node($_, "findings[$i].instances[]")) } arr_node($f->{instances}, "findings[$i].instances");
   @inst or fail("findings[$i].instances is empty — every class must list its instances");
   my @srcs = parse_sources($f, "findings[$i]");
+  validate_merged_meta($f, "findings[$i]");
   $count{$sev}++;
 
   if (!$validate_only) {
@@ -262,13 +286,14 @@ my $j = 0;
 for my $sn (@step_back) {
   $j++;
   my $s = obj_node($sn, "step_back[$j]");
-  check_keys($s, "step_back[$j]", [qw(classes name invites_because approach_change prevent)], \@opt_src);
+  check_keys($s, "step_back[$j]", [qw(classes name invites_because approach_change prevent)], \@opt_merged);
   my @ids = map { one_line(str_node($_, "step_back[$j].classes[]")) } arr_node($s->{classes}, "step_back[$j].classes");
   my %v;
   for my $k (qw(name invites_because approach_change prevent)) {
     $v{$k} = one_line(str_node($s->{$k}, "step_back[$j].$k"));
   }
   my @srcs = parse_sources($s, "step_back[$j]");
+  validate_merged_meta($s, "step_back[$j]");
   my $src_tag = @srcs ? ' (sources: ' . join(', ', @srcs) . ')' : '';
   push @sb_lines, '- [' . join(', ', @ids) . "] $v{name}$src_tag — Invites it because: $v{invites_because} — Approach change: $v{approach_change} — Prevent: $v{prevent}";
 }
