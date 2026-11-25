@@ -603,5 +603,83 @@ expect "space-safe worktree parser preserves spaces in path" "$REAL_SPACE_WT" "$
 git worktree remove -f "$SPACE_WT" >/dev/null 2>&1
 git branch -D space-target >/dev/null 2>&1
 
+# --- Round 3 hardening regressions: CAS merge TOCTOU, git SIGTERM UNBORN trap, unborn stderr silence ---
+
+# 9. CAS merge protocol aborts atomically when target ref rewinds A -> B after coverage check!
+CAS_REPO="$TMP/cas-merge-repo"
+CAS_MAIN_WT="$TMP/cas-main-wt"
+mkdir -p "$CAS_REPO"
+(
+  cd "$CAS_REPO" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'b\n' > f.txt && git add f.txt && git commit -qm "commit B"
+  B_SHA=$(git rev-parse HEAD)
+  printf 'a\n' >> f.txt && git commit -qam "commit A"
+  A_SHA=$(git rev-parse HEAD)
+  git switch -qc feat/cas
+  printf 'f\n' >> f.txt && git commit -qam "commit F"
+  F_SHA=$(git rev-parse HEAD)
+  git worktree add -q "$CAS_MAIN_WT" main >/dev/null 2>&1
+  # Coverage check pins EXPECTED_TARGET_SHA=A_SHA
+  EXPECTED_TARGET_SHA=$(git rev-parse --verify refs/heads/main)
+  [ "$EXPECTED_TARGET_SHA" = "$A_SHA" ] || exit 11
+  # Concurrent rewind moves main from A -> B right before ref update!
+  git -C "$CAS_MAIN_WT" checkout -q --detach "$EXPECTED_TARGET_SHA"
+  git -C "$CAS_MAIN_WT" merge -q --ff-only "$F_SHA"
+  NEW_TARGET_SHA=$(git -C "$CAS_MAIN_WT" rev-parse HEAD)
+  git update-ref refs/heads/main "$B_SHA" "$A_SHA"
+  # Atomic CAS update-ref MUST FAIL because refs/heads/main is now B_SHA != EXPECTED_TARGET_SHA!
+  if git -C "$CAS_MAIN_WT" update-ref refs/heads/main "$NEW_TARGET_SHA" "$EXPECTED_TARGET_SHA" 2>/dev/null; then
+    exit 12
+  fi
+  git -C "$CAS_MAIN_WT" checkout -q main
+  [ "$(git rev-parse refs/heads/main)" = "$B_SHA" ] || exit 13
+) && ok || bad "CAS merge failed to abort on concurrent target rewind A -> B"
+
+# 10. SIGTERM on submodule git rev-parse HEAD fails closed (NEVER misclassified as UNBORN)!
+SIG_GIT_BIN="$TMP/codex-git-sigterm"
+mkdir -p "$SIG_GIT_BIN"
+REAL_GIT=$(command -v git)
+cat > "$SIG_GIT_BIN/git" <<EOF
+#!/usr/bin/env bash
+is_sub=0; is_rp=0; is_head=0
+for arg in "\$@"; do
+  case "\$arg" in
+    *vendor/sub*) is_sub=1 ;;
+    rev-parse) is_rp=1 ;;
+    HEAD) is_head=1 ;;
+  esac
+done
+if [ "\$is_sub" = 1 ] && [ "\$is_rp" = 1 ] && [ "\$is_head" = 1 ]; then
+  kill -TERM \$\$
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$SIG_GIT_BIN/git"
+(
+  cd "$SUB_HOST" || exit 2
+  PATH="$SIG_GIT_BIN:$PATH" FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main >/dev/null 2>&1
+)
+rc_sig=$?
+[ "$rc_sig" -ne 0 ] && ok || bad "cr-review.sh start exited 0 despite SIGTERM on submodule rev-parse HEAD!"
+
+# 11. Unborn nested gitdir produces ZERO 'fatal: Needed a single revision' stderr leakage in tree_fp_v2!
+UNB_HOST="$TMP/unborn-nested-host"
+mkdir -p "$UNB_HOST/nested-unborn"
+(
+  cd "$UNB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'h1\n' > h.txt && git add h.txt && git commit -qm h1
+  git switch -qc feat/unb
+  printf 'h2\n' >> h.txt && git commit -qam h2
+  (cd nested-unborn && git init -q -b main .)
+  printf 'unb-1\n' > nested-unborn/x.txt
+  err_unb=$(FAKE_OUT="$F_CLEAN" bash "$CR" start --mode full --base main 2>&1 >/dev/null)
+  rc_u=$?
+  bash "$CR" wait --timeout 30 >/dev/null 2>&1
+  bash "$CR" cancel >/dev/null 2>&1 || true
+  [ "$rc_u" -eq 0 ] && ! printf '%s' "$err_unb" | grep -q "fatal: Needed a single revision"
+) && ok || bad "unborn nested gitdir leaked stderr or failed start in cr-review.sh"
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

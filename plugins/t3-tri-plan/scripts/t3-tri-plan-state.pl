@@ -8,7 +8,7 @@ use utf8;
 use Cwd qw(abs_path getcwd);
 use Digest::SHA qw(sha256_hex);
 use Encode qw(decode encode FB_CROAK LEAVE_SRC);
-use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
+use Fcntl qw(:flock O_RDWR O_CREAT O_NONBLOCK F_GETFD F_SETFD FD_CLOEXEC);
 use File::Basename qw(dirname basename);
 use File::Path qw(make_path);
 use File::Spec ();
@@ -77,6 +77,20 @@ sub _decode_cli_text {
   my $dec = eval { decode('UTF-8', $raw, FB_CROAK | LEAVE_SRC) };
   die_err("invalid UTF-8 bytes in $flag") if $@;
   return $dec;
+}
+
+# Join a raw OS-byte base path with decoded logical relative segments, keeping the result pure raw OS bytes (SvUTF8=0).
+sub _fs_join {
+  my ($base_bytes, @rel_chars) = @_;
+  return File::Spec->catfile($base_bytes, map { encode('UTF-8', $_) } @rel_chars);
+}
+
+# Decode a raw OS-byte path to Perl characters before printing to :encoding(UTF-8) STDOUT/STDERR (prevents double-encoding!).
+sub _display_path {
+  my ($bytes) = @_;
+  return '' unless defined $bytes;
+  my $dec = eval { decode('UTF-8', $bytes, FB_CROAK | LEAVE_SRC) };
+  return $@ ? $bytes : $dec;
 }
 
 sub _decode_wait_status {
@@ -194,11 +208,10 @@ sub _with_activation_lock_guard {
 }
 
 sub _guard_phase6_not_in_flight {
-  my ($st, $op_name, %opts) = @_;
+  my ($st, $op_name) = @_;
   return unless ref($st) eq 'HASH' && ref($st->{phases}) eq 'HASH' && ref($st->{phases}{'6'}) eq 'HASH';
   my $p6_st = $st->{phases}{'6'}{state} // 'none';
   if ($p6_st eq 'activating' || $p6_st eq 'activation_uncertain') {
-    return if $opts{allow_uncertain} && $p6_st eq 'activation_uncertain';
     die_err("cannot run $op_name while Phase 6 is '$p6_st' — run recover-activation, cancel-activating, or resolve-activation first", 3);
   }
 }
@@ -447,14 +460,14 @@ sub cmd_config_set {
   }
   my $ucfg = user_config_path();
   write_atomic_bytes($ucfg, encode_canonical($u), 0600);
-  print "CONFIG_SAVED=$ucfg\n";
+  print "CONFIG_SAVED=" . _display_path($ucfg) . "\n";
 }
 
 sub cmd_config_authorize_provider {
   my ($pid) = @_;
   die_err("config-authorize-provider requires <providerInstanceId>") unless defined $pid && length $pid;
   my $ucfg = user_config_path();
-  die_err("user config does not exist: $ucfg") unless -f $ucfg;
+  die_err("user config does not exist: " . _display_path($ucfg)) unless -f $ucfg;
   my $u = load_json_file($ucfg);
   my %seen = map { $_ => 1 } @{$u->{authorizedProviders} || []};
   push @{$u->{authorizedProviders}}, $pid unless $seen{$pid};
@@ -466,15 +479,23 @@ sub cmd_config_authorize_provider {
 sub cmd_config_show {
   my %opt = @_;
   my $ucfg = user_config_path();
-  my $repo = resolve_repo_root($opt{repo}, undef);
+  my $st_ro;
+  if (defined $opt{task} && -d $opt{task} && !-l $opt{task}) {
+    my $rt = abs_path($opt{task});
+    if (defined $rt && -f "$rt/research/plans/planning-state.json" && !-l "$rt/research/plans/planning-state.json") {
+      my $loaded = eval { load_json_file("$rt/research/plans/planning-state.json") };
+      $st_ro = $loaded if !$@ && ref $loaded eq 'HASH';
+    }
+  }
+  my $repo = resolve_repo_root($opt{repo}, $opt{task});
   my $pcfg_on_disk = (-f "$repo/.t3-tri-plan.json") ? "$repo/.t3-tri-plan.json" : '';
-  my $ign_proj = _effective_ignore_project_config(undef, \%opt);
+  my $ign_proj = _effective_ignore_project_config($st_ro, \%opt);
   my $pcfg = ($ign_proj ? '' : $pcfg_on_disk);
 
   if (!-f $ucfg) {
     print "CONFIGURED=0\n";
-    print "USER_CONFIG=$ucfg\n";
-    print "PROJECT_CONFIG=$pcfg\n" if length $pcfg;
+    print "USER_CONFIG=" . _display_path($ucfg) . "\n";
+    print "PROJECT_CONFIG=" . _display_path($pcfg) . "\n" if length $pcfg;
     print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj && length $pcfg_on_disk;
     return;
   }
@@ -811,8 +832,8 @@ sub cmd_config_show {
   };
 
   print "CONFIGURED=1\nCONFIG_VALID=1\n";
-  print "USER_CONFIG=$ucfg\n";
-  print "PROJECT_CONFIG=$pcfg\n" if length $pcfg;
+  print "USER_CONFIG=" . _display_path($ucfg) . "\n";
+  print "PROJECT_CONFIG=" . _display_path($pcfg) . "\n" if length $pcfg;
   print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj && length $pcfg_on_disk;
   print "PROJECT_OVERRIDDEN=$proj_overrode\n";
   print "NEEDS_PROVIDER_AUTH=" . (@unauth ? 1 : 0) . "\n";
@@ -991,7 +1012,7 @@ sub cmd_preflight_trellis {
   my $task_py = "$repo/.trellis/scripts/task.py";
   if (!-d "$repo/.trellis") {
     print "TRELLIS_COMPAT=unsupported\n";
-    print "REASON=no .trellis directory at $repo\n";
+    print "REASON=no .trellis directory at " . _display_path($repo) . "\n";
     exit 3;
   }
   if (!-f $task_py) {
@@ -1016,14 +1037,14 @@ sub cmd_preflight_trellis {
   if ($rc_h != 0 || @missing_sub) {
     print "TRELLIS_COMPAT=unsupported\n";
     print "MISSING_SUBCOMMANDS=" . join(',', @missing_sub) . "\n" if @missing_sub;
-    print "TASK_PY=$task_py\n";
+    print "TASK_PY=" . _display_path($task_py) . "\n";
     exit 3;
   }
 
   my $compat = ($ctx_mode eq 'session' && $has_cur_json) ? 'ok' : 'degraded';
   print "TRELLIS_COMPAT=$compat\n";
-  print "REPO_ROOT=$repo\n";
-  print "TASK_PY=$task_py\n";
+  print "REPO_ROOT=" . _display_path($repo) . "\n";
+  print "TASK_PY=" . _display_path($task_py) . "\n";
   print "HAS_WORKFLOW_MD=" . (-f "$repo/.trellis/workflow.md" ? 1 : 0) . "\n";
   print "HAS_CURRENT_JSON=$has_cur_json\n";
   print "HAS_CURRENT_SOURCE=$has_cur_source\n";
@@ -1054,7 +1075,7 @@ sub cmd_inspect_task {
     if (!-f $sf) {
       my $kind = $has_legacy_files ? 'LEGACY_DUAL_PLAN' : 'NEW';
       print "TASK_KIND=$kind\n";
-      print "TASK_DIR=$real_task\n";
+      print "TASK_DIR=" . _display_path($real_task) . "\n";
       print "PENDING_TX=$has_pending_tx\n";
       print "ACTIVE_RUN=$has_active_run\n";
       return;
@@ -1073,7 +1094,7 @@ sub cmd_inspect_task {
       $st = load_json_file($sf);
       my $p6 = (ref($st->{phases}) eq 'HASH' && ref($st->{phases}{'6'}) eq 'HASH') ? $st->{phases}{'6'} : {};
       print "TASK_KIND=TRI_PLAN\n";
-      print "TASK_DIR=$real_task\n";
+      print "TASK_DIR=" . _display_path($real_task) . "\n";
       print "GENERATION=" . ($st->{generation} // 0) . "\n";
       print "OWNER_GENERATION=" . ($st->{owner_generation} // 0) . "\n";
       print "TX_RECOVERED=$tx_rec\n";
@@ -1082,7 +1103,7 @@ sub cmd_inspect_task {
       print "MIGRATED_FROM_LEGACY=" . ($st->{migrated_from_legacy} ? 1 : 0) . "\n";
     } else {
       print "TASK_KIND=LEGACY_DUAL_PLAN\n";
-      print "TASK_DIR=$real_task\n";
+      print "TASK_DIR=" . _display_path($real_task) . "\n";
       print "PENDING_TX=0\n";
       print "ACTIVE_RUN=0\n";
       print "RECOMMENDATION=Continue on /trellis:dual-plan, or run migrate-legacy --confirm to import with strict re-verification\n";
@@ -1267,7 +1288,16 @@ sub cmd_commit_phase0 {
           my $old_gen = $st->{generation} // 1;
           my $tx_id = "tx-p0-auth-" . time() . "-$$";
           $st->{authorization}         = $opt{authorization} if $auth_chg;
-          $st->{ignore_project_config} = $ign_proj ? JSON::PP::true : JSON::PP::false if $ign_toggled;
+          if ($ign_toggled) {
+            $st->{ignore_project_config} = $ign_proj ? JSON::PP::true : JSON::PP::false;
+            if (ref($st->{review}) eq 'HASH') {
+              my $extra_sb = defined($st->{review}{extra_step_backs_granted})
+                ? int($st->{review}{extra_step_backs_granted})
+                : scalar(@{$st->{review}{extra_step_back_authorizations} || []});
+              $st->{review}{round_cap}              = $knobs->{roundCap};
+              $st->{review}{max_step_backs_allowed} = $knobs->{maxStepBacks} + $extra_sb;
+            }
+          }
           $st->{last_tx_id}            = $tx_id;
           execute_tx($real_task, $plans_dir, {
             tx_id               => $tx_id,
@@ -1304,6 +1334,13 @@ sub cmd_commit_phase0 {
         $st->{wording_equivalent_prd_shas} = [ sort keys %eq ];
         $st->{effective_prd_sha256}        = $prd_sha;
         $st->{ignore_project_config}       = $ign_proj ? JSON::PP::true : JSON::PP::false;
+        if (ref($st->{review}) eq 'HASH') {
+          my $extra_sb = defined($st->{review}{extra_step_backs_granted})
+            ? int($st->{review}{extra_step_backs_granted})
+            : scalar(@{$st->{review}{extra_step_back_authorizations} || []});
+          $st->{review}{round_cap}              = $knobs->{roundCap};
+          $st->{review}{max_step_backs_allowed} = $knobs->{maxStepBacks} + $extra_sb;
+        }
         $st->{phases}{'0'}{effective_prd_sha256} = $prd_sha;
         $st->{phases}{'0'}{prd}            = $prd_sha;
         $st->{last_tx_id}                  = $tx_id;
@@ -1320,15 +1357,15 @@ sub cmd_commit_phase0 {
         return;
       }
 
-      # Material PRD change: state-first tx (block uninspected 'activating', allow explicit supersede from 'activation_uncertain').
-      _guard_phase6_not_in_flight($st, 'commit-phase0 --change-kind material', allow_uncertain => 1);
+      # Material PRD change: state-first tx (MUST NOT bypass activating or activation_uncertain — resolve Phase 6 first!).
+      _guard_phase6_not_in_flight($st, 'commit-phase0 --change-kind material');
       die_err("--change-kind material requires --reason <summary>")
         unless defined $opt{reason} && $opt{reason} =~ /\S/;
       my $next_gen = $old_gen + 1;
       my $tx_id    = "tx-p0-mat-" . time() . "-$$-" . int(rand(10000));
       my $short8   = substr($cur_eff_prd, 0, 8);
       my $sup_rel  = "research/plans/superseded-${short8}-${tx_id}";
-      while (-e "$real_task/$sup_rel") {
+      while (-e _fs_join($real_task, $sup_rel)) {
         $sup_rel .= "-" . int(rand(1000));
       }
 
@@ -1696,7 +1733,7 @@ sub cmd_prepare_judge {
     });
 
     print "RUN_ID=$run_id\nPHASE=phase2-judge\nGENERATION=$gen\nOWNER_GENERATION=$st->{owner_generation}\n";
-      print "CANDIDATES_MANIFEST=$real_task/$cand_manifest_rel\n";
+      print "CANDIDATES_MANIFEST=" . _display_path($real_task) . "/$cand_manifest_rel\n";
     });
   });
 }
@@ -1755,8 +1792,9 @@ sub cmd_prepare_review {
     );
     if ($opt{mode} eq 'incremental') {
       my $prev = $st->{review}{last_reviewed_snapshot} // '';
+      my $prev_abs = length($prev) ? _fs_join($real_task, $prev) : '';
       die_err("incremental mode requires existing previous reviewed snapshot")
-        unless length $prev && -f "$real_task/$prev" && sha256_file("$real_task/$prev") eq ($st->{review}{last_reviewed_design_sha256} // '');
+        unless length $prev && -f $prev_abs && sha256_file($prev_abs) eq ($st->{review}{last_reviewed_design_sha256} // '');
       $round_inputs{prev_snapshot_rel}    = $prev;
       $round_inputs{prev_snapshot_sha256} = $st->{review}{last_reviewed_design_sha256};
     } else {
@@ -1866,10 +1904,11 @@ sub cmd_prepare_review {
 
     print "RUN_ID=$run_id\nPHASE=phase3-review\nROUND_NUM=$round_num\nMODE=$opt{mode}\nPURPOSE=$opt{purpose}\n";
     print "GENERATION=$gen\nOWNER_GENERATION=$st->{owner_generation}\n";
-    print "DESIGN_SNAPSHOT=$real_task/$snap_rel\nREVIEWED_DESIGN_SHA256=$design_sha\n";
-    print "FROZEN_LEDGER=$real_task/$frozen_led_rel\nLEDGER_MANIFEST=$real_task/$led_man_rel\n";
+    my $disp_task = _display_path($real_task);
+    print "DESIGN_SNAPSHOT=$disp_task/$snap_rel\nREVIEWED_DESIGN_SHA256=$design_sha\n";
+    print "FROZEN_LEDGER=$disp_task/$frozen_led_rel\nLEDGER_MANIFEST=$disp_task/$led_man_rel\n";
     print "REVIEW_BASELINE_SHA256=$baseline_sha\n";
-    print "PREV_SNAPSHOT=$real_task/$round_inputs{prev_snapshot_rel}\n" if length($round_inputs{prev_snapshot_rel} // '');
+    print "PREV_SNAPSHOT=$disp_task/$round_inputs{prev_snapshot_rel}\n" if length($round_inputs{prev_snapshot_rel} // '');
       print "SLOTS=" . join(',', sort keys %slots) . "\n";
     });
   });
@@ -2049,10 +2088,10 @@ sub _validate_slot_payload {
   if ($phase eq 'phase1-design') {
     ($rc, $out) = run_cmd_capture('perl', $VALIDATE_CAND, '--input', $input_file, '--write-canonical', $tmp_canon);
   } elsif ($phase eq 'phase2-judge') {
-    my $cm = "$real_task/$run->{candidates_manifest_rel}";
+    my $cm = _fs_join($real_task, $run->{candidates_manifest_rel});
     ($rc, $out) = run_cmd_capture('perl', $VALIDATE_JUDGE, '--input', $input_file, '--candidates-manifest', $cm, '--allow-forks', '--write-canonical', $tmp_canon);
   } elsif ($phase eq 'phase3-review') {
-    my $lm = "$real_task/$run->{ledger_manifest_rel}";
+    my $lm = _fs_join($real_task, $run->{ledger_manifest_rel});
     ($rc, $out) = run_cmd_capture(
       'perl', $PARSE_REVIEW,
       '--input', $input_file,
@@ -2080,7 +2119,7 @@ sub _ingest_result_common {
   for my $k (qw(task run_id generation owner owner_gen slot attempt child_run_id input)) {
     die_err("missing --$k") unless defined $opt{$k} && length $opt{$k};
   }
-  die_err("input file not found: $opt{input}") unless -f $opt{input};
+  die_err("input file not found or symlink: $opt{input}") unless -f $opt{input} && !-l $opt{input};
 
   with_task_lock($opt{task}, sub {
     my ($real_task, $plans_dir) = @_;
@@ -2096,6 +2135,13 @@ sub _ingest_result_common {
     my $run = load_json_file("$plans_dir/active-run.json");
     my $s   = $run->{slots}{$opt{slot}} // die_err("unknown slot '$opt{slot}'");
 
+    # Snapshot external --input ONCE into an isolated temp file (zero TOCTOU between hash, dup check, and validation!).
+    my $in_tmp_dir  = tempdir('t3-tri-in-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my $in_bytes    = read_raw_file($opt{input});
+    my $raw_in_sha  = sha256_bytes($in_bytes);
+    my $in_snap     = "$in_tmp_dir/input.bin";
+    write_atomic_bytes($in_snap, $in_bytes);
+
     # 2. Strict CAS BEFORE validating or writing ANY file!
     if ($s->{attempt} != $opt{attempt}) {
       print "STALE_CALLBACK=1\nREASON=attempt mismatch ($opt{attempt} != $s->{attempt})\n";
@@ -2108,8 +2154,7 @@ sub _ingest_result_common {
       if ($done_states{$s->{state}} &&
           ($s->{child_thread_id} // '') eq $opt{child_thread_id} &&
           ($s->{child_run_id} // '') eq $opt{child_run_id}) {
-        my $in_sha = sha256_file($opt{input});
-        if (($s->{raw_input_sha256} // '') eq $in_sha) {
+        if (($s->{raw_input_sha256} // '') eq $raw_in_sha) {
           print "DUPLICATE_NOOP=1\nSLOT=$opt{slot}\nSTATE=$s->{state}\n";
           return;
         }
@@ -2126,9 +2171,8 @@ sub _ingest_result_common {
         print "STALE_CALLBACK=1\nREASON=child_run_id mismatch ($opt{child_run_id} != $s->{child_run_id})\n";
         exit 4;
       }
-      my $in_sha = sha256_file($opt{input});
       if ($done_states{$s->{state}}) {
-        if (($s->{raw_input_sha256} // '') eq $in_sha) {
+        if (($s->{raw_input_sha256} // '') eq $raw_in_sha) {
           print "DUPLICATE_NOOP=1\nSLOT=$opt{slot}\nSTATE=$s->{state}\n";
           return;
         }
@@ -2140,9 +2184,8 @@ sub _ingest_result_common {
         unless $ok_st{$s->{state}};
     }
 
-    # 3. Validate payload now that lock + CAS succeeded.
-    my $raw_in_sha = sha256_file($opt{input});
-    my ($valid, $out_bytes, $ext, $err_reason, $kv) = _validate_slot_payload($real_task, $run, $opt{input});
+    # 3. Validate the SINGLE snapshot now that lock + CAS succeeded.
+    my ($valid, $out_bytes, $ext, $err_reason, $kv) = _validate_slot_payload($real_task, $run, $in_snap);
     my $out_sha = sha256_bytes($out_bytes);
     my $sha16   = substr($out_sha, 0, 16);
     my $res_rel = "research/plans/runs/$run->{run_id}/results/$opt{slot}-a$opt{attempt}-${sha16}.${ext}";
@@ -2180,7 +2223,7 @@ sub _ingest_result_common {
     });
 
     print "RESULT_RECORDED=1\nSLOT=$opt{slot}\nATTEMPT=$opt{attempt}\nSLOT_STATE=$s->{state}\n";
-    print "RESULT_FILE=$real_task/$res_rel\nRESULT_SHA256=$out_sha\n";
+    print "RESULT_FILE=" . _display_path($real_task) . "/$res_rel\nRESULT_SHA256=$out_sha\n";
     print "FORKS=$forks\n" if $run->{phase} eq 'phase2-judge';
     print "ERROR=$err_reason\n" if !$valid;
     exit($valid ? 0 : 1);
@@ -2488,8 +2531,8 @@ sub cmd_commit_phase1 {
       my (@writes, %cand_shas, %blind_map);
       for my $sn (@valid_slots) {
         my $s = $run->{slots}{$sn};
-        my $src_res = "$real_task/$s->{result_file}";
-        die_err("missing recorded result file $src_res") unless -f $src_res;
+        my $src_res = _fs_join($real_task, $s->{result_file});
+        die_err("missing recorded result file " . _display_path($src_res)) unless -f $src_res;
         my $bytes = read_raw_file($src_res);
         my $sha   = sha256_bytes($bytes);
         die_err("result digest mismatch for $sn") unless $sha eq $s->{result_sha256};
@@ -2591,8 +2634,8 @@ sub cmd_commit_phase2a {
         die_err("judge slot is '$js->{state}', expected 'completed_valid'", 3) unless ($js->{state} // '') eq 'completed_valid';
         my $expected_sha = $js->{result_sha256} // '';
         die_err("missing recorded judge result_sha256", 3) unless $expected_sha =~ /\A[0-9a-f]{64}\z/;
-        my $slot_res = "$real_task/$js->{result_file}";
-        die_err("missing judge result file $slot_res", 3) unless -f $slot_res && !-l $slot_res;
+        my $slot_res = _fs_join($real_task, $js->{result_file});
+        die_err("missing judge result file " . _display_path($slot_res), 3) unless -f $slot_res && !-l $slot_res;
         my $slot_bytes = read_raw_file($slot_res);
         die_err("recorded judge result digest mismatch (tampered on disk: $slot_res)", 3)
           unless sha256_bytes($slot_bytes) eq $expected_sha;
@@ -2906,17 +2949,15 @@ sub _compute_next_review {
     }
   }
 
-  # 6. roundCap -> step-back or stop (honoring configured knobs + persisted ignore_project_config + any extra step-back grants)
+  # 6. roundCap -> step-back or stop (always derived from live effective config + ignore_project_config + extra step-back grants)
   my $live_knobs = resolve_configured_knobs($repo, $ignore_proj);
-  my $cap        = $live_knobs->{has_round_cap} ? $live_knobs->{roundCap} : ($rev->{round_cap} // 3);
+  my $cap        = $live_knobs->{roundCap};
   my $dirty      = $rev->{dirty_since_step_back} // 0;
   my $sb_done    = $rev->{step_backs_done} // 0;
   my $extra_sb   = defined($rev->{extra_step_backs_granted})
     ? int($rev->{extra_step_backs_granted})
     : scalar(@{$rev->{extra_step_back_authorizations} || []});
-  my $sb_max     = $live_knobs->{has_max_step_backs}
-    ? ($live_knobs->{maxStepBacks} + $extra_sb)
-    : ($rev->{max_step_backs_allowed} // 1);
+  my $sb_max     = $live_knobs->{maxStepBacks} + $extra_sb;
   if ($cap > 0 && $dirty >= $cap) {
     if ($sb_done < $sb_max) {
       return { purpose => 'step-back', mode => 'step-back', profile => 'council', baseline => $live_baseline };
@@ -2941,8 +2982,9 @@ sub _compute_next_review {
 
   # 10. Previous snapshot exists and matches last_reviewed_design_sha256 -> incremental, else fallback full!
   my $prev = $rev->{last_reviewed_snapshot} // '';
-  if (length $prev && -f "$real_task/$prev" && !-l "$real_task/$prev" &&
-      sha256_file("$real_task/$prev") eq ($rev->{last_reviewed_design_sha256} // '')) {
+  my $prev_abs = length($prev) ? _fs_join($real_task, $prev) : '';
+  if (length $prev && -f $prev_abs && !-l $prev_abs &&
+      sha256_file($prev_abs) eq ($rev->{last_reviewed_design_sha256} // '')) {
     return { purpose => 'incremental', mode => 'incremental', profile => 'default', prev_snapshot => $prev, baseline => $live_baseline };
   }
 
@@ -2962,7 +3004,7 @@ sub cmd_next_review {
     print "PURPOSE=$r->{purpose}\nMODE=$r->{mode}\nPROFILE=$r->{profile}\n";
     print "REASON=$r->{reason}\n" if defined $r->{reason} && length $r->{reason};
     print "WARN=$r->{warn}\n" if defined $r->{warn} && length $r->{warn};
-    print "PREV_SNAPSHOT=$real_task/$r->{prev_snapshot}\n" if defined $r->{prev_snapshot} && length $r->{prev_snapshot};
+    print "PREV_SNAPSHOT=" . _display_path($real_task) . "/$r->{prev_snapshot}\n" if defined $r->{prev_snapshot} && length $r->{prev_snapshot};
     print "REVIEW_BASELINE_SHA256=$r->{baseline}\n" if defined $r->{baseline} && length $r->{baseline};
   });
 }
@@ -3010,7 +3052,7 @@ sub _verify_review_slot_binding {
   my ($real_task, $run, $valid_slots_ref, $merged_obj, $dismissed_path) = @_;
   my %rank = (BLOCKER => 3, SHOULD_FIX => 2, OPTIONAL => 1);
   my $is_blocking = sub { my ($s) = @_; return ($s eq 'BLOCKER' || $s eq 'SHOULD_FIX') ? 1 : 0; };
-  my $run_dir_real = abs_path("$real_task/research/plans/runs/$run->{run_id}");
+  my $run_dir_real = abs_path(_fs_join($real_task, 'research', 'plans', 'runs', $run->{run_id}));
   my @slot_objs;
 
   for my $sn (@$valid_slots_ref) {
@@ -3019,9 +3061,9 @@ sub _verify_review_slot_binding {
     my $rsha = $s->{result_sha256} // '';
     die_err("valid slot $sn missing recorded result_file or result_sha256", 3)
       unless length($rf) && $rsha =~ /\A[0-9a-f]{64}\z/;
-    my $abs_rf = "$real_task/$rf";
-    die_err("missing or symlink slot result file for $sn: $abs_rf", 3) unless -f $abs_rf && !-l $abs_rf;
-    my $real_rf = abs_path($abs_rf) // die_err("cannot resolve slot result file $abs_rf", 3);
+    my $abs_rf = _fs_join($real_task, $rf);
+    die_err("missing or symlink slot result file for $sn: " . _display_path($abs_rf), 3) unless -f $abs_rf && !-l $abs_rf;
+    my $real_rf = abs_path($abs_rf) // die_err("cannot resolve slot result file " . _display_path($abs_rf), 3);
     die_err("slot $sn result_file escapes run dir", 3)
       unless defined($run_dir_real) && index($real_rf, "$run_dir_real/") == 0;
     my $sbytes = read_raw_file($abs_rf);
@@ -3029,7 +3071,30 @@ sub _verify_review_slot_binding {
       unless sha256_bytes($sbytes) eq $rsha;
     my $sobj = eval { decode_strict($sbytes) };
     die_err("slot $sn canonical result_file invalid JSON: $@", 3) if $@ || ref $sobj ne 'HASH';
-    push @slot_objs, { slot => $sn, meta => $s, obj => $sobj };
+    my $t  = $s->{target} || {};
+    my $mtag = ($t->{providerInstanceId} // '') . '/' . ($t->{model} // '');
+    my (%reopened_cls, %blocking_reopened_cls, %verified_cls);
+    for my $f (@{$sobj->{findings} || []}) {
+      if (length($f->{reopens} // '')) {
+        my $rk = $rank{$f->{severity}} // 0;
+        $reopened_cls{$f->{reopens}} = $rk if ($reopened_cls{$f->{reopens}} // 0) < $rk;
+        if ($is_blocking->($f->{severity})) {
+          $blocking_reopened_cls{$f->{reopens}} = $rk if ($blocking_reopened_cls{$f->{reopens}} // 0) < $rk;
+        }
+      }
+    }
+    for my $v (@{$sobj->{verified} || []}) {
+      $verified_cls{$v->{id}} = 1 if defined $v->{id} && length $v->{id};
+    }
+    push @slot_objs, {
+      slot                  => $sn,
+      mtag                  => $mtag,
+      meta                  => $s,
+      obj                   => $sobj,
+      reopened_classes      => \%reopened_cls,
+      blocking_reopened     => \%blocking_reopened_cls,
+      verified_classes      => \%verified_cls,
+    };
   }
 
   my $strip_merged_meta = sub {
@@ -3041,7 +3106,7 @@ sub _verify_review_slot_binding {
       verdict                => $o->{verdict},
       findings               => [ map { my %x = %$_; delete $x{sources}; delete $x{dispute_note}; \%x } @{$o->{findings} || []} ],
       verified               => [ map { my %x = %$_; delete $x{sources}; delete $x{dispute_note}; \%x } @{$o->{verified} || []} ],
-      step_back              => $o->{step_back} || [],
+      step_back              => [ map { my %x = %$_; delete $x{sources}; \%x } @{$o->{step_back} || []} ],
       out_of_scope           => $o->{out_of_scope} || [],
     });
   };
@@ -3057,96 +3122,207 @@ sub _verify_review_slot_binding {
     return;
   }
 
-  # Multi-reviewer council: load optional evidenced --dismissed-findings.
+  # Multi-reviewer council: load optional evidenced --dismissed-findings with strict typed string checks (1-to-1 consumable!).
   my @dismissed;
   if (defined $dismissed_path && length $dismissed_path) {
     die_err("--dismissed-findings not found or symlink: $dismissed_path", 3)
       unless -f $dismissed_path && !-l $dismissed_path;
-    my $darr = eval { load_json_file($dismissed_path) };
-    die_err("--dismissed-findings must be a JSON array: $@", 3) if $@ || ref $darr ne 'ARRAY';
+    my $dnode = eval { load_json_file_typed($dismissed_path) };
+    die_err("--dismissed-findings must be a JSON array: $@", 3) if $@ || ref($dnode) ne 'ARRAY' || $dnode->[0] ne 'arr';
     my $idx = 0;
-    for my $d (@$darr) {
+    for my $dn (@{$dnode->[1]}) {
       $idx++;
-      die_err("--dismissed-findings[$idx] must be an object", 3) unless ref $d eq 'HASH';
+      die_err("--dismissed-findings[$idx] must be an object", 3) unless $dn->[0] eq 'obj';
+      my $dh = $dn->[1];
       for my $req (qw(slot title severity code_evidence)) {
         die_err("--dismissed-findings[$idx].$req must be a non-empty string", 3)
-          unless defined $d->{$req} && !ref($d->{$req}) && $d->{$req} =~ /\S/;
+          unless exists $dh->{$req} && $dh->{$req}[0] eq 'str' && $dh->{$req}[1] =~ /\S/;
       }
-      die_err("--dismissed-findings[$idx].severity invalid", 3) unless exists $rank{$d->{severity}};
-      push @dismissed, $d;
+      my $sev = $dh->{severity}[1];
+      die_err("--dismissed-findings[$idx].severity invalid", 3) unless exists $rank{$sev};
+      my $reo = '';
+      if (exists $dh->{reopens} && $dh->{reopens}[0] ne 'null') {
+        die_err("--dismissed-findings[$idx].reopens must be a string", 3) unless $dh->{reopens}[0] eq 'str';
+        $reo = $dh->{reopens}[1];
+      }
+      push @dismissed, {
+        slot          => $dh->{slot}[1],
+        title         => $dh->{title}[1],
+        severity      => $sev,
+        code_evidence => $dh->{code_evidence}[1],
+        reopens       => $reo,
+      };
     }
   }
 
-  my $is_dismissed = sub {
+  my @dism_used = (0) x scalar(@dismissed);
+  my $consume_dismissal = sub {
     my ($sn, $mtag, $f) = @_;
-    for my $d (@dismissed) {
+    for my $idx (0 .. $#dismissed) {
+      next if $dism_used[$idx];
+      my $d = $dismissed[$idx];
       next unless $d->{slot} eq $sn || $d->{slot} eq $mtag;
       next unless $d->{severity} eq $f->{severity};
       next unless $d->{title} eq $f->{title};
-      if (defined $d->{reopens} && length $d->{reopens}) {
-        next unless $d->{reopens} eq ($f->{reopens} // '');
+      my $f_reo = $f->{reopens} // '';
+      my $d_reo = $d->{reopens} // '';
+      if (length($f_reo) || length($d_reo)) {
+        next unless $d_reo eq $f_reo;
       }
+      $dism_used[$idx] = 1;
       return 1;
     }
     return 0;
   };
 
+  # Map valid recorded slots by slot name and unique model tag for strict dispute verification.
+  my %slot_by_name = map { $_->{slot} => $_ } @slot_objs;
+  my %slots_by_mtag;
+  push @{$slots_by_mtag{$_->{mtag}}}, $_ for @slot_objs;
+
   my %disputed_classes;
   for my $dp (@{$merged_obj->{disputes} || []}) {
-    $disputed_classes{$dp->{class_id}} = $dp->{resolution} if defined $dp->{class_id};
-  }
-
-  my (%merged_reopen_max, %merged_source_max);
-  for my $mf (@{$merged_obj->{findings} || []}) {
-    my $rk = $rank{$mf->{severity}} // 0;
-    if (length($mf->{reopens} // '')) {
-      my $cid = $mf->{reopens};
-      $merged_reopen_max{$cid} = $rk if ($merged_reopen_max{$cid} // 0) < $rk;
-    }
-    if ($is_blocking->($mf->{severity})) {
-      for my $src (@{$mf->{sources} || []}) {
-        $merged_source_max{$src} = $rk if ($merged_source_max{$src} // 0) < $rk;
+    my $cid = $dp->{class_id} // '';
+    my $res = $dp->{resolution} // '';
+    die_err("duplicate dispute entry for class '$cid'", 3) if exists $disputed_classes{$cid};
+    my (%seen_canon, $has_reopen_pos, $has_verified_pos);
+    for my $rp (@{$dp->{reviewer_positions} || []}) {
+      my $ref_slot = $rp->{slot} // '';
+      my $so = $slot_by_name{$ref_slot};
+      if (!$so && exists $slots_by_mtag{$ref_slot} && @{$slots_by_mtag{$ref_slot}} == 1) {
+        $so = $slots_by_mtag{$ref_slot}[0];
+      }
+      die_err("dispute for $cid cites unknown or non-valid slot '$ref_slot'", 3) unless $so;
+      die_err("dispute for $cid cites slot '$so->{slot}' more than once", 3) if $seen_canon{$so->{slot}}++;
+      my $pos = $rp->{position} // '';
+      if ($pos eq 'reopen' || $pos eq 'finding') {
+        die_err("dispute for $cid claims slot $so->{slot} took position '$pos', but recorded slot did not reopen $cid", 3)
+          unless exists $so->{reopened_classes}{$cid};
+        $has_reopen_pos = 1;
+      } elsif ($pos eq 'verified') {
+        die_err("dispute for $cid claims slot $so->{slot} verified $cid, but recorded slot did not verify $cid", 3)
+          unless $so->{verified_classes}{$cid};
+        $has_verified_pos = 1;
+      } else {
+        die_err("dispute for $cid has invalid position '$pos'", 3);
       }
     }
+    die_err("dispute for $cid lacks genuine reopen-vs-verified disagreement among recorded valid slots", 3)
+      unless $has_reopen_pos && $has_verified_pos;
+    for my $so (@slot_objs) {
+      if (exists $so->{blocking_reopened}{$cid} && !$seen_canon{$so->{slot}}) {
+        die_err("dispute for $cid omits slot $so->{slot} which recorded a blocking reopen of $cid", 3);
+      }
+    }
+    $disputed_classes{$cid} = $res;
   }
 
-  my @unaccounted;
-  my $any_slot_sb = 0;
-  for my $so (@slot_objs) {
-    my $sn = $so->{slot};
-    my $t  = $so->{meta}{target} || {};
-    my $mtag = ($t->{providerInstanceId} // '') . '/' . ($t->{model} // '');
-    $any_slot_sb = 1 if @{$so->{obj}{step_back} || []} > 0;
+  # Bipartite maximum matching helper (Kuhn) for strict 1-to-1 per-slot traceability.
+  my $has_perfect_matching = sub {
+    my ($n_left, $n_right, $adj) = @_;
+    my @match_r = (-1) x $n_right;
+    my $dfs;
+    $dfs = sub {
+      my ($u, $vis) = @_;
+      for my $v (@{$adj->[$u] || []}) {
+        next if $vis->[$v];
+        $vis->[$v] = 1;
+        if ($match_r[$v] == -1 || $dfs->($match_r[$v], $vis)) {
+          $match_r[$v] = $u;
+          return 1;
+        }
+      }
+      return 0;
+    };
+    for my $u (0 .. $n_left - 1) {
+      my @vis = (0) x $n_right;
+      return 0 unless $dfs->($u, \@vis);
+    }
+    return 1;
+  };
 
-    my $max_new_undism_rank = 0;
-    my @new_undism_titles;
+  my $has_src = sub {
+    my ($item, $sn, $mtag) = @_;
+    for my $src (@{$item->{sources} || []}) {
+      return 1 if $src eq $sn || $src eq $mtag;
+    }
+    return 0;
+  };
+
+  my @m_findings = @{$merged_obj->{findings} || []};
+  my @m_sbs      = @{$merged_obj->{step_back} || []};
+  my @unaccounted;
+
+  for my $so (@slot_objs) {
+    my $sn   = $so->{slot};
+    my $mtag = $so->{mtag};
+
+    # 1. Per-finding 1-to-1 blocking finding binding.
+    #    Reopened blocking findings are exempted ONLY when a validated dispute resolved 'verified' or 'unresolved'
+    #    (resolution 'reopen' MUST keep the reopened finding at >= severity unless explicitly dismissed!).
+    my @need_f;
     for my $f (@{$so->{obj}{findings} || []}) {
       next unless $is_blocking->($f->{severity});
-      next if $is_dismissed->($sn, $mtag, $f);
-      my $rk = $rank{$f->{severity}} // 0;
+      next if $consume_dismissal->($sn, $mtag, $f);
       if (length($f->{reopens} // '')) {
-        my $cid = $f->{reopens};
-        my $in_merged = (($merged_reopen_max{$cid} // 0) >= $rk) ? 1 : 0;
-        my $in_dispute = exists $disputed_classes{$cid} ? 1 : 0;
-        if (!$in_merged && !$in_dispute) {
-          push @unaccounted, "slot $sn ($mtag) reopened blocking $cid ($f->{severity}) missing/downgraded without dispute or --dismissed-findings";
-        }
-      } else {
-        $max_new_undism_rank = $rk if $rk > $max_new_undism_rank;
-        push @new_undism_titles, "$f->{severity}:$f->{title}";
+        my $dres = $disputed_classes{$f->{reopens}} // '';
+        next if $dres eq 'verified' || $dres eq 'unresolved';
       }
+      push @need_f, $f;
     }
-    if ($max_new_undism_rank > 0) {
-      my $got_rk = $merged_source_max{$mtag} // 0;
-      $got_rk = $merged_source_max{$sn} if ($merged_source_max{$sn} // 0) > $got_rk;
-      if ($got_rk < $max_new_undism_rank) {
-        push @unaccounted, "slot $sn ($mtag) blocking finding(s) [" . join(', ', @new_undism_titles) . "] not traced in merged findings[].sources at >= severity without evidenced --dismissed-findings";
-      }
-    }
-  }
 
-  if (($run->{mode} // '') eq 'step-back' && $any_slot_sb && @{$merged_obj->{step_back} || []} == 0) {
-    push @unaccounted, "council slot(s) reported step_back[] items that were dropped from merged output";
+    if (@need_f) {
+      my @cand_mf = grep { $is_blocking->($_->{severity}) } @m_findings;
+      my @adj;
+      for my $i (0 .. $#need_f) {
+        my $nf   = $need_f[$i];
+        my $nrk  = $rank{$nf->{severity}} // 0;
+        my $nreo = $nf->{reopens} // '';
+        my @edges;
+        for my $j (0 .. $#cand_mf) {
+          my $mf  = $cand_mf[$j];
+          my $mrk = $rank{$mf->{severity}} // 0;
+          next if $mrk < $nrk;
+          if (length $nreo) {
+            next unless ($mf->{reopens} // '') eq $nreo;
+            if (ref($mf->{sources}) eq 'ARRAY' && @{$mf->{sources}}) {
+              next unless $has_src->($mf, $sn, $mtag);
+            }
+          } else {
+            next unless $has_src->($mf, $sn, $mtag);
+          }
+          push @edges, $j;
+        }
+        push @adj, \@edges;
+      }
+      if (!$has_perfect_matching->(scalar(@need_f), scalar(@cand_mf), \@adj)) {
+        my @titles = map { "$_->{severity}:" . (length($_->{reopens} // '') ? "$_->{reopens}:" : '') . $_->{title} } @need_f;
+        push @unaccounted, "slot $sn ($mtag) has " . scalar(@need_f) . " undismissed blocking finding(s) [" . join(', ', @titles) . "] not matched 1-to-1 in merged findings[] at >= severity (with slot sources / matching reopens) without validated dispute or evidenced --dismissed-findings";
+      }
+    }
+
+    # 2. Per-proposal 1-to-1 step_back[] binding (requires sources attribution & class-set preservation!).
+    my @slot_sbs = @{$so->{obj}{step_back} || []};
+    if (@slot_sbs) {
+      my @cand_sbs = grep { $has_src->($_, $sn, $mtag) } @m_sbs;
+      my @adj;
+      for my $i (0 .. $#slot_sbs) {
+        my %need_cls = map { $_ => 1 } @{$slot_sbs[$i]{classes} || []};
+        my @edges;
+        for my $j (0 .. $#cand_sbs) {
+          my %got_cls = map { $_ => 1 } @{$cand_sbs[$j]{classes} || []};
+          my $ok_cls = 1;
+          for my $c (keys %need_cls) {
+            if (!$got_cls{$c}) { $ok_cls = 0; last; }
+          }
+          push @edges, $j if $ok_cls;
+        }
+        push @adj, \@edges;
+      }
+      if (!$has_perfect_matching->(scalar(@slot_sbs), scalar(@cand_sbs), \@adj)) {
+        push @unaccounted, "slot $sn ($mtag) reported " . scalar(@slot_sbs) . " step_back[] proposal(s) not preserved 1-to-1 in merged step_back[] (with sources attributing slot and covering all classes)";
+      }
+    }
   }
 
   if (@unaccounted) {
@@ -3187,7 +3363,7 @@ sub cmd_finish_review_round {
       if (!defined($merged_input_path) || !length($merged_input_path)) {
         if (@valid_slots == 1) {
           my $s1 = $run->{slots}{$valid_slots[0]};
-          $merged_input_path = "$real_task/$s1->{result_file}" if defined $s1->{result_file};
+          $merged_input_path = _fs_join($real_task, $s1->{result_file}) if defined $s1->{result_file};
         }
       }
       die_err("finish-review-round requires --merged-input <path> (or single valid reviewer slot)")
@@ -3210,7 +3386,7 @@ sub cmd_finish_review_round {
       ) {
         my ($rel, $want, $label) = @$fcheck;
         next unless defined $rel && length $rel && defined $want && length $want;
-        my $p = "$real_task/$rel";
+        my $p = _fs_join($real_task, $rel);
         if (!-f $p || -l $p) {
           push @$drifts, "$label missing or symlink ($rel)";
         } else {
@@ -3243,16 +3419,28 @@ sub cmd_finish_review_round {
         exit 3;
       }
 
-      # Strictly re-validate merged result JSON (with --merged + frozen ledger manifest)!
+      # Snapshot external inputs ONCE into $tmp_dir (zero TOCTOU across parse, binding verification, and archival!).
       my $tmp_dir   = tempdir('t3-tri-fin-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+      my $in_snap   = "$tmp_dir/merged-in.json";
+      write_atomic_bytes($in_snap, read_raw_file($merged_input_path));
+      my ($dism_snap, $dism_bytes);
+      if (defined $opt{dismissed_findings} && length $opt{dismissed_findings}) {
+        die_err("--dismissed-findings not found or symlink: $opt{dismissed_findings}", 3)
+          unless -f $opt{dismissed_findings} && !-l $opt{dismissed_findings};
+        $dism_bytes = read_raw_file($opt{dismissed_findings});
+        $dism_snap  = "$tmp_dir/dismissed-in.json";
+        write_atomic_bytes($dism_snap, $dism_bytes);
+      }
+
+      # Strictly re-validate merged result JSON (with --merged + frozen ledger manifest)!
       my $canon_tmp = "$tmp_dir/result.json";
       my $md_tmp    = "$tmp_dir/review.md";
       my ($rc, $vout) = run_cmd_capture(
         'perl', $PARSE_REVIEW,
-        '--input', $merged_input_path,
+        '--input', $in_snap,
         '--expected-mode', $run->{mode},
         '--expected-design-sha', $run->{reviewed_design_sha256},
-        '--ledger-manifest', "$real_task/$run->{ledger_manifest_rel}",
+        '--ledger-manifest', _fs_join($real_task, $run->{ledger_manifest_rel}),
         '--merged',
         '--write-canonical', $canon_tmp,
         '--render-md', $md_tmp
@@ -3266,8 +3454,8 @@ sub cmd_finish_review_round {
       my $md_bytes = read_raw_file($md_tmp);
       my $m = decode_strict($m_bytes);
 
-      # Enforce strict slot-to-merged binding (single reviewer exact match; council blocking finding traceability)!
-      _verify_review_slot_binding($real_task, $run, \@valid_slots, $m, $opt{dismissed_findings});
+      # Enforce strict slot-to-merged binding (single reviewer exact match; council 1-to-1 finding/step_back/dispute binding)!
+      _verify_review_slot_binding($real_task, $run, \@valid_slots, $m, $dism_snap);
 
     my $eff_verdict = $vkv->{EFFECTIVE_VERDICT}; # clean | dirty
     my $rev = $st->{review};
@@ -3410,10 +3598,10 @@ sub cmd_finish_review_round {
         { dst => 'research/plans/review-ledger.md',    bytes => $ledger_bytes, is_state_file => 0 },
         { dst => 'research/plans/planning-state.json', bytes => encode_canonical($st), is_state_file => 1 },
       );
-      if (defined $opt{dismissed_findings} && length $opt{dismissed_findings}) {
+      if (defined $dism_bytes) {
         push @fin_writes, {
           dst           => "$run->{round_dir_rel}/dismissed-findings.json",
-          bytes         => read_raw_file($opt{dismissed_findings}),
+          bytes         => $dism_bytes,
           is_state_file => 0,
         };
       }
@@ -3452,34 +3640,45 @@ sub cmd_commit_phase4_revision {
       my $rev = $st->{review};
 
       if (defined $opt{dispositions_json} && length $opt{dispositions_json}) {
-        my $disp = load_json_file($opt{dispositions_json});
-        die_err("--dispositions-json must be an array") unless ref $disp eq 'ARRAY';
+        my $disp_node = load_json_file_typed($opt{dispositions_json});
+        die_err("--dispositions-json must be an array") unless ref($disp_node) eq 'ARRAY' && $disp_node->[0] eq 'arr';
         my %valid_d = map { $_ => 1 } qw(adopted rejected moved-to-implement out-of-scope);
-        for my $item (@$disp) {
-          die_err("disposition entry must be an object") unless ref $item eq 'HASH';
-          my $cid  = $item->{id};
-          my $kind = $item->{disposition};
-          die_err("disposition missing non-empty string id") unless defined $cid && !ref($cid) && $cid =~ /\S/;
-          die_err("disposition for $cid missing string disposition") unless defined $kind && !ref($kind);
+        for my $item_node (@{$disp_node->[1]}) {
+          die_err("disposition entry must be an object") unless $item_node->[0] eq 'obj';
+          my $ih = $item_node->[1];
+          die_err("disposition missing non-empty string id")
+            unless exists $ih->{id} && $ih->{id}[0] eq 'str' && $ih->{id}[1] =~ /\S/;
+          my $cid = $ih->{id}[1];
+          die_err("disposition for $cid missing string disposition")
+            unless exists $ih->{disposition} && $ih->{disposition}[0] eq 'str';
+          my $kind = $ih->{disposition}[1];
           die_err("unknown class $cid in disposition") unless exists $rev->{classes}{$cid};
           die_err("invalid disposition '$kind' for $cid") unless $valid_d{$kind};
-          my $note = $item->{note} // '';
-          die_err("disposition note for $cid must be a string") if ref($note);
+          my $note = '';
+          if (exists $ih->{note} && $ih->{note}[0] ne 'null') {
+            die_err("disposition note for $cid must be a string") unless $ih->{note}[0] eq 'str';
+            $note = $ih->{note}[1];
+          }
           my $c = $rev->{classes}{$cid};
           $c->{disposition}      = $kind;
           $c->{disposition_note} = $note;
           $c->{status}           = 'disposed';
           if ($c->{recurring}) {
-            my $co = $item->{codified};
             die_err("recurring class $cid MUST provide codified.{invariant_id, guard_test} (non-blank strings)")
-              unless ref $co eq 'HASH' &&
-                     defined($co->{invariant_id}) && !ref($co->{invariant_id}) && $co->{invariant_id} =~ /\S/ &&
-                     defined($co->{guard_test})   && !ref($co->{guard_test})   && $co->{guard_test}   =~ /\S/;
-            my $rme = $co->{review_md_entry} // '';
-            die_err("recurring class $cid codified.review_md_entry must be a string") if ref($rme);
+              unless exists $ih->{codified} && $ih->{codified}[0] eq 'obj';
+            my $coh = $ih->{codified}[1];
+            die_err("recurring class $cid MUST provide codified.{invariant_id, guard_test} (non-blank strings)")
+              unless exists $coh->{invariant_id} && $coh->{invariant_id}[0] eq 'str' && $coh->{invariant_id}[1] =~ /\S/ &&
+                     exists $coh->{guard_test}   && $coh->{guard_test}[0]   eq 'str' && $coh->{guard_test}[1]   =~ /\S/;
+            my $rme = '';
+            if (exists $coh->{review_md_entry} && $coh->{review_md_entry}[0] ne 'null') {
+              die_err("recurring class $cid codified.review_md_entry must be a string")
+                unless $coh->{review_md_entry}[0] eq 'str';
+              $rme = $coh->{review_md_entry}[1];
+            }
             $c->{codified} = {
-              invariant_id    => $co->{invariant_id},
-              guard_test      => $co->{guard_test},
+              invariant_id    => $coh->{invariant_id}[1],
+              guard_test      => $coh->{guard_test}[1],
               review_md_entry => $rme,
             };
           }
@@ -3683,12 +3882,15 @@ sub _validate_jsonl_non_seed {
   for my $line (split(/\r?\n/, $raw)) {
     $line_no++;
     next unless $line =~ /\S/;
-    my $obj = eval { decode_strict($line) };
-    return (0, "$jsonl_path:$line_no invalid JSON: $@") if $@ || ref $obj ne 'HASH';
-    next unless exists $obj->{file};
-    return (0, "$jsonl_path:$line_no 'file' must be a string") if !defined($obj->{file}) || ref($obj->{file});
-    my $rel = $obj->{file};
+    my $node = eval { decode_strict_typed($line) };
+    return (0, "$jsonl_path:$line_no invalid JSON: $@") if $@ || ref($node) ne 'ARRAY' || $node->[0] ne 'obj';
+    my $oh = $node->[1];
+    next unless exists $oh->{file};
+    return (0, "$jsonl_path:$line_no 'file' must be a JSON string")
+      unless $oh->{file}[0] eq 'str';
+    my $rel = $oh->{file}[1];
     next unless length $rel;
+    return (0, "$jsonl_path:$line_no 'file' must not be whitespace-only") unless $rel =~ /\S/;
     return (0, "$jsonl_path:$line_no absolute or traversal path forbidden: $rel")
       if $rel =~ m{\A/} || $rel =~ /\0/ || $rel =~ m{(?:\A|/)\.\.(?:/|\z)} || $rel eq '.' || $rel =~ m{\A\./?\z};
     my $rel_bytes = encode('UTF-8', $rel);
@@ -3714,6 +3916,19 @@ sub _validate_implement_codification {
     $des_txt = eval { decode('UTF-8', read_raw_file("$real_task/design.md"), FB_CROAK | LEAVE_SRC) };
     return (0, "design.md is not valid UTF-8") if $@ || !defined $des_txt;
   }
+  # Load typed AST of planning-state.json so numeric/boolean codified values cannot slip past Perl scalar coercion!
+  my $typed_classes;
+  my $sf = "$real_task/research/plans/planning-state.json";
+  if (-f $sf && !-l $sf) {
+    my $st_typed = eval { load_json_file_typed($sf) };
+    return (0, "planning-state.json invalid typed JSON: $@") if $@ || ref($st_typed) ne 'ARRAY' || $st_typed->[0] ne 'obj';
+    my $rev_n = $st_typed->[1]{review};
+    if (ref($rev_n) eq 'ARRAY' && $rev_n->[0] eq 'obj' &&
+        ref($rev_n->[1]{classes}) eq 'ARRAY' && $rev_n->[1]{classes}[0] eq 'obj') {
+      $typed_classes = $rev_n->[1]{classes}[1];
+    }
+  }
+
   my @missing;
   for my $cid (sort keys %{$st->{review}{classes} || {}}) {
     my $c = $st->{review}{classes}{$cid};
@@ -3722,22 +3937,35 @@ sub _validate_implement_codification {
         unless index($imp_txt, $cid) >= 0;
     }
     if ($c->{recurring}) {
-      my $co = $c->{codified};
-      if (ref $co ne 'HASH' ||
-          !defined($co->{invariant_id}) || ref($co->{invariant_id}) || $co->{invariant_id} !~ /\S/ ||
-          !defined($co->{guard_test})   || ref($co->{guard_test})   || $co->{guard_test}   !~ /\S/) {
-        push @missing, "recurring class $cid lacks non-blank codified invariant/guard_test";
-      } else {
-        push @missing, "recurring invariant $co->{invariant_id} ($cid) not found in design.md"
-          unless index($des_txt, $co->{invariant_id}) >= 0;
-        push @missing, "recurring invariant $co->{invariant_id} ($cid) not referenced in implement.md"
-          unless index($imp_txt, $co->{invariant_id}) >= 0;
-        push @missing, "recurring guard test '$co->{guard_test}' ($cid) not referenced in implement.md"
-          unless index($imp_txt, $co->{guard_test}) >= 0;
-        if (defined($co->{review_md_entry}) && !ref($co->{review_md_entry}) && $co->{review_md_entry} =~ /\S/) {
-          push @missing, "recurring REVIEW.md entry '$co->{review_md_entry}' ($cid) not referenced in implement.md"
-            unless index($imp_txt, $co->{review_md_entry}) >= 0;
+      my $tc = ($typed_classes && exists $typed_classes->{$cid} && $typed_classes->{$cid}[0] eq 'obj')
+        ? $typed_classes->{$cid}[1] : undef;
+      my $tco = ($tc && exists $tc->{codified} && $tc->{codified}[0] eq 'obj')
+        ? $tc->{codified}[1] : undef;
+      if (!$tco ||
+          !exists $tco->{invariant_id} || $tco->{invariant_id}[0] ne 'str' || $tco->{invariant_id}[1] !~ /\S/ ||
+          !exists $tco->{guard_test}   || $tco->{guard_test}[0]   ne 'str' || $tco->{guard_test}[1]   !~ /\S/) {
+        push @missing, "recurring class $cid lacks non-blank JSON string codified.{invariant_id, guard_test}";
+        next;
+      }
+      my $inv = $tco->{invariant_id}[1];
+      my $gt  = $tco->{guard_test}[1];
+      my $rme = '';
+      if (exists $tco->{review_md_entry} && $tco->{review_md_entry}[0] ne 'null') {
+        if ($tco->{review_md_entry}[0] ne 'str') {
+          push @missing, "recurring class $cid codified.review_md_entry must be a JSON string";
+          next;
         }
+        $rme = $tco->{review_md_entry}[1];
+      }
+      push @missing, "recurring invariant $inv ($cid) not found in design.md"
+        unless index($des_txt, $inv) >= 0;
+      push @missing, "recurring invariant $inv ($cid) not referenced in implement.md"
+        unless index($imp_txt, $inv) >= 0;
+      push @missing, "recurring guard test '$gt' ($cid) not referenced in implement.md"
+        unless index($imp_txt, $gt) >= 0;
+      if ($rme =~ /\S/) {
+        push @missing, "recurring REVIEW.md entry '$rme' ($cid) not referenced in implement.md"
+          unless index($imp_txt, $rme) >= 0;
       }
     }
   }
@@ -4097,20 +4325,55 @@ sub cmd_commit_phase6_ready {
 }
 
 # Query task.py current --json under the EXACT original trellis_context_key!
-# Enforces Trellis exit-code convention: rc=0 (task present or valid ok), rc=1 ONLY when current_task is null;
-# ANY other exit code (e.g. 2, 7, 127, signals) or missing current_task key fails closed!
+# Enforces Trellis JSON schema & exit-code convention:
+#   - top-level object MUST contain 'current_task' (either null or object with non-empty string 'dir')
+#   - MUST NOT contain error/failure keys (error/errors/traceback/exception/message/ok=false/status=error)
+#   - rc=0 when current_task is present; rc=0|1 ONLY when current_task is null; any other rc or malformed JSON fails closed!
 sub _probe_trellis_current {
   my ($repo_root, $task_py, $context_key) = @_;
   my %env_ov = (TRELLIS_CONTEXT_ID => ($context_key eq 'degraded-no-context' ? undef : $context_key));
   my ($rc, $out, $err) = run_cmd_capture_split($repo_root, \%env_ov, 'python3', $task_py, 'current', '--json');
-  my $data = eval { decode_strict($out) };
-  if ($@ || ref $data ne 'HASH' || !exists $data->{current_task}) {
+  my $node = eval { decode_strict_typed($out) };
+  if ($@ || ref($node) ne 'ARRAY' || $node->[0] ne 'obj') {
     return (0, undef, "task.py current --json failed (rc=$rc): $out $err");
   }
-  if ($rc != 0 && !($rc == 1 && !defined $data->{current_task})) {
-    return (0, undef, "task.py current --json exited unexpectedly (rc=$rc): $out $err");
+  my $oh = $node->[1];
+  if (!exists $oh->{current_task}) {
+    return (0, undef, "task.py current --json missing current_task key (rc=$rc): $out $err");
   }
-  return (1, $data, '');
+  # Reject explicit error payloads even when current_task is null and rc == 0!
+  for my $ek (qw(error errors traceback exception message)) {
+    if (exists $oh->{$ek} && $oh->{$ek}[0] ne 'null') {
+      if ($oh->{$ek}[0] ne 'str' || $oh->{$ek}[1] =~ /\S/) {
+        return (0, undef, "task.py current --json reported '$ek' (rc=$rc): $out $err");
+      }
+    }
+  }
+  if (exists $oh->{ok} && $oh->{ok}[0] eq 'bool' && !$oh->{ok}[1]) {
+    return (0, undef, "task.py current --json reported ok=false (rc=$rc): $out $err");
+  }
+  if (exists $oh->{status} && $oh->{status}[0] eq 'str' && lc($oh->{status}[1]) eq 'error') {
+    return (0, undef, "task.py current --json reported status=error (rc=$rc): $out $err");
+  }
+  my $ctn = $oh->{current_task};
+  if ($ctn->[0] eq 'null') {
+    if ($rc != 0 && $rc != 1) {
+      return (0, undef, "task.py current --json exited unexpectedly (rc=$rc): $out $err");
+    }
+  } elsif ($ctn->[0] eq 'obj') {
+    if (!exists $ctn->[1]{dir} || $ctn->[1]{dir}[0] ne 'str' || $ctn->[1]{dir}[1] !~ /\S/) {
+      return (0, undef, "task.py current --json returned malformed current_task (missing string dir): $out $err");
+    }
+    if ($rc != 0) {
+      return (0, undef, "task.py current --json returned non-zero rc=$rc with non-null current_task: $out $err");
+    }
+  } else {
+    return (0, undef, "task.py current --json returned malformed current_task type '$ctn->[0]': $out $err");
+  }
+  if (exists $oh->{stale} && $oh->{stale}[0] ne 'bool' && $oh->{stale}[0] ne 'null') {
+    return (0, undef, "task.py current --json returned malformed stale field: $out $err");
+  }
+  return (1, unwrap_typed($node), '');
 }
 
 # SINGLE SHARED POSTCONDITION PREDICATE for ALL THREE activated paths
@@ -4165,8 +4428,15 @@ sub _verify_activation_postconditions {
 sub _try_activation_lock {
   my ($plans_dir) = @_;
   my $lp = "$plans_dir/.activation.lock";
-  die_err("refusing symlink at $lp") if -l $lp;
-  open(my $fh, '>>', $lp) or die_err("cannot open $lp: $!");
+  my $o_nofollow = eval { Fcntl::O_NOFOLLOW() } || 0;
+  die_err("EXTERNAL_CONFLICT: symlink or non-regular lockfile at " . _display_path($lp), 2)
+    if -l $lp || (-e $lp && !-f $lp);
+  sysopen(my $fh, $lp, O_RDWR | O_CREAT | O_NONBLOCK | $o_nofollow, 0644)
+    or die_err("EXTERNAL_CONFLICT: cannot safely open lockfile " . _display_path($lp) . ": $!", 2);
+  if (!-f $fh) {
+    close $fh;
+    die_err("EXTERNAL_CONFLICT: non-regular file at lockfile " . _display_path($lp), 2);
+  }
   if (!flock($fh, LOCK_EX | LOCK_NB)) {
     close $fh;
     return undef;

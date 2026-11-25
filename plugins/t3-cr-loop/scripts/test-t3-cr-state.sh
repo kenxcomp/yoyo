@@ -644,5 +644,222 @@ mkdir -p "$SUB_HOST"
   [ "$rc_sm" -eq 3 ] && [ "$(printf '%s\n' "$out_sm" | kv REASON)" = "tree-changed" ]
 ) && ok || bad "t3 tree_fp_v2 missed 2nd edit inside already-dirty tracked submodule!"
 
+# =============================================================================
+# 8. Round 3 Hardening Regressions (TOCTOU snapshot, 1-to-1 council & step_back,
+#    config-show persisted ignore-project-config, SIGTERM UNBORN trap, unborn stderr)
+# =============================================================================
+
+# 8a. Persisted --ignore-project-config propagates to bare config-show (no flag needed)!
+cat > "$R/.t3-cr-loop.json" <<'EOF'
+{
+  "version": 1,
+  "defaultReviewer": { "providerInstanceId": "projOnlyProvider", "model": "proj-model-1", "effortKey": "effort", "effort": "high" },
+  "knobs": { "roundCap": 9 }
+}
+EOF
+bash "$ST" init --ignore-project-config >/dev/null
+out_cs_ign=$(bash "$ST" config-show)
+expect "bare config-show inherits persisted ignore_project_config (user reviewer, no auth prompt)" "1:codex:0" \
+  "$(printf '%s\n' "$out_cs_ign" | kv PROJECT_CONFIG_IGNORED):$(printf '%s\n' "$out_cs_ign" | kv DEFAULT_PROVIDER):$(printf '%s\n' "$out_cs_ign" | kv NEEDS_PROVIDER_AUTH)"
+out_cs_use=$(bash "$ST" config-show --use-project-config)
+expect "config-show --use-project-config overrides persisted ignore" "projOnlyProvider:1" \
+  "$(printf '%s\n' "$out_cs_use" | kv DEFAULT_PROVIDER):$(printf '%s\n' "$out_cs_use" | kv NEEDS_PROVIDER_AUTH)"
+bash "$ST" init --use-project-config >/dev/null
+rm -f "$R/.t3-cr-loop.json"
+
+# 8b. record-result rejects symlink input and finish single-snapshot keeps verdict & archived JSON identical!
+po_toctou=$(bash "$ST" prepare --purpose full --mode full --base main --slots s1 --owner "$OWNER")
+RDT=$(printf '%s\n' "$po_toctou" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RDT" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RDT" --slot s1 --attempt 1 --owner "$OWNER" --task-id ttoc --child-thread-id cttoc >/dev/null
+ln -sf "$F_CLEAN" "$TMP/sym-input.json"
+bash "$ST" record-result "$RDT" --slot s1 --attempt 1 --owner "$OWNER" --task-id ttoc --input "$TMP/sym-input.json" >/dev/null 2>&1
+expect "record-result rejects symlink --input" "2" "$?"
+rm -f "$TMP/sym-input.json"
+bash "$ST" record-result "$RDT" --slot s1 --attempt 1 --owner "$OWNER" --task-id ttoc --input "$F_P1_SLOT" >/dev/null
+# Concurrently swap external merged file between clean and P1 while finish runs:
+# single-snapshot invariant guarantees VERDICT=clean can NEVER coexist with P1 archived JSON!
+RACE_F="$TMP/race-merged.json"
+cp "$F_CLEAN" "$RACE_F"
+(
+  for _k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    cp "$F_P1_SLOT" "$RACE_F" 2>/dev/null || true
+    cp "$F_CLEAN" "$RACE_F" 2>/dev/null || true
+  done
+) &
+RACE_PID=$!
+out_race=$(bash "$ST" finish "$RDT" --merged "$RACE_F" 2>/dev/null); rc_race=$?
+wait "$RACE_PID" 2>/dev/null || true
+v_race=$(printf '%s\n' "$out_race" | kv VERDICT)
+if [ "$v_race" = "clean" ]; then
+  bad "single-reviewer P1 settled as clean during TOCTOU race!"
+else
+  ok
+fi
+# Clean up unfinished round if race hit clean snapshot and errored (expected!)
+if [ "$rc_race" -ne 0 ]; then
+  bash "$ST" finish "$RDT" >/dev/null
+fi
+
+# 8c. Council 1-to-1 per-finding binding: 2 independent P1 findings from 1 slot CANNOT collapse into 1 merged P1!
+F_TWO_P1="$TMP/two-p1-slot.json"
+cat > "$F_TWO_P1" <<'EOF'
+{
+  "summary": "Two distinct P1 bugs.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1"
+    },
+    {
+      "severity": "P1", "reopens": "", "title": "Bug Two", "location": "app.txt:2",
+      "pattern": "p2", "still_wrong": "", "instances": ["app.txt:2"], "fix": "f2", "prevent": "t2"
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_ONE_P1_DOUBLE_SRC="$TMP/one-p1-double-src.json"
+cat > "$F_ONE_P1_DOUBLE_SRC" <<'EOF'
+{
+  "summary": "Dropped Bug Two.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
+      "sources": ["s1", "codex/gpt-6.2-sol"]
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+F_TWO_P1_MERGED="$TMP/two-p1-merged.json"
+cat > "$F_TWO_P1_MERGED" <<'EOF'
+{
+  "summary": "Kept both P1 bugs.",
+  "verdict": "findings",
+  "findings": [
+    {
+      "severity": "P1", "reopens": "", "title": "Bug One", "location": "app.txt:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["app.txt:1"], "fix": "f1", "prevent": "t1",
+      "sources": ["codex/gpt-6.2-sol"]
+    },
+    {
+      "severity": "P1", "reopens": "", "title": "Bug Two", "location": "app.txt:2",
+      "pattern": "p2", "still_wrong": "", "instances": ["app.txt:2"], "fix": "f2", "prevent": "t2",
+      "sources": ["codex/gpt-6.2-sol"]
+    }
+  ],
+  "step_back": [], "out_of_scope": []
+}
+EOF
+po_2p1=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1,s2 --owner "$OWNER")
+RD2P1=$(printf '%s\n' "$po_2p1" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RD2P1" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2P1" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2p1a --child-thread-id ct2p1a >/dev/null
+bash "$ST" record-result "$RD2P1" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2p1a --input "$F_TWO_P1" >/dev/null
+bash "$ST" claim-slot "$RD2P1" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2P1" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2p1b --child-thread-id ct2p1b >/dev/null
+bash "$ST" record-result "$RD2P1" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2p1b --input "$F_CLEAN" >/dev/null
+out_collapse=$(bash "$ST" finish "$RD2P1" --merged "$F_ONE_P1_DOUBLE_SRC"); rc=$?
+expect "council rejects collapsing 2 same-severity P1 findings from 1 slot into 1" "5:error" "$rc:$(printf '%s\n' "$out_collapse" | kv VERDICT)"
+out_both=$(bash "$ST" finish "$RD2P1" --merged "$F_TWO_P1_MERGED"); rc=$?
+expect "council accepts preserving both P1 findings 1-to-1" "0:dirty:2" "$rc:$(printf '%s\n' "$out_both" | kv VERDICT):$(printf '%s\n' "$out_both" | kv P1)"
+
+# 8d. Council 1-to-1 step_back[] proposal binding: 2 step_back proposals CANNOT collapse into 1!
+F_TWO_SB="$TMP/two-sb-slot.json"
+cat > "$F_TWO_SB" <<'EOF'
+{
+  "summary": "Two structural proposals.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Proposal A", "invites_because": "a", "approach_change": "x", "prevent": "t1" },
+    { "classes": ["C2"], "name": "Proposal B", "invites_because": "b", "approach_change": "y", "prevent": "t2" }
+  ],
+  "out_of_scope": []
+}
+EOF
+F_ONE_SB_MERGED="$TMP/one-sb-merged.json"
+cat > "$F_ONE_SB_MERGED" <<'EOF'
+{
+  "summary": "Dropped Proposal B.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Proposal A", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["s1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+F_TWO_SB_MERGED="$TMP/two-sb-merged.json"
+cat > "$F_TWO_SB_MERGED" <<'EOF'
+{
+  "summary": "Kept both proposals.",
+  "verdict": "clean",
+  "findings": [],
+  "step_back": [
+    { "classes": ["C1"], "name": "Proposal A", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["s1"] },
+    { "classes": ["C2"], "name": "Proposal B", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["s1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+po_2sb=$(bash "$ST" prepare --purpose step-back --mode step-back --base main --slots s1,s2 --owner "$OWNER")
+RD2SB=$(printf '%s\n' "$po_2sb" | kv ROUND_DIR)
+bash "$ST" claim-slot "$RD2SB" --slot s1 --attempt 1 --owner "$OWNER" --provider codex --model gpt-6.2-sol --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2SB" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2sba --child-thread-id ct2sba >/dev/null
+bash "$ST" record-result "$RD2SB" --slot s1 --attempt 1 --owner "$OWNER" --task-id t2sba --input "$F_TWO_SB" >/dev/null
+bash "$ST" claim-slot "$RD2SB" --slot s2 --attempt 1 --owner "$OWNER" --provider antigravity --model gemini-4-neon --options-json '{}' >/dev/null
+bash "$ST" record-dispatch "$RD2SB" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2sbb --child-thread-id ct2sbb >/dev/null
+bash "$ST" record-result "$RD2SB" --slot s2 --attempt 1 --owner "$OWNER" --task-id t2sbb --input "$F_CLEAN" >/dev/null
+out_sb1=$(bash "$ST" finish "$RD2SB" --merged "$F_ONE_SB_MERGED"); rc=$?
+expect "council rejects dropping 1 of 2 step_back[] proposals" "5:error" "$rc:$(printf '%s\n' "$out_sb1" | kv VERDICT)"
+out_sb2=$(bash "$ST" finish "$RD2SB" --merged "$F_TWO_SB_MERGED"); rc=$?
+expect "council accepts preserving both step_back[] proposals 1-to-1" "0:clean" "$rc:$(printf '%s\n' "$out_sb2" | kv VERDICT)"
+
+# 8e. SIGTERM on submodule git rev-parse HEAD fails closed & unborn nested gitdir leaks ZERO stderr!
+SIG_BIN="$TMP/t3-git-sigterm"
+mkdir -p "$SIG_BIN"
+REAL_GIT=$(command -v git)
+cat > "$SIG_BIN/git" <<EOF
+#!/usr/bin/env bash
+is_sub=0; is_rp=0; is_head=0
+for arg in "\$@"; do
+  case "\$arg" in
+    *vendor/sub*) is_sub=1 ;;
+    rev-parse) is_rp=1 ;;
+    HEAD) is_head=1 ;;
+  esac
+done
+if [ "\$is_sub" = 1 ] && [ "\$is_rp" = 1 ] && [ "\$is_head" = 1 ]; then
+  kill -TERM \$\$
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$SIG_BIN/git"
+(
+  cd "$SUB_HOST" || exit 2
+  PATH="$SIG_BIN:$PATH" bash "$ST" prepare --purpose full --mode full --base main --slots s1 --owner "$OWNER" >/dev/null 2>&1
+)
+[ "$?" -ne 0 ] && ok || bad "t3 prepare exited 0 despite SIGTERM on submodule rev-parse HEAD!"
+
+UNB_HOST="$TMP/t3-unborn-host"
+mkdir -p "$UNB_HOST/nested-unb"
+(
+  cd "$UNB_HOST" || exit 2
+  git init -q -b main . && git config user.email t@example.invalid && git config user.name t
+  printf 'h1\n' > h.txt && git add h.txt && git commit -qm h1
+  git switch -qc feat/unb
+  printf 'h2\n' >> h.txt && git commit -qam h2
+  (cd nested-unb && git init -q -b main .)
+  printf 'u1\n' > nested-unb/x.txt
+  err_u=$(bash "$ST" prepare --purpose initial-full --mode full --base main --slots s1 --owner "$OWNER" 2>&1 >/dev/null)
+  rc_u=$?
+  [ "$rc_u" -eq 0 ] && ! printf '%s' "$err_u" | grep -q "fatal: Needed a single revision"
+) && ok || bad "t3 prepare leaked unborn stderr or failed on unborn nested gitdir"
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

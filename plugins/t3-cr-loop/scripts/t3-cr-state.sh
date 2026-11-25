@@ -454,8 +454,7 @@ cmd_config_authorize_provider() {
 
 cmd_config_show() {
   caps_file=""; ov_model=""; ov_effort=""; ov_council=""; ov_single=""
-  ignore_proj=0
-  [ "${T3_CR_IGNORE_PROJECT_CONFIG:-0}" = "1" ] && ignore_proj=1
+  ignore_proj=0; ignore_proj_set=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --capabilities) [ $# -ge 2 ] || die "config-show: --capabilities requires a file"; caps_file="$2"; shift 2 ;;
@@ -463,11 +462,27 @@ cmd_config_show() {
       --override-effort) [ $# -ge 2 ] || die "config-show: --override-effort requires a value"; ov_effort="$2"; shift 2 ;;
       --override-council) [ $# -ge 2 ] || die "config-show: --override-council requires a value"; ov_council="$2"; shift 2 ;;
       --single) [ $# -ge 2 ] || die "config-show: --single requires a value"; ov_single="$2"; shift 2 ;;
-      --ignore-project-config) ignore_proj=1; shift ;;
-      --use-project-config) ignore_proj=0; shift ;;
+      --ignore-project-config) ignore_proj=1; ignore_proj_set=1; shift ;;
+      --use-project-config) ignore_proj=0; ignore_proj_set=1; shift ;;
       *) die "config-show: unknown arg $1" ;;
     esac
   done
+  if [ "$ignore_proj_set" -eq 0 ]; then
+    if [ "${T3_CR_IGNORE_PROJECT_CONFIG:-0}" = "1" ]; then
+      ignore_proj=1
+    elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      _cs_cd=$(git rev-parse --git-common-dir 2>/dev/null)
+      _cs_br=$(git branch --show-current 2>/dev/null)
+      if [ -n "$_cs_cd" ] && [ -n "$_cs_br" ]; then
+        _cs_cd=$(cd "$_cs_cd" && pwd -P 2>/dev/null)
+        _cs_bk=$(printf '%s' "$_cs_br" | sed 's|/|__|g; s|[^A-Za-z0-9._-]|_|g')
+        _cs_sf="$_cs_cd/t3-cr-loop/$_cs_bk/state"
+        if [ -f "$_cs_sf" ] && [ ! -L "$_cs_sf" ]; then
+          [ "$(sed -n 's/^ignore_project_config=//p' "$_cs_sf" | tail -n 1)" = "1" ] && ignore_proj=1
+        fi
+      fi
+    fi
+  fi
   ucfg=$(user_config_path)
   pcfg_disk=""
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -1006,7 +1021,12 @@ tree_fp_v2() {
 
     sub run_git_raw {
       my ($dir, @args) = @_;
-      open(my $ph, "-|", "git", "-C", $dir, @args) or return (1, "");
+      my $pid = open(my $ph, "-|");
+      return (1, "") unless defined $pid;
+      if ($pid == 0) {
+        open(STDERR, ">", "/dev/null");
+        exec("git", "-C", $dir, @args) or exit 127;
+      }
       binmode($ph, ":raw");
       local $/;
       my $out = <$ph>;
@@ -1029,12 +1049,19 @@ tree_fp_v2() {
     $hash_git_repo = sub {
       my ($dir, $depth) = @_;
       exit 1 if $depth > 8;
-      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "HEAD");
+      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "--quiet", "HEAD");
       $sh =~ s/\s+//g;
-      if ($rc_h != 0 || !length $sh) {
-        my ($rc_sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
-        exit 1 unless $rc_sym == 0;
+      if ($rc_h == 0 && $sh =~ /\A[0-9a-f]{40,64}\z/) {
+        # valid committed HEAD
+      } elsif ($rc_h == 1 && !length $sh) {
+        my ($rc_sym, $sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
+        $sym =~ s/\s+//g;
+        exit 1 unless $rc_sym == 0 && $sym =~ m{\Arefs/heads/.+\z};
+        my ($rc_sr, $sr_out) = run_git_raw($dir, "show-ref", "--verify", "--quiet", $sym);
+        exit 1 unless $rc_sr == 1 && !length $sr_out;
         $sh = "UNBORN";
+      } else {
+        exit 1;
       }
       my $ctx = Digest::SHA->new(256);
       $ctx->add("head\0$sh\0");
@@ -1634,9 +1661,17 @@ cmd_record_result() {
       *) die "record-result: unknown arg $1" ;;
     esac
   done
-  [ -n "$slot" ] && [ -n "$attempt" ] && [ -n "$owner" ] && [ -f "$infile" ] || die "record-result: missing required args or input file"
+  [ -n "$slot" ] && [ -n "$attempt" ] && [ -n "$owner" ] && [ -f "$infile" ] && [ ! -L "$infile" ] || die "record-result: missing required args or non-regular/symlink input file"
   is_uint "$attempt" || die "record-result: --attempt must be an integer"
+  case "$slot" in
+    ""|.|..|*[^A-Za-z0-9._-]*) die "record-result: invalid slot id '$slot'" ;;
+  esac
   af="$d/active_round.json"; [ -f "$af" ] || die "record-result: missing $af"
+
+  # 0. Snapshot input file ONCE into an isolated staging file inside $d so hashing,
+  #    parsing, canonicalization, and invalid-input archival all read the EXACT same bytes (zero TOCTOU!).
+  snap_in="$d/.record-input-${slot}-a${attempt}.tmp.$$"
+  cp "$infile" "$snap_in" || { rm -f "$snap_in"; die "record-result: cannot snapshot input file"; }
 
   # 1. Strict CAS & slot-name validation BEFORE running parse-review.pl or writing/deleting ANY file!
   pre_chk=$(perl -MJSON::PP -MDigest::SHA=sha256_hex -e '
@@ -1666,33 +1701,36 @@ cmd_record_result() {
     die "CAS failed: slot $slot in state '\''$st'\'', expected running or waiting\n"
       unless $st eq "running" || $st eq "waiting";
     print "ACTION=proceed\nIN_SHA=$in_sha\n";
-  ' "$af" "$slot" "$attempt" "$owner" "$tid" "$infile") || die "record-result CAS failed"
+  ' "$af" "$slot" "$attempt" "$owner" "$tid" "$snap_in") || { rm -f "$snap_in"; die "record-result CAS failed"; }
 
   act=$(printf '%s\n' "$pre_chk" | sed -n 's/^ACTION=//p' | head -n 1)
   in_sha=$(printf '%s\n' "$pre_chk" | sed -n 's/^IN_SHA=//p' | head -n 1)
   if [ "$act" = "dup" ]; then
+    rm -f "$snap_in"
     dup_st=$(printf '%s\n' "$pre_chk" | sed -n 's/^STATE=//p' | head -n 1)
     dup_rf=$(printf '%s\n' "$pre_chk" | sed -n 's/^RESULT_FILE=//p' | head -n 1)
     printf 'DUPLICATE_NOOP=1\nSLOT=%s\nATTEMPT=%s\nSLOT_STATE=%s\nRESULT_FILE=%s\n' "$slot" "$attempt" "$dup_st" "$dup_rf"
     [ "$dup_st" = "completed_valid" ] && return 0 || exit 5
   fi
 
-  # 2. Validate into a temporary file inside $d (never overwriting live result paths prematurely).
+  # 2. Validate the SINGLE snapshot into a temporary file inside $d (never re-reading $infile!).
   canon_out="$d/result-${slot}-a${attempt}.json"
   invalid_out="$d/result-${slot}-a${attempt}.invalid.txt"
   tmp_canon="$d/.result-${slot}-a${attempt}.tmp.$$.json"
   tmp_inv="$d/.result-${slot}-a${attempt}.tmp.$$.invalid.txt"
-  vout=$(perl "$PARSER" --validate-only "$infile" --write-canonical "$tmp_canon")
+  vout=$(perl "$PARSER" --validate-only "$snap_in" --write-canonical "$tmp_canon")
   vrc=$?
 
   new_st="completed_valid"; err_reason=""; res_path="$canon_out"; staged_art="$tmp_canon"
   if [ "$vrc" -ne 0 ]; then
     rm -f "$tmp_canon"
-    cp "$infile" "$tmp_inv" || { rm -f "$tmp_inv"; die "cannot stage invalid result"; }
+    mv "$snap_in" "$tmp_inv" || { rm -f "$snap_in" "$tmp_inv"; die "cannot stage invalid result"; }
     new_st="completed_invalid"
     err_reason=$(printf '%s\n' "$vout" | sed -n 's/^ERROR=//p' | head -n 1)
     res_path="$invalid_out"
     staged_art="$tmp_inv"
+  else
+    rm -f "$snap_in"
   fi
 
   # Refuse directory/symlink conflicts at artifact target AND active_round.json BEFORE moving!
@@ -1940,27 +1978,50 @@ cmd_finish() {
     exit 3
   fi
 
-  # Archive merged result and strictly validate/render it
+  # Snapshot merged input (and optional dismissed-findings) ONCE into isolated staging files inside $d
+  # so parsing, slot-binding verification, and archival ALL consume the EXACT same immutable bytes (zero TOCTOU!).
   res="$d/merged-result.json"
+  dism_archive="$d/dismissed-findings.json"
   if [ -d "$res" ] || [ -L "$res" ]; then
     printf 'VERDICT=error\nREASON=refusing directory or symlink at %s\n' "$res"
     exit 5
   fi
-  if [ "$(cd "$(dirname "$merged_file")" && pwd -P)/$(basename "$merged_file")" != "$res" ]; then
-    cp "$merged_file" "$res" || die "cannot copy merged result to $res"
+  if [ -n "$dismissed_file" ] && { [ -d "$dism_archive" ] || [ -L "$dism_archive" ]; }; then
+    printf 'VERDICT=error\nREASON=refusing directory or symlink at %s\n' "$dism_archive"
+    exit 5
   fi
+  snap_merged="$d/.finish-merged.tmp.$$"
+  cp "$merged_file" "$snap_merged" || { rm -f "$snap_merged"; die "cannot snapshot merged result"; }
+  snap_merged_sha=$(perl -MDigest::SHA=sha256_hex -e '
+    open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+    local $/; my $b = <$fh>; close $fh or exit 1;
+    print sha256_hex(defined $b ? $b : "");
+  ' "$snap_merged") || { rm -f "$snap_merged"; die "cannot hash merged snapshot"; }
+  snap_dism=""; snap_dism_sha=""
+  if [ -n "$dismissed_file" ]; then
+    snap_dism="$d/.finish-dismissed.tmp.$$"
+    cp "$dismissed_file" "$snap_dism" || { rm -f "$snap_merged" "$snap_dism"; die "cannot snapshot dismissed findings"; }
+    snap_dism_sha=$(perl -MDigest::SHA=sha256_hex -e '
+      open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+      local $/; my $b = <$fh>; close $fh or exit 1;
+      print sha256_hex(defined $b ? $b : "");
+    ' "$snap_dism") || { rm -f "$snap_merged" "$snap_dism"; die "cannot hash dismissed snapshot"; }
+  fi
+
   frag="$d/ledger-fragment.md"; md="$d/review.md"
-  parsed=$(perl "$PARSER" "$res" "$(snum next_class_id)" "$LEDGER" "$frag" "$md" --allow-sources)
+  parsed=$(perl "$PARSER" "$snap_merged" "$(snum next_class_id)" "$LEDGER" "$frag" "$md" --allow-sources)
   prc=$?
   if [ "$prc" -ne 0 ]; then
+    mv "$snap_merged" "$res" 2>/dev/null || rm -f "$snap_merged"
+    rm -f "$snap_dism"
     printf 'VERDICT=error\n%s\nRESULT=%s\n' "$(printf '%s\n' "$parsed" | sed -n 's/^ERROR=/REASON=/p')" "$res"
     exit 5
   fi
 
-  # Enforce strict slot-to-merged integrity (prevents settling blocking slot findings as clean!).
+  # Enforce strict per-finding & per-proposal slot-to-merged integrity on the EXACT same snapshot!
   bind_err=$(perl -MJSON::PP -MDigest::SHA=sha256_hex -MCwd=abs_path -e '
     use strict; use warnings;
-    my ($af, $round_dir, $merged_path, $skip_p3, $mode, $dismissed_path) = @ARGV;
+    my ($af, $round_dir, $merged_path, $skip_p3, $mode, $dismissed_path, $want_msha) = @ARGV;
     my $J = JSON::PP->new->utf8;
     my $JC = JSON::PP->new->utf8->canonical;
     my %rank = (P0 => 4, P1 => 3, P2 => 2, P3 => 1);
@@ -1972,7 +2033,9 @@ cmd_finish() {
 
     my $rdir_real = abs_path($round_dir) // die "cannot resolve round dir\n";
     open(my $fh, "<:raw", $af) or die "cannot read $af\n"; local $/; my $ar = $J->decode(<$fh>); close $fh;
-    open(my $mfh, "<:raw", $merged_path) or die "cannot read $merged_path\n"; local $/; my $merged = $J->decode(<$mfh>); close $mfh;
+    open(my $mfh, "<:raw", $merged_path) or die "cannot read $merged_path\n"; local $/; my $mbytes = <$mfh>; close $mfh;
+    die "merged snapshot mutated mid-verification\n" if length($want_msha // "") && sha256_hex($mbytes) ne $want_msha;
+    my $merged = $J->decode($mbytes);
 
     my @valid_slots;
     for my $k (@{$ar->{slotOrder}}) {
@@ -2011,7 +2074,7 @@ cmd_finish() {
       exit 0;
     }
 
-    # Multi-reviewer council: load optional evidenced --dismissed-findings.
+    # Multi-reviewer council: load optional evidenced --dismissed-findings (1-to-1 consumable!).
     my @dismissed;
     if (defined $dismissed_path && length $dismissed_path) {
       open(my $dfh, "<:raw", $dismissed_path) or die "cannot read --dismissed-findings\n"; local $/; my $draw = <$dfh>; close $dfh;
@@ -2030,79 +2093,161 @@ cmd_finish() {
       }
     }
 
-    my $is_dismissed = sub {
+    my @dism_used = (0) x scalar(@dismissed);
+    my $consume_dismissal = sub {
       my ($slot, $model_tag, $f) = @_;
-      for my $d (@dismissed) {
+      for my $idx (0 .. $#dismissed) {
+        next if $dism_used[$idx];
+        my $d = $dismissed[$idx];
         next unless ($d->{slot} eq $slot || $d->{slot} eq $model_tag);
         next unless $d->{severity} eq $f->{severity};
         next unless $d->{title} eq $f->{title};
-        if (defined $d->{reopens} && length $d->{reopens}) {
-          next unless $d->{reopens} eq ($f->{reopens} // "");
+        my $f_reo = $f->{reopens} // "";
+        my $d_reo = defined($d->{reopens}) ? $d->{reopens} : "";
+        if (length($f_reo) || length($d_reo)) {
+          next unless $d_reo eq $f_reo;
         }
+        $dism_used[$idx] = 1;
         return 1;
       }
       return 0;
     };
 
-    my %merged_reopen_max;
-    my %merged_source_max;
-    for my $mf (@{$merged->{findings} || []}) {
-      my $rk = $rank{$mf->{severity}} // 0;
-      if (length($mf->{reopens} // "")) {
-        my $cid = $mf->{reopens};
-        $merged_reopen_max{$cid} = $rk if ($merged_reopen_max{$cid} // 0) < $rk;
-      }
-      if ($is_blocking->($mf->{severity})) {
-        for my $src (@{$mf->{sources} || []}) {
-          $merged_source_max{$src} = $rk if ($merged_source_max{$src} // 0) < $rk;
+    # Bipartite maximum matching helper (Kuhn) for 1-to-1 per-slot binding.
+    my $has_perfect_matching = sub {
+      my ($n_left, $n_right, $adj) = @_;
+      my @match_r = (-1) x $n_right;
+      my $dfs;
+      $dfs = sub {
+        my ($u, $vis) = @_;
+        for my $v (@{$adj->[$u] || []}) {
+          next if $vis->[$v];
+          $vis->[$v] = 1;
+          if ($match_r[$v] == -1 || $dfs->($match_r[$v], $vis)) {
+            $match_r[$v] = $u;
+            return 1;
+          }
         }
+        return 0;
+      };
+      for my $u (0 .. $n_left - 1) {
+        my @vis = (0) x $n_right;
+        return 0 unless $dfs->($u, \@vis);
       }
-    }
+      return 1;
+    };
 
+    my $has_src = sub {
+      my ($item, $sn, $mtag) = @_;
+      for my $src (@{$item->{sources} || []}) {
+        return 1 if $src eq $sn || $src eq $mtag;
+      }
+      return 0;
+    };
+
+    my @m_findings = @{$merged->{findings} || []};
+    my @m_sbs      = @{$merged->{step_back} || []};
     my @unaccounted;
-    my $any_slot_sb = 0;
+
     for my $vs (@valid_slots) {
       my $sn = $vs->{slot};
       my $mtag = "$vs->{meta}{providerInstanceId}/$vs->{meta}{model}";
-      $any_slot_sb = 1 if @{$vs->{obj}{step_back} || []} > 0;
-      my $max_undism_rank = 0;
-      my @undism_titles;
+
+      # 1. Per-finding 1-to-1 blocking binding (with severity >= and reopens preservation!).
+      my @need_f;
       for my $f (@{$vs->{obj}{findings} || []}) {
         next unless $is_blocking->($f->{severity});
-        next if $is_dismissed->($sn, $mtag, $f);
-        my $rk = $rank{$f->{severity}} // 0;
-        $max_undism_rank = $rk if $rk > $max_undism_rank;
-        push @undism_titles, "$f->{severity}:$f->{title}";
-        if (length($f->{reopens} // "")) {
-          my $cid = $f->{reopens};
-          if (($merged_reopen_max{$cid} // 0) < $rk) {
-            push @unaccounted, "slot $sn ($mtag) reopened blocking $cid ($f->{severity}) missing or downgraded in merged findings without --dismissed-findings";
+        next if $consume_dismissal->($sn, $mtag, $f);
+        push @need_f, $f;
+      }
+      if (@need_f) {
+        my @cand_mf = grep { $is_blocking->($_->{severity}) && $has_src->($_, $sn, $mtag) } @m_findings;
+        my @adj;
+        for my $i (0 .. $#need_f) {
+          my $nf = $need_f[$i];
+          my $nrk = $rank{$nf->{severity}} // 0;
+          my $nreo = $nf->{reopens} // "";
+          my @edges;
+          for my $j (0 .. $#cand_mf) {
+            my $mf = $cand_mf[$j];
+            my $mrk = $rank{$mf->{severity}} // 0;
+            next if $mrk < $nrk;
+            if (length $nreo) {
+              next unless ($mf->{reopens} // "") eq $nreo;
+            }
+            push @edges, $j;
           }
+          push @adj, \@edges;
+        }
+        if (!$has_perfect_matching->(scalar(@need_f), scalar(@cand_mf), \@adj)) {
+          my @titles = map { "$_->{severity}:" . (length($_->{reopens} // "") ? "$_->{reopens}:" : "") . $_->{title} } @need_f;
+          push @unaccounted, "slot $sn ($mtag) has " . scalar(@need_f) . " undismissed blocking finding(s) [" . join(", ", @titles) . "] not matched 1-to-1 in merged findings[].sources at >= severity (and matching reopens) without evidenced --dismissed-findings";
         }
       }
-      if ($max_undism_rank > 0) {
-        my $got_rk = $merged_source_max{$mtag} // 0;
-        $got_rk = $merged_source_max{$sn} if ($merged_source_max{$sn} // 0) > $got_rk;
-        if ($got_rk < $max_undism_rank) {
-          push @unaccounted, "slot $sn ($mtag) blocking finding(s) [" . join(", ", @undism_titles) . "] not traced in merged findings[].sources at >= severity without evidenced --dismissed-findings";
+
+      # 2. Per-proposal 1-to-1 step_back[] binding (requires sources attribution & class-set preservation!).
+      my @slot_sbs = @{$vs->{obj}{step_back} || []};
+      if (@slot_sbs) {
+        my @cand_sbs = grep { $has_src->($_, $sn, $mtag) } @m_sbs;
+        my @adj;
+        for my $i (0 .. $#slot_sbs) {
+          my %need_cls = map { $_ => 1 } @{$slot_sbs[$i]{classes} || []};
+          my @edges;
+          for my $j (0 .. $#cand_sbs) {
+            my %got_cls = map { $_ => 1 } @{$cand_sbs[$j]{classes} || []};
+            my $ok_cls = 1;
+            for my $c (keys %need_cls) {
+              if (!$got_cls{$c}) { $ok_cls = 0; last; }
+            }
+            push @edges, $j if $ok_cls;
+          }
+          push @adj, \@edges;
+        }
+        if (!$has_perfect_matching->(scalar(@slot_sbs), scalar(@cand_sbs), \@adj)) {
+          push @unaccounted, "slot $sn ($mtag) reported " . scalar(@slot_sbs) . " step_back[] proposal(s) not preserved 1-to-1 in merged step_back[] (with sources attributing slot and covering all classes)";
         }
       }
-    }
-    if ($mode eq "step-back" && $any_slot_sb && @{$merged->{step_back} || []} == 0) {
-      push @unaccounted, "council slot(s) reported step_back[] items that were dropped from merged output";
     }
     if (@unaccounted) {
       die join("; ", @unaccounted) . "\n";
     }
-  ' "$af" "$d" "$res" "$SKIP_P3" "$mode" "$dismissed_file" 2>&1)
+  ' "$af" "$d" "$snap_merged" "$SKIP_P3" "$mode" "$snap_dism" "$snap_merged_sha" 2>&1)
   brc=$?
   if [ "$brc" -ne 0 ]; then
+    mv "$snap_merged" "$res" 2>/dev/null || rm -f "$snap_merged"
+    rm -f "$snap_dism"
     bind_err=$(printf '%s' "$bind_err" | tr '\n' ' ')
     printf 'VERDICT=error\nREASON=%s\nRESULT=%s\n' "$bind_err" "$res"
     exit 5
   fi
-  if [ -n "$dismissed_file" ]; then
-    cp "$dismissed_file" "$d/dismissed-findings.json" || die "cannot archive dismissed findings"
+
+  # Atomically commit the exact verified snapshot to $res (and dismissed-findings.json) + post-verify!
+  if [ -d "$res" ] || [ -L "$res" ]; then
+    rm -f "$snap_merged" "$snap_dism"
+    printf 'VERDICT=error\nREASON=refusing directory or symlink at %s\n' "$res"
+    exit 5
+  fi
+  mv "$snap_merged" "$res" || { rm -f "$snap_merged" "$snap_dism"; die "cannot commit merged result to $res"; }
+  post_msha=$(perl -MDigest::SHA=sha256_hex -e '
+    exit 1 if -l $ARGV[0] || !-f $ARGV[0];
+    open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+    local $/; my $b = <$fh>; close $fh or exit 1;
+    print sha256_hex(defined $b ? $b : "");
+  ' "$res") || { rm -f "$snap_dism"; die "finish: post-move hash failed on $res"; }
+  [ "$post_msha" = "$snap_merged_sha" ] || { rm -f "$snap_dism"; die "finish: post-move byte verification failed on $res"; }
+  if [ -n "$snap_dism" ]; then
+    if [ -d "$dism_archive" ] || [ -L "$dism_archive" ]; then
+      rm -f "$snap_dism"
+      die "finish: refusing directory or symlink at $dism_archive"
+    fi
+    mv "$snap_dism" "$dism_archive" || { rm -f "$snap_dism"; die "cannot archive dismissed findings"; }
+    post_dsha=$(perl -MDigest::SHA=sha256_hex -e '
+      exit 1 if -l $ARGV[0] || !-f $ARGV[0];
+      open(my $fh, "<:raw", $ARGV[0]) or exit 1;
+      local $/; my $b = <$fh>; close $fh or exit 1;
+      print sha256_hex(defined $b ? $b : "");
+    ' "$dism_archive") || die "finish: post-move hash failed on $dism_archive"
+    [ "$post_dsha" = "$snap_dism_sha" ] || die "finish: post-move byte verification failed on $dism_archive"
   fi
   pv() { printf '%s\n' "$parsed" | sed -n "s/^$1=//p"; }
   c0=$(pv P0); c1=$(pv P1); c2=$(pv P2); c3=$(pv P3); total=$(pv TOTAL)

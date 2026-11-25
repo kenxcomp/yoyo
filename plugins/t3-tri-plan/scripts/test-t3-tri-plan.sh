@@ -163,6 +163,9 @@ def main():
         if os.environ.get("MOCK_CURRENT_MODE", "") == "exit0_missing_key":
             print(json.dumps({"error": "missing current_task key"}))
             return 0
+        if os.environ.get("MOCK_CURRENT_MODE", "") == "exit0_null_error":
+            print(json.dumps({"current_task": None, "error": "context backend failed"}))
+            return 0
         pf = ptr_file()
         tdir = pf.read_text().strip() if (pf and pf.is_file()) else None
         if "--json" in args:
@@ -935,6 +938,11 @@ assert_contains "RECOVERY_CASE=partial_pointer_only" "$out" "RECOVERY_CASE=parti
 # =============================================================================
 printf '\n=== Group G: PRD Material Supersedence Crash & Recreated Source Conflict + Legacy Migration ===\n'
 # =============================================================================
+
+# First resolve Test 6d's activation_uncertain via the explicit human-verified exit path before PRD material pivot!
+rm -rf "$REPO/.trellis/.mock-ptrs"
+bash "$STATE" resolve-activation --task "$TASK" --repo "$REPO" --resolution reset_to_ready --evidence "human cleared partial pointer before PRD pivot" >/dev/null
+assert_rc "resolve-activation reset_to_ready exits activation_uncertain cleanly before PRD pivot" "$?" 0
 
 # Simulate crash right after moving candidates/ during PRD material change!
 printf '\nBREAKING PRD CHANGE: new architecture required.\n' >> "$TASK/prd.md"
@@ -1843,6 +1851,469 @@ EOF
 chmod +x "$SHIM_BIN/git"
 out=$(PATH="$SHIM_BIN:$PATH" perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'compute_worktree_fp($ARGV[0], "")' "$REPO_J" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && assert_contains "TriTx::_git SIGTERM fails closed with rc=143" "$out" "rc=143" || fail "TriTx::_git treated SIGTERM as rc=0!"
+
+# =============================================================================
+printf '\n=== Group K: Round 3 Hardening Regressions ===\n'
+# =============================================================================
+
+# K1. activation_uncertain: exit 0 with {"current_task":null,"error":...} AND commit-phase0 --change-kind material MUST both fail closed!
+out=$(MOCK_CURRENT_MODE=exit0_null_error bash "$STATE" resolve-activation --task "$TASK_J" --repo "$REPO_J" --resolution reset_to_ready --evidence "error probe test" 2>&1); rc=$?
+assert_rc "resolve-activation reset_to_ready rejects exit 0 JSON with current_task:null + error key" "$rc" 3
+cp "$TASK_J/prd.md" "$TMP/prd-j.bak"
+printf '\n- Material change attempted while activation_uncertain\n' >> "$TASK_J/prd.md"
+out=$(bash "$STATE" commit-phase0 --task "$TASK_J" --repo "$REPO_J" --change-kind material --reason "try bypassing activation_uncertain" 2>&1); rc=$?
+assert_rc "commit-phase0 --change-kind material blocked while Phase 6 is activation_uncertain (exit 3)" "$rc" 3
+out_insp=$(bash "$STATE" inspect-task --task "$TASK_J" 2>&1)
+assert_contains "Phase 6 remains activation_uncertain after refused material PRD change" "$out_insp" "PHASE6_STATE=activation_uncertain"
+cp "$TMP/prd-j.bak" "$TASK_J/prd.md"
+
+# K2. FIFO at .activation.lock or .tri-plan.lock MUST fail immediately (EXTERNAL_CONFLICT, NEVER hang)!
+REPO_FIFO="$TMP/repo-fifo"
+make_repo "$REPO_FIFO"
+TASK_FIFO="$REPO_FIFO/.trellis/tasks/01-fifo"
+mkdir -p "$TASK_FIFO/research/plans"
+printf '# PRD\n' > "$TASK_FIFO/prd.md"
+mkfifo "$TASK_FIFO/research/plans/.activation.lock"
+out=$(bash "$STATE" commit-phase0 --task "$TASK_FIFO" --repo "$REPO_FIFO" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && assert_contains "FIFO at .activation.lock fails fast with EXTERNAL_CONFLICT" "$out" "EXTERNAL_CONFLICT" || fail "FIFO at .activation.lock did not fail!"
+rm -f "$TASK_FIFO/research/plans/.activation.lock" "$TASK_FIFO/research/plans/.tri-plan.lock"
+mkfifo "$TASK_FIFO/research/plans/.tri-plan.lock"
+out=$(bash "$STATE" commit-phase0 --task "$TASK_FIFO" --repo "$REPO_FIFO" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && assert_contains "FIFO at .tri-plan.lock fails fast with EXTERNAL_CONFLICT" "$out" "EXTERNAL_CONFLICT" || fail "FIFO at .tri-plan.lock did not fail!"
+rm -f "$TASK_FIFO/research/plans/.tri-plan.lock"
+
+# K3. Chinese task directory (.trellis/tasks/01-中文) works end-to-end with ZERO EXTERNAL_CONFLICT and ZERO double-encoded STDOUT paths!
+REPO_K="$TMP/repo-k"
+make_repo "$REPO_K"
+mkdir -p "$REPO_K/src"
+printf 'print(1)\n' > "$REPO_K/src/app.py"
+printf 'numeric file test\n' > "$REPO_K/709"
+cat > "$REPO_K/.t3-tri-plan.json" <<'EOF'
+{
+  "version": 1,
+  "knobs": { "roundCap": 1, "maxStepBacks": 0 }
+}
+EOF
+git -C "$REPO_K" add -A && git -C "$REPO_K" commit -q -m "add app, numeric file, and project roundCap=1"
+
+TASK_K="$REPO_K/.trellis/tasks/01-中文"
+mkdir -p "$TASK_K"
+printf '# 中文 PRD\n- 核心目标\n' > "$TASK_K/prd.md"
+cat > "$TASK_K/task.json" <<'EOF'
+{ "id": "01-中文", "title": "中文任务", "status": "planning" }
+EOF
+
+out_ik=$(bash "$STATE" inspect-task --task "$TASK_K" 2>&1); rc=$?
+assert_rc "inspect-task on Chinese task dir 01-中文 succeeds" "$rc" 0
+TDIR_OUT=$(printf '%s\n' "$out_ik" | sed -n 's/^TASK_DIR=//p')
+[ -d "$TDIR_OUT" ] && ok "inspect-task TASK_DIR prints exact valid UTF-8 path (no mojibake): $TDIR_OUT" || fail "inspect-task TASK_DIR mojibaked: $TDIR_OUT"
+
+# Initialize WITH project config active (roundCap=1, maxStepBacks=0) to also test K5 toggle!
+out=$(bash "$STATE" commit-phase0 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
+assert_rc "commit-phase0 on Chinese task dir 01-中文 succeeds (no EXTERNAL_CONFLICT)" "$rc" 0
+
+# Phase 1 -> Phase 2a -> Phase 2b on Chinese task dir!
+pd_k=$(bash "$STATE" prepare-design --task "$TASK_K" --repo "$REPO_K" --slots-json "$TMP/designers.json" --owner "owner-k1")
+PDK_RUN=$(printf '%s\n' "$pd_k" | sed -n 's/^RUN_ID=//p')
+for sn in candidate-a candidate-b candidate-c; do
+  bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PDK_RUN" --slot "$sn" --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+  bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PDK_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot "$sn" --attempt 1 --task-id "tk-$sn" --child-thread-id "ctk-$sn" --child-run-id "crk-$sn" >/dev/null
+  rr_k=$(bash "$STATE" record-result --task "$TASK_K" --run-id "$PDK_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot "$sn" --attempt 1 --task-id "tk-$sn" --child-run-id "crk-$sn" --input "$TMP/cand-ok.md")
+  RF_K=$(printf '%s\n' "$rr_k" | sed -n 's/^RESULT_FILE=//p')
+  [ -f "$RF_K" ] || fail "record-result RESULT_FILE mojibaked on Chinese task dir: $RF_K"
+done
+ok "Phase 1 record-result RESULT_FILE paths exist verbatim on Chinese task dir"
+bash "$STATE" commit-phase1 --task "$TASK_K" --repo "$REPO_K" >/dev/null
+assert_rc "commit-phase1 on Chinese task dir succeeds" "$?" 0
+
+pj_k=$(bash "$STATE" prepare-judge --task "$TASK_K" --repo "$REPO_K" --target-json "$TMP/judge-target.json" --owner "owner-k1")
+PJK_RUN=$(printf '%s\n' "$pj_k" | sed -n 's/^RUN_ID=//p')
+CM_K=$(printf '%s\n' "$pj_k" | sed -n 's/^CANDIDATES_MANIFEST=//p')
+[ -f "$CM_K" ] && ok "prepare-judge CANDIDATES_MANIFEST path exists verbatim on Chinese task dir" || fail "CANDIDATES_MANIFEST mojibaked: $CM_K"
+CA_K=$(shasum -a 256 "$TASK_K/research/plans/candidates/candidate-a.md" | awk '{print $1}')
+CB_K=$(shasum -a 256 "$TASK_K/research/plans/candidates/candidate-b.md" | awk '{print $1}')
+CC_K=$(shasum -a 256 "$TASK_K/research/plans/candidates/candidate-c.md" | awk '{print $1}')
+cat > "$TMP/judge-k.json" <<EOF
+{
+  "candidate_set": [
+    { "slot": "candidate-a", "sha256": "$CA_K" },
+    { "slot": "candidate-b", "sha256": "$CB_K" },
+    { "slot": "candidate-c", "sha256": "$CC_K" }
+  ],
+  "fact_checks": [
+    { "id": "F1", "candidate_slot": "candidate-c", "claim": "src/app.py:1 ok", "status": "CONFIRMED", "file_line_evidence": "src/app.py:1" }
+  ],
+  "axis_matrix": {
+    "architecture_fit": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "ssot_invariants": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "hidden_callers": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "migration_compat": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "real_entrypoint_tests": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "abstraction_restraint": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "prd_scope_fidelity": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "rollback_viability": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "unique_risks": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "key_assumptions": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "dependency_order": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}},
+    "failure_recovery_acceptance": {"candidate-a":{"rating":"strong","evidence_note":"ok"},"candidate-b":{"rating":"acceptable","evidence_note":"ok"},"candidate-c":{"rating":"acceptable","evidence_note":"ok"}}
+  },
+  "primary_winner": "candidate-a",
+  "winner_rationale": "Cleanest invariants.",
+  "eliminated": [
+    { "slot": "candidate-b", "rationale": "Extra layer." },
+    { "slot": "candidate-c", "rationale": "Missing rollback." }
+  ],
+  "cherry_picks": [],
+  "rejected_ideas": [],
+  "product_forks": [],
+  "product_decisions": [],
+  "synthesis_body_markdown": "# Synthesis\nWinner: candidate-a.",
+  "initial_design_markdown": "# Design\n- Core design for Chinese task dir (mentions 701 and 703).\n"
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PJK_RUN" --slot judge --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PJK_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot judge --attempt 1 --task-id "tk-j" --child-thread-id "ctk-j" --child-run-id "crk-j" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PJK_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot judge --attempt 1 --task-id "tk-j" --child-run-id "crk-j" --input "$TMP/judge-k.json" >/dev/null
+bash "$STATE" commit-phase2a --task "$TASK_K" --repo "$REPO_K" >/dev/null
+bash "$STATE" commit-phase2b --task "$TASK_K" --repo "$REPO_K" --assemble >/dev/null
+assert_rc "Phase 2a + 2b succeed cleanly on Chinese task dir" "$?" 0
+
+# K4a. prepare-review on Chinese task dir (previously crashed with EXTERNAL_CONFLICT!) + 2-BLOCKER collapse rejection!
+pr_k1=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose initial-full --mode full --slots-json "$TMP/two-rev.json" --owner "owner-k1" 2>&1); rc=$?
+assert_rc "prepare-review succeeds on Chinese task dir 01-中文 (no EXTERNAL_CONFLICT)" "$rc" 0
+PRK1_RUN=$(printf '%s\n' "$pr_k1" | sed -n 's/^RUN_ID=//p')
+PRK1_DSHA=$(printf '%s\n' "$pr_k1" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+PRK1_SNAP=$(printf '%s\n' "$pr_k1" | sed -n 's/^DESIGN_SNAPSHOT=//p')
+PRK1_LM=$(printf '%s\n' "$pr_k1" | sed -n 's/^LEDGER_MANIFEST=//p')
+[ -f "$PRK1_SNAP" ] && [ -f "$PRK1_LM" ] && ok "prepare-review STDOUT paths exist verbatim on Chinese task dir" || fail "prepare-review STDOUT paths mojibaked: $PRK1_SNAP | $PRK1_LM"
+
+cat > "$TMP/rev-k1-two-blk.json" <<EOF
+{
+  "summary": "Two independent blockers", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql"
+    },
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker Two", "location": "design.md:2",
+      "pattern": "p2", "still_wrong": "", "instances": ["design.md:2"],
+      "fix": "f2", "prevent": "t2", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-k1-clean.json" <<EOF
+{
+  "summary": "Clean", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "clean",
+  "findings": [], "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-k1-collapsed.json" <<EOF
+{
+  "summary": "Dropped Blocker Two", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1", "codex/gpt-6.2-sol"]
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-k1-both.json" <<EOF
+{
+  "summary": "Both blockers preserved", "mode": "full", "reviewed_design_sha256": "$PRK1_DSHA", "verdict": "findings",
+  "findings": [
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker One", "location": "design.md:1",
+      "pattern": "p1", "still_wrong": "", "instances": ["design.md:1"],
+      "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "REVIEW.md#no-raw-sql",
+      "sources": ["slot1"]
+    },
+    {
+      "severity": "BLOCKER", "reopens": "", "title": "Blocker Two", "location": "design.md:2",
+      "pattern": "p2", "still_wrong": "", "instances": ["design.md:2"],
+      "fix": "f2", "prevent": "t2", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+      "sources": ["slot1"]
+    }
+  ],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRK1_RUN" --slot slot1 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRK1_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-r1a" --child-thread-id "ctk-r1a" --child-run-id "crk-r1a" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRK1_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-r1a" --child-run-id "crk-r1a" --input "$TMP/rev-k1-two-blk.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRK1_RUN" --slot slot2 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRK1_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-r1b" --child-thread-id "ctk-r1b" --child-run-id "crk-r1b" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRK1_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-r1b" --child-run-id "crk-r1b" --input "$TMP/rev-k1-clean.json" >/dev/null
+
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-collapsed.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects collapsing 2 independent BLOCKERs from 1 slot into 1 (exit 3)" "$rc" 3
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k1-both.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council accepts preserving both BLOCKERs 1-to-1" "$rc" 0
+
+# K6a. Phase 4 MUST reject numeric codified.{invariant_id, guard_test}!
+cat > "$TMP/disp-k-num.json" <<'EOF'
+[
+  { "id": "D1", "disposition": "adopted", "note": "ok", "codified": { "invariant_id": 701, "guard_test": 703 } },
+  { "id": "D2", "disposition": "adopted", "note": "ok" }
+]
+EOF
+out=$(bash "$STATE" commit-phase4-revision --task "$TASK_K" --repo "$REPO_K" --dispositions-json "$TMP/disp-k-num.json" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "Phase 4 rejects numeric JSON codified.{invariant_id, guard_test}" || fail "Phase 4 accepted numeric codified!"
+
+printf '\n- I-K1: parameterized SQL (guard: test_k1).\n' >> "$TASK_K/design.md"
+cat > "$TMP/disp-k-ok.json" <<'EOF'
+[
+  { "id": "D1", "disposition": "adopted", "note": "fixed", "codified": { "invariant_id": "I-K1", "guard_test": "test_k1" } },
+  { "id": "D2", "disposition": "adopted", "note": "fixed" }
+]
+EOF
+bash "$STATE" commit-phase4-revision --task "$TASK_K" --repo "$REPO_K" --dispositions-json "$TMP/disp-k-ok.json" >/dev/null
+
+# K5. With project roundCap=1, maxStepBacks=0, 1 dirty round -> PURPOSE=stop;
+#     toggling commit-phase0 --ignore-project-config on unchanged PRD MUST recompute thresholds -> PURPOSE=incremental!
+out_stop=$(bash "$STATE" next-review --task "$TASK_K" --repo "$REPO_K" 2>&1)
+assert_contains "project roundCap=1,maxStepBacks=0 triggers PURPOSE=stop" "$out_stop" "PURPOSE=stop"
+out_ign=$(bash "$STATE" commit-phase0 --task "$TASK_K" --repo "$REPO_K" --ignore-project-config 2>&1); rc=$?
+assert_rc "commit-phase0 --ignore-project-config on unchanged PRD succeeds" "$rc" 0
+assert_contains "PROJECT_CONFIG_IGNORED=1 emitted on toggle" "$out_ign" "PROJECT_CONFIG_IGNORED=1"
+out_cs_k=$(bash "$STATE" config-show --task "$TASK_K" --repo "$REPO_K" 2>&1)
+assert_contains "config-show --task inherits persisted ignore_project_config" "$out_cs_k" "PROJECT_CONFIG_IGNORED=1"
+out_nr_k=$(bash "$STATE" next-review --task "$TASK_K" --repo "$REPO_K" 2>&1)
+assert_contains "toggling --ignore-project-config recomputes thresholds -> PURPOSE=incremental (NOT stop!)" "$out_nr_k" "PURPOSE=incremental"
+
+# K4b. Council disputes[] hardening: reject fabricated ghost slots AND reject resolution:reopen BLOCKER->OPTIONAL downgrade!
+pr_k2=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose full --mode full --slots-json "$TMP/two-rev.json" --owner "owner-k1")
+PRK2_RUN=$(printf '%s\n' "$pr_k2" | sed -n 's/^RUN_ID=//p')
+PRK2_DSHA=$(printf '%s\n' "$pr_k2" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+cat > "$TMP/rev-k2-reopen.json" <<EOF
+{
+  "summary": "Reopen D1", "mode": "full", "reviewed_design_sha256": "$PRK2_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "BLOCKER", "reopens": "D1", "title": "D1 still broken", "location": "design.md:1",
+    "pattern": "p1", "still_wrong": "still raw", "instances": ["design.md:1"],
+    "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": ""
+  }],
+  "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-k2-ver.json" <<EOF
+{
+  "summary": "Verified D1", "mode": "full", "reviewed_design_sha256": "$PRK2_DSHA", "verdict": "clean",
+  "findings": [], "verified": [{ "id": "D1", "note": "looks good" }], "step_back": [], "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRK2_RUN" --slot slot1 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRK2_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-r2a" --child-thread-id "ctk-r2a" --child-run-id "crk-r2a" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRK2_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-r2a" --child-run-id "crk-r2a" --input "$TMP/rev-k2-reopen.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRK2_RUN" --slot slot2 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRK2_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-r2b" --child-thread-id "ctk-r2b" --child-run-id "crk-r2b" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRK2_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-r2b" --child-run-id "crk-r2b" --input "$TMP/rev-k2-ver.json" >/dev/null
+
+# (i) Fabricated ghost slots in disputes[] with resolution=verified -> MUST FAIL!
+cat > "$TMP/rev-k2-ghost-dispute.json" <<EOF
+{
+  "summary": "Ghost dispute", "mode": "full", "reviewed_design_sha256": "$PRK2_DSHA", "verdict": "clean",
+  "findings": [], "verified": [{ "id": "D1", "note": "verified" }], "step_back": [], "out_of_scope": [],
+  "disputes": [{
+    "class_id": "D1",
+    "reviewer_positions": [
+      { "slot": "ghost1", "position": "reopen", "evidence": "src/app.py:1" },
+      { "slot": "ghost2", "position": "verified", "evidence": "src/app.py:1" }
+    ],
+    "resolution": "verified", "code_evidence": "src/app.py:1"
+  }]
+}
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k2-ghost-dispute.json" 2>&1); rc=$?
+assert_rc "disputes[] citing nonexistent ghost slots rejected (exit 3)" "$rc" 3
+
+# (ii) Valid slots with resolution=reopen BUT downgraded D1 to OPTIONAL -> MUST FAIL!
+cat > "$TMP/rev-k2-reopen-downgrade.json" <<EOF
+{
+  "summary": "Downgraded reopen", "mode": "full", "reviewed_design_sha256": "$PRK2_DSHA", "verdict": "findings",
+  "findings": [{
+    "severity": "OPTIONAL", "reopens": "D1", "title": "D1 downgraded", "location": "design.md:1",
+    "pattern": "p1", "still_wrong": "minor", "instances": ["design.md:1"],
+    "fix": "f1", "prevent": "t1", "evidence": "src/app.py:1", "violates_review_md_rule": "",
+    "sources": ["slot1"]
+  }],
+  "verified": [], "step_back": [], "out_of_scope": [],
+  "disputes": [{
+    "class_id": "D1",
+    "reviewer_positions": [
+      { "slot": "slot1", "position": "reopen", "evidence": "src/app.py:1" },
+      { "slot": "slot2", "position": "verified", "evidence": "src/app.py:1" }
+    ],
+    "resolution": "reopen", "code_evidence": "src/app.py:1"
+  }]
+}
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k2-reopen-downgrade.json" 2>&1); rc=$?
+assert_rc "disputes[] resolution=reopen CANNOT downgrade reopened BLOCKER to OPTIONAL (exit 3)" "$rc" 3
+
+# (iii) Valid slots with genuine reopen-vs-verified disagreement resolved 'verified' -> PASSES!
+cat > "$TMP/rev-k2-valid-dispute.json" <<EOF
+{
+  "summary": "Real verified dispute", "mode": "full", "reviewed_design_sha256": "$PRK2_DSHA", "verdict": "clean",
+  "findings": [], "verified": [{ "id": "D1", "note": "verified in code" }], "step_back": [], "out_of_scope": [],
+  "disputes": [{
+    "class_id": "D1",
+    "reviewer_positions": [
+      { "slot": "slot1", "position": "reopen", "evidence": "src/app.py:1" },
+      { "slot": "slot2", "position": "verified", "evidence": "src/app.py:1" }
+    ],
+    "resolution": "verified", "code_evidence": "src/app.py:1 checked directly"
+  }]
+}
+EOF
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-k2-valid-dispute.json" 2>&1); rc=$?
+assert_rc "disputes[] with real verified slot positions accepted cleanly" "$rc" 0
+
+# K4c. Council step-back: 2 step_back[] proposals from 1 slot CANNOT collapse into 1!
+pr_ksb=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose step-back --mode step-back --slots-json "$TMP/two-rev.json" --owner "owner-k1")
+PRKSB_RUN=$(printf '%s\n' "$pr_ksb" | sed -n 's/^RUN_ID=//p')
+PRKSB_DSHA=$(printf '%s\n' "$pr_ksb" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+cat > "$TMP/rev-ksb-two.json" <<EOF
+{
+  "summary": "Two step-back proposals", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
+  "findings": [], "verified": [],
+  "step_back": [
+    { "classes": ["D1"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1" },
+    { "classes": ["D2"], "name": "Prop 2", "invites_because": "b", "approach_change": "y", "prevent": "t2" }
+  ],
+  "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-ksb-clean.json" <<EOF
+{
+  "summary": "No proposals", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
+  "findings": [], "verified": [], "step_back": [], "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-ksb-one.json" <<EOF
+{
+  "summary": "Dropped Prop 2", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
+  "findings": [], "verified": [],
+  "step_back": [
+    { "classes": ["D1"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["slot1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+cat > "$TMP/rev-ksb-both.json" <<EOF
+{
+  "summary": "Kept both proposals", "mode": "step-back", "reviewed_design_sha256": "$PRKSB_DSHA", "verdict": "clean",
+  "findings": [], "verified": [],
+  "step_back": [
+    { "classes": ["D1"], "name": "Prop 1", "invites_because": "a", "approach_change": "x", "prevent": "t1", "sources": ["slot1"] },
+    { "classes": ["D2"], "name": "Prop 2", "invites_because": "b", "approach_change": "y", "prevent": "t2", "sources": ["slot1"] }
+  ],
+  "out_of_scope": []
+}
+EOF
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRKSB_RUN" --slot slot1 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKSB_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-sba" --child-thread-id "ctk-sba" --child-run-id "crk-sba" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKSB_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-sba" --child-run-id "crk-sba" --input "$TMP/rev-ksb-two.json" >/dev/null
+bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRKSB_RUN" --slot slot2 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKSB_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-sbb" --child-thread-id "ctk-sbb" --child-run-id "crk-sbb" >/dev/null
+bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKSB_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot2 --attempt 1 --task-id "tk-sbb" --child-run-id "crk-sbb" --input "$TMP/rev-ksb-clean.json" >/dev/null
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-one.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council rejects dropping 1 of 2 step_back[] proposals (exit 3)" "$rc" 3
+out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-both.json" 2>&1); rc=$?
+assert_rc "t3-tri-plan council accepts preserving both step_back[] proposals 1-to-1" "$rc" 0
+
+# Finish convergence on TASK_K for K6b Phase 5 numeric JSON rejection!
+# (D2 was promoted to recurring by K4c step_back[], so codify D2 cleanly in Phase 4c!)
+printf '\n- I-K2: centralize guard (guard: test_k2).\n' >> "$TASK_K/design.md"
+cat > "$TMP/disp-k-sb.json" <<'EOF'
+[
+  { "id": "D2", "disposition": "adopted", "note": "codified after step-back", "codified": { "invariant_id": "I-K2", "guard_test": "test_k2" } }
+]
+EOF
+bash "$STATE" commit-phase4-revision --task "$TASK_K" --repo "$REPO_K" --step-back-assessment-done --dispositions-json "$TMP/disp-k-sb.json" >/dev/null
+for _c in 1 2; do
+  pr_kc=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose full --mode full --slots-json "$TMP/single-rev.json" --owner "owner-k1")
+  PRKC_RUN=$(printf '%s\n' "$pr_kc" | sed -n 's/^RUN_ID=//p')
+  PRKC_DSHA=$(printf '%s\n' "$pr_kc" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
+  cat > "$TMP/rev-kc.json" <<EOF
+{ "summary": "Clean", "mode": "full", "reviewed_design_sha256": "$PRKC_DSHA", "verdict": "clean", "findings": [], "verified": [{ "id": "D1", "note": "ok" }], "step_back": [], "out_of_scope": [] }
+EOF
+  bash "$STATE" claim-slot --task "$TASK_K" --run-id "$PRKC_RUN" --slot slot1 --owner "owner-k1" --owner-gen 1 --generation 1 >/dev/null
+  bash "$STATE" record-dispatch --task "$TASK_K" --run-id "$PRKC_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-c$_c" --child-thread-id "ctk-c$_c" --child-run-id "crk-c$_c" >/dev/null
+  bash "$STATE" record-result --task "$TASK_K" --run-id "$PRKC_RUN" --generation 1 --owner "owner-k1" --owner-gen 1 --slot slot1 --attempt 1 --task-id "tk-c$_c" --child-run-id "crk-c$_c" --input "$TMP/rev-kc.json" >/dev/null
+  bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" >/dev/null
+done
+
+# K6b. Phase 5 MUST reject numeric JSONL file:709 AND numeric codified invariant_id:701 / guard_test:703!
+cat > "$TASK_K/implement.md" <<'EOF'
+# Implement
+- I-K1 guard test_k1 and I-K2 guard test_k2 (also mentions 701 and 703)
+EOF
+printf '{"file": 709, "reason": "numeric file path"}\n' > "$TASK_K/implement.jsonl"
+printf '{"file": ".trellis/spec/core.md", "reason": "ok"}\n' > "$TASK_K/check.jsonl"
+out=$(bash "$STATE" commit-phase5 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
+assert_rc "Phase 5 rejects numeric JSONL file:709 (exit 3)" "$rc" 3
+
+printf '{"file": ".trellis/spec/core.md", "reason": "ok"}\n' > "$TASK_K/implement.jsonl"
+cp "$TASK_K/research/plans/planning-state.json" "$TMP/ps-k.bak"
+python3 -c '
+import json
+p = "'"$TASK_K/research/plans/planning-state.json"'"
+d = json.load(open(p, "r", encoding="utf-8"))
+d["review"]["classes"]["D1"]["codified"] = {"invariant_id": 701, "guard_test": 703, "review_md_entry": ""}
+open(p, "w", encoding="utf-8").write(json.dumps(d, indent=2))
+'
+out=$(bash "$STATE" commit-phase5 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
+assert_rc "Phase 5 rejects numeric codified invariant_id:701 / guard_test:703 in planning-state.json (exit 3)" "$rc" 3
+cp "$TMP/ps-k.bak" "$TASK_K/research/plans/planning-state.json"
+out=$(bash "$STATE" commit-phase5 --task "$TASK_K" --repo "$REPO_K" 2>&1); rc=$?
+assert_rc "Phase 5 succeeds on Chinese task dir once valid string JSONL & codified restored" "$rc" 0
+
+# K7. TriTx::_git SIGTERM on rev-parse HEAD fails closed (NEVER returns UNBORN!) + TriTx catches 2nd edit to untracked file inside submodule!
+SHIM_HEAD="$TMP/git-sigterm-head"
+mkdir -p "$SHIM_HEAD"
+cat > "$SHIM_HEAD/git" <<EOF
+#!/usr/bin/env bash
+is_rp=0; is_head=0
+for arg in "\$@"; do
+  case "\$arg" in
+    rev-parse) is_rp=1 ;;
+    HEAD) is_head=1 ;;
+  esac
+done
+if [ "\$is_rp" = 1 ] && [ "\$is_head" = 1 ]; then
+  kill -TERM \$\$
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$SHIM_HEAD/git"
+out=$(PATH="$SHIM_HEAD:$PATH" perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'compute_worktree_fp($ARGV[0], "")' "$REPO_K" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && assert_contains "TriTx compute_worktree_fp fails closed on rev-parse HEAD SIGTERM (never UNBORN)" "$out" "rc=143" || fail "TriTx returned UNBORN on SIGTERM!"
+out=$(PATH="$SHIM_HEAD:$PATH" perl -I"$HERE/lib" -MTriTx=scan_repo_rules -e 'scan_repo_rules($ARGV[0])' "$REPO_K" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && assert_contains "TriTx scan_repo_rules fails closed on rev-parse HEAD SIGTERM" "$out" "rc=143" || fail "TriTx scan_repo_rules swallowed SIGTERM!"
+
+# Submodule untracked file 2nd edit caught by TriTx::compute_worktree_fp!
+SUB_K_SRC="$TMP/tri-sub-src"
+SUB_K_HOST="$TMP/tri-sub-host"
+mkdir -p "$SUB_K_SRC" "$SUB_K_HOST"
+(cd "$SUB_K_SRC" && git init -q -b main . && git config user.email t@t && git config user.name t && echo s1 > s.txt && git add s.txt && git commit -qm s1)
+(
+  cd "$SUB_K_HOST" && git init -q -b main . && git config user.email t@t && git config user.name t && echo h1 > h.txt && git add h.txt && git commit -qm h1
+  git -c protocol.file.allow=always submodule -q add "$SUB_K_SRC" vendor/sub >/dev/null 2>&1
+  git commit -qm "add sub"
+)
+printf 'untr-v1\n' > "$SUB_K_HOST/vendor/sub/untr.txt"
+FP1=$(perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'print compute_worktree_fp($ARGV[0], "")->{digest}' "$SUB_K_HOST")
+printf 'untr-v2\n' > "$SUB_K_HOST/vendor/sub/untr.txt"
+FP2=$(perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'print compute_worktree_fp($ARGV[0], "")->{digest}' "$SUB_K_HOST")
+[ -n "$FP1" ] && [ -n "$FP2" ] && [ "$FP1" != "$FP2" ] && ok "TriTx compute_worktree_fp catches 2nd edit to untracked file inside tracked submodule" || fail "TriTx missed 2nd edit to submodule untracked file! ($FP1 == $FP2)"
 
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

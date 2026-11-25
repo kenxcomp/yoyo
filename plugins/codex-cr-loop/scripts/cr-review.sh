@@ -275,7 +275,12 @@ tree_fp_v2() {
 
     sub run_git_raw {
       my ($dir, @args) = @_;
-      open(my $ph, "-|", "git", "-C", $dir, @args) or return (1, "");
+      my $pid = open(my $ph, "-|");
+      return (1, "") unless defined $pid;
+      if ($pid == 0) {
+        open(STDERR, ">", "/dev/null");
+        exec("git", "-C", $dir, @args) or exit 127;
+      }
       binmode($ph, ":raw");
       local $/;
       my $out = <$ph>;
@@ -298,12 +303,19 @@ tree_fp_v2() {
     $hash_git_repo = sub {
       my ($dir, $depth) = @_;
       exit 1 if $depth > 8;
-      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "HEAD");
+      my ($rc_h, $sh) = run_git_raw($dir, "rev-parse", "--verify", "--quiet", "HEAD");
       $sh =~ s/\s+//g;
-      if ($rc_h != 0 || !length $sh) {
-        my ($rc_sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
-        exit 1 unless $rc_sym == 0;
+      if ($rc_h == 0 && $sh =~ /\A[0-9a-f]{40,64}\z/) {
+        # valid committed HEAD
+      } elsif ($rc_h == 1 && !length $sh) {
+        my ($rc_sym, $sym) = run_git_raw($dir, "symbolic-ref", "-q", "HEAD");
+        $sym =~ s/\s+//g;
+        exit 1 unless $rc_sym == 0 && $sym =~ m{\Arefs/heads/.+\z};
+        my ($rc_sr, $sr_out) = run_git_raw($dir, "show-ref", "--verify", "--quiet", $sym);
+        exit 1 unless $rc_sr == 1 && !length $sr_out;
         $sh = "UNBORN";
+      } else {
+        exit 1;
       }
       my $ctx = Digest::SHA->new(256);
       $ctx->add("head\0$sh\0");

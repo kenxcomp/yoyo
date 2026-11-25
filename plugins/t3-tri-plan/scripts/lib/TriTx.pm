@@ -5,8 +5,8 @@ use warnings;
 use utf8;
 use Cwd qw(abs_path);
 use Digest::SHA qw(sha256_hex);
-use Encode qw(decode FB_CROAK LEAVE_SRC);
-use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
+use Encode qw(decode encode FB_CROAK LEAVE_SRC);
+use Fcntl qw(:flock O_WRONLY O_RDWR O_CREAT O_EXCL O_NONBLOCK);
 use File::Basename qw(dirname);
 use File::Copy qw(copy);
 use File::Find qw(find);
@@ -95,10 +95,19 @@ sub _assert_clean_rel_path {
   }
 }
 
+sub _norm_os_bytes {
+  my ($p) = @_;
+  return '' unless defined $p;
+  return Encode::is_utf8($p) ? encode('UTF-8', $p) : $p;
+}
+
 # Check path stays strictly inside $root and no existing component is a symlink.
 sub ensure_no_symlink_components {
   my ($root, $target) = @_;
+  $root   = _norm_os_bytes($root);
+  $target = _norm_os_bytes($target) if defined $target;
   my $r = abs_path($root) // die "EXTERNAL_CONFLICT: cannot resolve root '$root'\n";
+  $r = _norm_os_bytes($r);
   die "EXTERNAL_CONFLICT: symlink forbidden at root '$root'\n" if -l $root;
   return if !defined $target || !length $target;
   die "EXTERNAL_CONFLICT: NUL byte in managed path\n" if index($target, "\0") >= 0;
@@ -108,7 +117,7 @@ sub ensure_no_symlink_components {
     die "EXTERNAL_CONFLICT: parent traversal '..' forbidden in managed path '$target'\n" if $seg eq '..';
   }
 
-  my $rel = File::Spec->abs2rel($target, $r);
+  my $rel = _norm_os_bytes(File::Spec->abs2rel($target, $r));
   die "EXTERNAL_CONFLICT: managed path '$target' escapes root '$r'\n"
     if $rel =~ m{\A(?:/|\.\.(?:/|\z))};
 
@@ -116,12 +125,13 @@ sub ensure_no_symlink_components {
   my $cur = $r;
   for my $part (@parts) {
     die "EXTERNAL_CONFLICT: parent traversal '..' forbidden in managed path '$target'\n" if $part eq '..';
-    $cur = File::Spec->catfile($cur, $part);
+    $cur = _norm_os_bytes(File::Spec->catfile($cur, $part));
     if (-l $cur) {
       die "EXTERNAL_CONFLICT: symlink detected at managed path $cur\n";
     }
     if (-e $cur) {
       my $resolved = abs_path($cur);
+      $resolved = _norm_os_bytes($resolved) if defined $resolved;
       die "EXTERNAL_CONFLICT: resolved path '$resolved' escapes root '$r'\n"
         unless defined $resolved && ($resolved eq $r || index($resolved, "$r/") == 0);
     } else {
@@ -135,6 +145,19 @@ sub _decode_git_path {
   return '' unless defined $raw;
   my $dec = eval { decode('UTF-8', $raw, FB_CROAK | LEAVE_SRC) };
   return $@ ? $raw : $dec;
+}
+
+# Encode a decoded logical path segment/relative path to raw UTF-8 OS bytes (SvUTF8=0)
+# before joining with raw OS-byte base directories ($task_dir, $plans_dir, $staged_dir).
+sub _rel_bytes {
+  my ($rel) = @_;
+  return '' unless defined $rel;
+  return encode('UTF-8', $rel);
+}
+
+sub _fs_cat {
+  my ($base_bytes, @rel_chars) = @_;
+  return File::Spec->catfile($base_bytes, map { encode('UTF-8', $_) } @rel_chars);
 }
 
 # Deterministic recursive directory manifest (for move_dir_to_archive).
@@ -181,17 +204,25 @@ sub dir_tree_manifest {
 # Acquire exclusive flock on canonicalized <TASK>/research/plans/.tri-plan.lock.
 sub with_task_lock {
   my ($task_dir, $code) = @_;
+  $task_dir = _norm_os_bytes($task_dir);
   die "EXTERNAL_CONFLICT: symlink forbidden at task dir $task_dir\n" if -l $task_dir;
   my $real_task = abs_path($task_dir);
+  $real_task = _norm_os_bytes($real_task) if defined $real_task;
   die "invalid task dir: $task_dir\n" unless defined $real_task && -d $real_task;
   my $plans_dir = "$real_task/research/plans";
   my $lock_path = "$plans_dir/.tri-plan.lock";
   ensure_no_symlink_components($real_task, $lock_path);
   make_path($plans_dir) unless -d $plans_dir;
   ensure_no_symlink_components($real_task, $lock_path);
-  die "EXTERNAL_CONFLICT: non-regular lockfile at $lock_path\n" if -e $lock_path && (!-f $lock_path || -l $lock_path);
-  open(my $lfh, '>>', $lock_path) or die "cannot open lockfile $lock_path: $!\n";
-  flock($lfh, LOCK_EX) or die "cannot acquire flock on $lock_path: $!\n";
+  my $o_nofollow = eval { Fcntl::O_NOFOLLOW() } || 0;
+  die "EXTERNAL_CONFLICT: non-regular lockfile at $lock_path\n" if -l $lock_path || (-e $lock_path && !-f $lock_path);
+  sysopen(my $lfh, $lock_path, O_RDWR | O_CREAT | O_NONBLOCK | $o_nofollow, 0644)
+    or die "EXTERNAL_CONFLICT: cannot safely open lockfile $lock_path: $!\n";
+  if (!-f $lfh) {
+    close $lfh;
+    die "EXTERNAL_CONFLICT: non-regular file at lockfile $lock_path\n";
+  }
+  flock($lfh, LOCK_EX) or do { close $lfh; die "cannot acquire flock on $lock_path: $!\n"; };
   my @res;
   my $want = wantarray;
   my $ok = eval {
@@ -237,7 +268,7 @@ sub check_stale_readonly {
           if (($op->{type} // '') eq 'write_file' && ($op->{dst} // '') eq 'research/plans/active-run.json') {
             my $srel = $op->{staged_rel} // '';
             if ($srel =~ /\A[A-Za-z0-9._-]+\z/) {
-              my $sp = "$plans_dir/.tx-staging/$tx_id/$srel";
+              my $sp = _fs_cat($plans_dir, '.tx-staging', $tx_id, $srel);
               if (-f $sp && !-l $sp) {
                 my $sr = eval { load_json_file($sp) };
                 $logical_run = $sr if !$@ && ref $sr eq 'HASH';
@@ -310,12 +341,12 @@ sub _replay_op {
   if ($type eq 'write_file') {
     _assert_clean_rel_path($op->{dst}, 'tx write_file.dst');
     _assert_clean_rel_path($op->{staged_rel}, 'tx write_file.staged_rel');
-    my $dst = File::Spec->catfile($task_dir, $op->{dst});
+    my $dst = _fs_cat($task_dir, $op->{dst});
     ensure_no_symlink_components($task_dir, $dst);
     my $post_sha = $op->{post_sha256};
     my $pre_kind = $op->{expected_pre_kind}; # 'absent' | 'file'
     my $pre_sha  = $op->{expected_pre_sha256};
-    my $src_stage = File::Spec->catfile($staged_dir, $op->{staged_rel});
+    my $src_stage = _fs_cat($staged_dir, $op->{staged_rel});
     ensure_no_symlink_components($staged_dir, $src_stage);
 
     if (-l $dst) {
@@ -364,8 +395,8 @@ sub _replay_op {
   elsif ($type eq 'move_file_to_archive') {
     _assert_clean_rel_path($op->{src}, 'tx move_file.src');
     _assert_clean_rel_path($op->{dst}, 'tx move_file.dst');
-    my $src = File::Spec->catfile($task_dir, $op->{src});
-    my $dst = File::Spec->catfile($task_dir, $op->{dst});
+    my $src = _fs_cat($task_dir, $op->{src});
+    my $dst = _fs_cat($task_dir, $op->{dst});
     ensure_no_symlink_components($task_dir, $src);
     ensure_no_symlink_components($task_dir, $dst);
     my $want_sha = $op->{src_sha256};
@@ -395,8 +426,8 @@ sub _replay_op {
   elsif ($type eq 'move_dir_to_archive') {
     _assert_clean_rel_path($op->{src}, 'tx move_dir.src');
     _assert_clean_rel_path($op->{dst}, 'tx move_dir.dst');
-    my $src = File::Spec->catfile($task_dir, $op->{src});
-    my $dst = File::Spec->catfile($task_dir, $op->{dst});
+    my $src = _fs_cat($task_dir, $op->{src});
+    my $dst = _fs_cat($task_dir, $op->{dst});
     ensure_no_symlink_components($task_dir, $src);
     ensure_no_symlink_components($task_dir, $dst);
     my $want_tree = $op->{tree_sha256};
@@ -425,7 +456,7 @@ sub _replay_op {
   }
   elsif ($type eq 'remove_file') {
     _assert_clean_rel_path($op->{target}, 'tx remove_file.target');
-    my $tgt = File::Spec->catfile($task_dir, $op->{target});
+    my $tgt = _fs_cat($task_dir, $op->{target});
     ensure_no_symlink_components($task_dir, $tgt);
     my $pre_sha = $op->{expected_pre_sha256};
     die "EXTERNAL_CONFLICT: symlink at remove_file target $op->{target}\n" if -l $tgt;
@@ -457,7 +488,7 @@ sub recover_tx {
   die "EXTERNAL_CONFLICT: corrupt .pending.tx.json (ops must be an array)\n"
     unless ref($tx->{ops}) eq 'ARRAY';
   my $staged_root = "$plans_dir/.tx-staging";
-  my $staged_dir  = "$staged_root/$tx_id";
+  my $staged_dir  = _fs_cat($staged_root, $tx_id);
   ensure_no_symlink_components($task_dir, $staged_dir);
   my $marker = $tx->{commit_marker} // 'staged';
   die "EXTERNAL_CONFLICT: corrupt .pending.tx.json (invalid commit_marker '$marker')\n"
@@ -500,7 +531,7 @@ sub execute_tx {
   recover_tx($task_dir, $plans_dir);
 
   my $tx_id = $spec->{tx_id} || ("tx-" . time() . "-$$-" . int(rand(100000)));
-  my $staged_dir = "$plans_dir/.tx-staging/$tx_id";
+  my $staged_dir = _fs_cat($plans_dir, '.tx-staging', $tx_id);
   make_path($staged_dir);
 
   my @ops;
@@ -508,8 +539,8 @@ sub execute_tx {
 
   # 1. Stage moves (capture pre-hashes / dir manifests).
   for my $m (@{$spec->{moves} || []}) {
-    my $src_abs = File::Spec->catfile($task_dir, $m->{src});
-    my $dst_abs = File::Spec->catfile($task_dir, $m->{dst});
+    my $src_abs = _fs_cat($task_dir, $m->{src});
+    my $dst_abs = _fs_cat($task_dir, $m->{dst});
     ensure_no_symlink_components($task_dir, $src_abs);
     ensure_no_symlink_components($task_dir, $dst_abs);
     next unless -e $src_abs;
@@ -537,7 +568,7 @@ sub execute_tx {
 
   # 2. Stage removes.
   for my $r (@{$spec->{removes} || []}) {
-    my $abs = File::Spec->catfile($task_dir, $r);
+    my $abs = _fs_cat($task_dir, $r);
     ensure_no_symlink_components($task_dir, $abs);
     next unless -e $abs;
     die "EXTERNAL_CONFLICT: remove target is not a regular file: $r\n" unless -f $abs && !-l $abs;
@@ -556,10 +587,10 @@ sub execute_tx {
     die "tx invariant violated: write_file targets moved src '$w->{dst}' in same tx\n"
       if $moved_srcs{$w->{dst}};
     $idx++;
-    my $dst_abs = File::Spec->catfile($task_dir, $w->{dst});
+    my $dst_abs = _fs_cat($task_dir, $w->{dst});
     ensure_no_symlink_components($task_dir, $dst_abs);
     my $staged_rel = sprintf("w%03d.bin", $idx);
-    write_atomic_bytes("$staged_dir/$staged_rel", $w->{bytes});
+    write_atomic_bytes(_fs_cat($staged_dir, $staged_rel), $w->{bytes});
     my $post_sha = sha256_bytes($w->{bytes});
 
     my ($pre_kind, $pre_sha) = ('absent', undef);
@@ -630,10 +661,15 @@ sub execute_tx {
   return $tx_id;
 }
 
-# Helper to run git commands safely in $repo_root (fails closed on signals as 128+sig!).
+# Helper to run git commands safely in $repo_root (silences stderr probes and fails closed on signals as 128+sig!).
 sub _git {
   my ($repo_root, @args) = @_;
-  open(my $ph, '-|', 'git', '-C', $repo_root, @args) or return (1, '');
+  my $pid = open(my $ph, '-|');
+  return (1, '') unless defined $pid;
+  if ($pid == 0) {
+    open(STDERR, '>', '/dev/null');
+    exec('git', '-C', $repo_root, @args) or exit 127;
+  }
   binmode($ph, ':raw');
   local $/;
   my $out = <$ph>;
@@ -652,8 +688,91 @@ sub _git {
   return ($rc, defined $out ? $out : '');
 }
 
+# Strictly resolve HEAD SHA or prove genuine unborn branch (never misclassifying signals or corrupt git errors as UNBORN!).
+sub _git_head_or_unborn {
+  my ($dir, $err_prefix) = @_;
+  my ($rc_h, $head) = _git($dir, 'rev-parse', '--verify', '--quiet', 'HEAD');
+  $head =~ s/\s+//g;
+  if ($rc_h == 0 && $head =~ /\A[0-9a-f]{40,64}\z/) {
+    return $head;
+  }
+  if ($rc_h == 1 && !length $head) {
+    my ($rc_sym, $sym) = _git($dir, 'symbolic-ref', '-q', 'HEAD');
+    $sym =~ s/\s+//g;
+    if ($rc_sym == 0 && $sym =~ m{\Arefs/heads/.+\z}) {
+      my ($rc_sr, $sr_out) = _git($dir, 'show-ref', '--verify', '--quiet', $sym);
+      return 'UNBORN' if $rc_sr == 1 && !length $sr_out;
+    }
+  }
+  die "$err_prefix: git rev-parse HEAD failed (rc=$rc_h) and HEAD is not a provably unborn symbolic ref\n";
+}
+
+# Recursively hash a tracked submodule or nested git working tree (HEAD, diffs, stage, untracked file contents, nested gitlinks).
+sub _hash_git_repo {
+  my ($dir, $depth) = @_;
+  die "WORKTREE_FP_ERROR: nested git repository depth exceeded (>8) at '$dir'\n" if $depth > 8;
+  my $sh = _git_head_or_unborn($dir, 'WORKTREE_FP_ERROR');
+  my $ctx = Digest::SHA->new(256);
+  $ctx->add("head\0$sh\0");
+  if ($sh ne 'UNBORN') {
+    my ($rc_d, $d_out) = _git($dir, 'diff', 'HEAD', '--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--binary');
+    die "WORKTREE_FP_ERROR: submodule git diff HEAD failed (rc=$rc_d)\n" unless $rc_d == 0;
+    $ctx->add("diff_head\0" . sha256_bytes($d_out) . "\0");
+    my ($rc_c, $c_out) = _git($dir, 'diff', '--cached', '--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--binary');
+    die "WORKTREE_FP_ERROR: submodule git diff --cached failed (rc=$rc_c)\n" unless $rc_c == 0;
+    $ctx->add("diff_cached\0" . sha256_bytes($c_out) . "\0");
+  } else {
+    my ($rc_st, $st_out) = _git($dir, 'ls-files', '--stage', '-z');
+    die "WORKTREE_FP_ERROR: unborn submodule git ls-files --stage failed (rc=$rc_st)\n" unless $rc_st == 0;
+    $ctx->add("stage_unborn\0" . sha256_bytes($st_out) . "\0");
+  }
+  my ($rc_w, $w_out) = _git($dir, 'diff', '--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--binary');
+  die "WORKTREE_FP_ERROR: submodule git diff failed (rc=$rc_w)\n" unless $rc_w == 0;
+  $ctx->add("diff_wt\0" . sha256_bytes($w_out) . "\0");
+
+  my ($rc_u, $u_out) = _git($dir, 'ls-files', '--others', '--exclude-standard', '-z');
+  die "WORKTREE_FP_ERROR: submodule git ls-files --others failed (rc=$rc_u)\n" unless $rc_u == 0;
+  for my $up (sort grep { length $_ } split(/\0/, $u_out)) {
+    my $ufull = File::Spec->catfile($dir, $up);
+    if (-l $ufull) {
+      my $tgt = readlink($ufull);
+      die "WORKTREE_FP_ERROR: cannot readlink '$ufull'\n" unless defined $tgt;
+      $ctx->add("ul\0$up\0$tgt\0");
+    } elsif (-f $ufull) {
+      my $ex = (-x $ufull) ? 'x' : 'f';
+      $ctx->add("uf\0$ex\0$up\0" . sha256_file($ufull) . "\0");
+    } elsif (-d $ufull && -e "$ufull/.git") {
+      $ctx->add("ug\0$up\0" . _hash_git_repo($ufull, $depth + 1) . "\0");
+    } elsif (-d $ufull) {
+      my (undef, $tsha) = dir_tree_manifest($ufull);
+      $ctx->add("ud\0$up\0$tsha\0");
+    } else {
+      $ctx->add("uo\0$up\0");
+    }
+  }
+
+  my ($rc_gs, $gs_out) = _git($dir, 'ls-files', '--stage', '-z');
+  die "WORKTREE_FP_ERROR: submodule git ls-files --stage failed (rc=$rc_gs)\n" unless $rc_gs == 0;
+  my %sub_nested;
+  for my $ent (split(/\0/, $gs_out)) {
+    if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+      $sub_nested{$2} = $1;
+    }
+  }
+  for my $sp (sort keys %sub_nested) {
+    my $sfull = File::Spec->catfile($dir, $sp);
+    if (-d $sfull && -e "$sfull/.git") {
+      $ctx->add("sub\0$sp\0$sub_nested{$sp}\0" . _hash_git_repo($sfull, $depth + 1) . "\0");
+    } else {
+      $ctx->add("sub_absent\0$sp\0$sub_nested{$sp}\0");
+    }
+  }
+  return $ctx->hexdigest;
+}
+
 # Compute worktree_fp v3: content-based fingerprint covering HEAD, reflog count,
-# staged index entries, and working-tree content SHA-256 of ALL modified tracked
+# staged index entries, tracked submodules / nested gitdirs (recursively including
+# untracked file contents), and working-tree content SHA-256 of ALL modified tracked
 # files and non-ignored untracked files (excluding engine runtime paths under
 # <task_rel>/research/plans/{.tri-plan.lock,.tx-staging,.pending.tx.json,active-run.json,runs}).
 sub compute_worktree_fp {
@@ -663,15 +782,7 @@ sub compute_worktree_fp {
   die "WORKTREE_FP_ERROR: '$repo_root' is not a valid git working tree (rc=$rc_g)\n"
     unless $rc_g == 0 && $inside eq 'true';
 
-  my ($rc_h, $head) = _git($repo_root, 'rev-parse', '--verify', 'HEAD');
-  $head =~ s/\s+//g;
-  if ($rc_h != 0 || !length $head) {
-    # Distinguish genuine unborn HEAD from corrupted repo.
-    my ($rc_sym) = _git($repo_root, 'symbolic-ref', '-q', 'HEAD');
-    die "WORKTREE_FP_ERROR: git rev-parse HEAD failed and HEAD is not an unborn symbolic ref\n"
-      unless $rc_sym == 0;
-    $head = 'UNBORN';
-  }
+  my $head = _git_head_or_unborn($repo_root, 'WORKTREE_FP_ERROR');
 
   my $refcnt = '0';
   if ($head ne 'UNBORN') {
@@ -748,6 +859,18 @@ sub compute_worktree_fp {
   die "WORKTREE_FP_ERROR: git ls-files --others failed (rc=$rc_u)\n" unless $rc_u == 0;
   $wt_paths{$_} = 1 for grep { length $_ } split(/\0/, $raw_u);
 
+  # Also enumerate ALL tracked gitlinks (mode 160000 submodules) so edits inside submodules
+  # (including repeated edits to untracked files inside a submodule) are always recursively hashed!
+  my ($rc_gs, $raw_gs) = _git($repo_root, 'ls-files', '--stage', '-z');
+  die "WORKTREE_FP_ERROR: git ls-files --stage failed (rc=$rc_gs)\n" unless $rc_gs == 0;
+  my %tracked_gitlinks;
+  for my $ent (split(/\0/, $raw_gs)) {
+    if ($ent =~ /\A160000\s+([0-9a-f]+)\s+\d+\t(.+)\z/s) {
+      $tracked_gitlinks{$2} = $1;
+      $wt_paths{$2} = 1;
+    }
+  }
+
   my %wt_files;
   for my $raw_p (sort keys %wt_paths) {
     my $p_key = _decode_git_path($raw_p);
@@ -761,15 +884,12 @@ sub compute_worktree_fp {
       my $exec = (@st && ($st[2] & 0111)) ? 'x' : '-';
       $wt_files{$p_key} = "file:$exec:" . sha256_file($abs);
     } elsif (-d $abs) {
-      # Dirty submodule / nested gitlink: capture its HEAD + status + diff hash instead of static 'dir'!
+      # Tracked submodule or nested gitdir: recursively hash HEAD, diffs, untracked file contents, and nested gitlinks!
       if (-e "$abs/.git") {
-        my ($rc_sh, $sub_h) = _git($abs, 'rev-parse', '--verify', 'HEAD');
-        $sub_h =~ s/\s+//g;
-        my ($rc_sp, $sub_p) = _git($abs, 'status', '--porcelain', '--untracked-files=all', '-z');
-        my ($rc_sd, $sub_d) = _git($abs, 'diff', '--no-ext-diff', 'HEAD');
-        die "WORKTREE_FP_ERROR: failed inspecting dirty submodule '$p_key'\n"
-          unless $rc_sp == 0 && ($rc_sh == 0 || $rc_sd == 0);
-        $wt_files{$p_key} = 'gitlink:' . sha256_bytes("$sub_h\0$sub_p\0$sub_d");
+        my $oid = $tracked_gitlinks{$raw_p} // '';
+        $wt_files{$p_key} = "gitlink:$oid:" . _hash_git_repo($abs, 1);
+      } elsif (exists $tracked_gitlinks{$raw_p}) {
+        $wt_files{$p_key} = "gitlink_uninit:$tracked_gitlinks{$raw_p}";
       } else {
         my (undef, $tsha) = dir_tree_manifest($abs);
         $wt_files{$p_key} = "dir:$tsha";
@@ -854,9 +974,8 @@ sub _slugify_heading {
 # working-tree deltas to those rule files. Also extracts heading anchors for REVIEW.md files.
 sub scan_repo_rules {
   my ($repo_root) = @_;
-  my ($rc_h, $head) = _git($repo_root, 'rev-parse', '--verify', 'HEAD');
-  $head =~ s/\s+//g;
-  $head = '' if $rc_h != 0;
+  my $head = _git_head_or_unborn($repo_root, 'RULES_SCAN_ERROR');
+  $head = '' if $head eq 'UNBORN';
 
   my %base_rules;   # decoded_path => blob_sha256
   my %rule_files;   # decoded REVIEW.md paths => 1
@@ -970,7 +1089,7 @@ sub compute_non_prd_baseline {
   my $cands = {};
   if (ref($state->{phases}) eq 'HASH' && ref($state->{phases}{'1'}) eq 'HASH' && ref($state->{phases}{'1'}{candidates}) eq 'HASH') {
     for my $slot (sort keys %{$state->{phases}{'1'}{candidates}}) {
-      my $cp = "$task_dir/research/plans/candidates/$slot.md";
+      my $cp = _fs_cat($task_dir, 'research', 'plans', 'candidates', "$slot.md");
       $cands->{$slot} = (-f $cp && !-l $cp) ? sha256_file($cp) : 'MISSING';
     }
   }

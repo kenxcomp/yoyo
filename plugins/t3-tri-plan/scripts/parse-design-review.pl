@@ -197,8 +197,9 @@ my $sb_arr = req_arr($top->{step_back}, 'step_back', 0);
 if ($mode ne 'step-back' && @$sb_arr > 0) {
   fail("step_back must be empty when mode is '$mode'");
 }
+my @SB_OPT = $is_merged ? ('sources') : ();
 for my $i (0 .. $#$sb_arr) {
-  my $sb = req_obj($sb_arr->[$i], "step_back[$i]", [qw(classes name invites_because approach_change prevent)], []);
+  my $sb = req_obj($sb_arr->[$i], "step_back[$i]", [qw(classes name invites_because approach_change prevent)], \@SB_OPT);
   my $cls = req_arr($sb->{classes}, "step_back[$i].classes", 1);
   for my $j (0 .. $#$cls) {
     my $cid = req_str($cls->[$j], "step_back[$i].classes[$j]", 1);
@@ -209,6 +210,10 @@ for my $i (0 .. $#$sb_arr) {
   req_str($sb->{invites_because}, "step_back[$i].invites_because", 1);
   req_str($sb->{approach_change}, "step_back[$i].approach_change", 1);
   req_str($sb->{prevent}, "step_back[$i].prevent", 1);
+  if ($is_merged && exists $sb->{sources}) {
+    my $srcs = req_arr($sb->{sources}, "step_back[$i].sources", 1);
+    for my $j (0 .. $#$srcs) { req_str($srcs->[$j], "step_back[$i].sources[$j]", 1); }
+  }
 }
 
 # Validate out_of_scope[].
