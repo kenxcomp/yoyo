@@ -994,6 +994,46 @@ assert_contains "legacy user_decision mismatch flagged unproven" "$out" "legacy_
 out=$(bash "$STATE" commit-phase6-ready --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
 assert_rc "migrated legacy task CANNOT auto-pass Phase 6" "$rc" 3
 
+# Re-verification of migrated Phase 0 (short legacy digest 'deadbeef' -> needs-reverification):
+# 1. check-freshness reports NEXT_STAGE=phase0 before re-verification.
+out=$(bash "$STATE" check-freshness --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
+assert_rc "migrated task with short Phase 0 digest is stale" "$rc" 1
+assert_contains "migrated task reports FRESH=0" "$out" "FRESH=0"
+assert_contains "migrated task starts at NEXT_STAGE=phase0" "$out" "NEXT_STAGE=phase0"
+
+# 2. --change-kind wording is refused while Phase 0 is still unverified (fail-closed).
+printf '# Legacy PRD\n(typo fix)\n' > "$LEG_TASK/prd.md"
+out=$(bash "$STATE" commit-phase0 --task "$LEG_TASK" --repo "$REPO" --change-kind wording --evidence "typo" 2>&1); rc=$?
+assert_rc "commit-phase0 --change-kind wording refused while Phase 0 needs-reverification" "$rc" 3
+printf '# Legacy PRD\n' > "$LEG_TASK/prd.md"
+
+# 3. commit-phase0 on unchanged PRD reverifies Phase 0 and advances NEXT_STAGE past phase0 to phase1.
+out=$(bash "$STATE" commit-phase0 --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
+assert_rc "commit-phase0 reverifies migrated Phase 0 on unchanged PRD" "$rc" 0
+assert_contains "reverify prints PHASE0_COMMITTED=1" "$out" "PHASE0_COMMITTED=1"
+assert_contains "reverify prints CHANGE_KIND=reverified" "$out" "CHANGE_KIND=reverified"
+
+out=$(bash "$STATE" check-freshness --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
+assert_rc "reverified migrated task still requires Phase 1+" "$rc" 1
+assert_contains "reverified migrated task reports FRESH=0" "$out" "FRESH=0"
+assert_contains "check-freshness advances from phase0 to NEXT_STAGE=phase1" "$out" "NEXT_STAGE=phase1"
+
+p0_reverified_ok=$(perl -MJSON::PP -e '
+  open my $fh, "<", $ARGV[0] or die $!;
+  local $/; my $d = decode_json(<$fh>);
+  my $st = $d->{phases}{"0"}{status} // "";
+  my $has_p0_unproven = grep { /\Aphase0\(/ } @{$d->{unproven_reasons} || []};
+  print(($st eq "completed" && !$has_p0_unproven) ? "OK" : "BAD:$st:$has_p0_unproven");
+' -- "$LEG_TASK/research/plans/planning-state.json")
+assert_eq "planning-state.json marks Phase 0 completed and clears phase0 unproven reason" "$p0_reverified_ok" "OK"
+
+out=$(bash "$STATE" commit-phase6-ready --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
+assert_rc "reverified Phase 0 alone still CANNOT auto-pass Phase 6" "$rc" 3
+
+out=$(bash "$STATE" commit-phase0 --task "$LEG_TASK" --repo "$REPO" 2>&1); rc=$?
+assert_rc "second commit-phase0 on unchanged PRD is idempotent" "$rc" 0
+assert_contains "second commit-phase0 reports CHANGE_KIND=unchanged" "$out" "CHANGE_KIND=unchanged"
+
 # =============================================================================
 printf '\n=== Group H: install-skills.sh Symlink Ownership Protection ===\n'
 # =============================================================================

@@ -1289,15 +1289,38 @@ sub cmd_commit_phase0 {
         unless ($st->{pipeline} // '') eq 't3-tri-plan';
 
       my $cur_eff_prd = $st->{effective_prd_sha256} // '';
+      my $p0_status   = (ref($st->{phases}) eq 'HASH' && ref($st->{phases}{'0'}) eq 'HASH')
+        ? ($st->{phases}{'0'}{status} // '')
+        : '';
+      my $p0_incomplete = ($p0_status ne 'completed') ? 1 : 0;
       if ($cur_eff_prd eq $prd_sha) {
         my $auth_chg = (defined $opt{authorization} && length $opt{authorization} && $opt{authorization} ne ($st->{authorization} // '')) ? 1 : 0;
         my $ign_toggled = (($opt{ignore_project_config} || $opt{use_project_config}) && (($st->{ignore_project_config} ? 1 : 0) != $ign_proj)) ? 1 : 0;
-        if ($auth_chg || $ign_toggled) {
+        if ($p0_incomplete || $auth_chg || $ign_toggled) {
           _guard_phase6_not_in_flight($st, 'commit-phase0');
           my $old_gen = $st->{generation} // 1;
-          my $tx_id = "tx-p0-auth-" . time() . "-$$";
+          my $tx_id = ($p0_incomplete ? "tx-p0-reverify-" : "tx-p0-auth-") . time() . "-$$";
+          if ($p0_incomplete) {
+            $st->{phases} = {} unless ref($st->{phases}) eq 'HASH';
+            my $now = now_iso();
+            $st->{phases}{'0'} = {
+              status               => 'completed',
+              prd                  => $prd_sha,
+              prd_sha256           => $prd_sha,
+              effective_prd_sha256 => $prd_sha,
+              completed_at         => $now,
+              reverified_at        => $now,
+            };
+            $st->{prd_lineage} = $prd_sha unless length($st->{prd_lineage} // '');
+            my %eq = map { $_ => 1 } @{$st->{wording_equivalent_prd_shas} || [$st->{prd_lineage}]};
+            $eq{$prd_sha} = 1;
+            $st->{wording_equivalent_prd_shas} = [ sort keys %eq ];
+            if (ref($st->{unproven_reasons}) eq 'ARRAY') {
+              $st->{unproven_reasons} = [ grep { !/\Aphase0\(/ } @{$st->{unproven_reasons}} ];
+            }
+          }
           $st->{authorization}         = $opt{authorization} if $auth_chg;
-          if ($ign_toggled) {
+          if ($ign_toggled || $p0_incomplete) {
             $st->{ignore_project_config} = $ign_proj ? JSON::PP::true : JSON::PP::false;
             if (ref($st->{review}) eq 'HASH') {
               my $extra_sb = defined($st->{review}{extra_step_backs_granted})
@@ -1317,7 +1340,8 @@ sub cmd_commit_phase0 {
             ],
           });
         }
-        print "PHASE0_COMMITTED=1\nCHANGE_KIND=unchanged\nPRD_SHA256=$prd_sha\nGENERATION=$st->{generation}\n";
+        my $out_kind = $p0_incomplete ? 'reverified' : 'unchanged';
+        print "PHASE0_COMMITTED=1\nCHANGE_KIND=$out_kind\nPRD_SHA256=$prd_sha\nGENERATION=$st->{generation}\n";
         print "PROJECT_CONFIG_IGNORED=1\n" if $ign_proj;
         return;
       }
@@ -1328,6 +1352,8 @@ sub cmd_commit_phase0 {
 
       my $old_gen = $st->{generation} // 1;
       if ($kind eq 'wording') {
+        die_err("Phase 0 is unverified (" . (length($p0_status) ? $p0_status : 'missing') . ") — cannot record wording-only change; use --change-kind material or revert prd.md and reverify Phase 0 first", 3)
+          if $p0_incomplete;
         _guard_phase6_not_in_flight($st, 'commit-phase0 --change-kind wording');
         die_err("--change-kind wording requires --evidence <why contract/acceptance unchanged>")
           unless defined $opt{evidence} && $opt{evidence} =~ /\S/;
