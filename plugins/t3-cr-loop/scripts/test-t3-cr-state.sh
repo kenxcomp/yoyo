@@ -993,14 +993,30 @@ mkdir -p "$DASH_REPO"
   [ ! -e "INJECTED_RCE" ] || exit 33
 ) && ok || bad "leading-dash or -e switch filename failed or executed Perl code in record-result"
 
-# 8g. Round 5 High #3: different root causes on the SAME line CANNOT merge into one entry; same-name distinct step_back[] proposals CAN coexist!
+# 8f-2. Round 6 High #1: install-skills.sh handles leading '-' and '-e;BEGIN{...}' target dirs safely (no Perl switch injection)!
+INST_DASH="$TMP/inst-dash-test"
+mkdir -p "$INST_DASH"
+(
+  cd "$INST_DASH" || exit 2
+  INST_SH="$HERE/install-skills.sh"
+  bash "$INST_SH" --target "-foo" >/dev/null || exit 41
+  [ -L "-foo/t3-cr-loop" ] || exit 42
+  out_u=$(bash "$INST_SH" --uninstall --target "-foo") || exit 43
+  [ ! -L "-foo/t3-cr-loop" ] || exit 44
+  POC_DIR='-e;BEGIN{open(my $f,">","INJECTED_INST");print $f "bad";close $f}#'
+  bash "$INST_SH" --target "$POC_DIR" >/dev/null || exit 45
+  bash "$INST_SH" --uninstall --target "$POC_DIR" >/dev/null || exit 46
+  [ ! -e "INJECTED_INST" ] && [ ! -L "$POC_DIR/t3-cr-loop" ] || exit 47
+) && ok || bad "t3-cr-loop install-skills.sh failed on leading-dash target or executed Perl switch code"
+
+# 8g. Round 5 High #3 + Round 6 High #2: different root causes on the SAME line (even with IDENTICAL title!) CANNOT merge into one entry; same-name distinct step_back[] proposals CAN coexist!
 F_AUTH_S1="$TMP/auth-s1.json"
 cat > "$F_AUTH_S1" <<'EOF'
 {
   "summary": "Missing auth check.",
   "verdict": "findings",
   "findings": [{
-    "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+    "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
     "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
     "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test"
   }],
@@ -1013,7 +1029,7 @@ cat > "$F_STREAM_S2" <<'EOF'
   "summary": "Stream leak on error path.",
   "verdict": "findings",
   "findings": [{
-    "severity": "P1", "reopens": "", "title": "Stream not closed", "location": "app.txt:1",
+    "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
     "pattern": "file stream leaks descriptor on error return path", "still_wrong": "",
     "instances": ["app.txt:1"], "fix": "close stream handle in finally block", "prevent": "add leak test"
   }],
@@ -1023,15 +1039,15 @@ EOF
 F_BAD_CROSS_MERGE="$TMP/bad-cross-merge.json"
 cat > "$F_BAD_CROSS_MERGE" <<'EOF'
 {
-  "summary": "Improperly collapsed auth and stream leak.",
+  "summary": "Improperly collapsed auth and stream leak despite same title.",
   "verdict": "findings",
   "findings": [{
-    "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+    "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
     "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
     "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test",
     "sources": ["s1", "s2"],
     "merged_from": [{ "slot": "s1", "index": 0 }, { "slot": "s2", "index": 0 }],
-    "merge_rationale": "same line app.txt:1"
+    "merge_rationale": "same line and same title"
   }],
   "step_back": [], "out_of_scope": []
 }
@@ -1043,13 +1059,13 @@ cat > "$F_GOOD_CROSS_SEP" <<'EOF'
   "verdict": "findings",
   "findings": [
     {
-      "severity": "P1", "reopens": "", "title": "Missing auth check", "location": "app.txt:1",
+      "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
       "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "",
       "instances": ["app.txt:1"], "fix": "verify session token before handler", "prevent": "add authz test",
       "sources": ["s1"], "merged_from": [{ "slot": "s1", "index": 0 }]
     },
     {
-      "severity": "P1", "reopens": "", "title": "Stream not closed", "location": "app.txt:1",
+      "severity": "P1", "reopens": "", "title": "Input handling bug", "location": "app.txt:1",
       "pattern": "file stream leaks descriptor on error return path", "still_wrong": "",
       "instances": ["app.txt:1"], "fix": "close stream handle in finally block", "prevent": "add leak test",
       "sources": ["s2"], "merged_from": [{ "slot": "s2", "index": 0 }]

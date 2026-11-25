@@ -1259,7 +1259,7 @@ cmd_tree_clean() {
   printf 'TREE=clean\nIGNORED_HANDOFFS=%s\n' "$ignored"
 }
 
-cmd_paths() { resolve_paths; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
+cmd_paths() { resolve_paths; validate_branch_ownership; printf 'STATE_DIR=%s\nLEDGER=%s\nSTATE=%s\n' "$STATE_DIR" "$LEDGER" "$STATE"; }
 
 sub="${1:-}"
 case "$sub" in

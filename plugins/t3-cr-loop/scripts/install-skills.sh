@@ -30,7 +30,7 @@ resolve_link_target() {
     }
     my $r = abs_path($raw);
     print defined($r) ? $r : $raw;
-  ' "$1" 2>/dev/null
+  ' -- "$1" 2>/dev/null
 }
 
 is_owned_symlink() {
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --project)
       [ $# -ge 2 ] && [ -n "${2:-}" ] || die "--project requires a repo path"
-      TARGET_DIR="$(cd "$2" && pwd -P)/.agents/skills" || die "invalid --project path: $2"
+      TARGET_DIR="$(cd -- "$2" && pwd -P)/.agents/skills" || die "invalid --project path: $2"
       shift 2
       ;;
     --target)
@@ -65,7 +65,7 @@ done
 
 case "$MODE" in
   install)
-    mkdir -p "$TARGET_DIR" || die "cannot create $TARGET_DIR"
+    mkdir -p -- "$TARGET_DIR" || die "cannot create $TARGET_DIR"
     for s in $SKILLS; do
       src="$SKILLS_SRC/$s"
       dst="$TARGET_DIR/$s"
@@ -75,11 +75,11 @@ case "$MODE" in
           existing=$(resolve_link_target "$dst" || printf '<unresolvable>')
           die "refusing to overwrite foreign symlink at $dst -> $existing (expected $src)"
         fi
-        rm -f "$dst" || die "cannot replace owned symlink $dst"
+        rm -f -- "$dst" || die "cannot replace owned symlink $dst"
       elif [ -e "$dst" ]; then
         die "refusing to overwrite non-symlink at $dst — move or remove it first"
       fi
-      ln -s "$src" "$dst" || die "failed to symlink $dst -> $src"
+      ln -s -- "$src" "$dst" || die "failed to symlink $dst -> $src"
       printf 'INSTALLED %s -> %s\n' "$dst" "$src"
     done
     printf 'PLUGIN_ROOT=%s\n' "$PLUGIN_ROOT"
@@ -91,7 +91,7 @@ case "$MODE" in
       dst="$TARGET_DIR/$s"
       if [ -L "$dst" ]; then
         if is_owned_symlink "$dst" "$src"; then
-          rm -f "$dst" || die "cannot remove $dst"
+          rm -f -- "$dst" || die "cannot remove $dst"
           printf 'REMOVED %s\n' "$dst"
         else
           existing=$(resolve_link_target "$dst" || printf '<unresolvable>')
@@ -111,7 +111,7 @@ case "$MODE" in
         ok=0
         continue
       fi
-      real_skill=$(cd "$dst" && pwd -P)
+      real_skill=$(cd -- "$dst" && pwd -P)
       real_root=$(cd "$real_skill/../.." && pwd -P)
       if [ -x "$real_root/scripts/t3-cr-state.sh" ] && [ -f "$real_root/references/review-protocol.md" ]; then
         printf 'OK %s (plugin_root=%s)\n' "$s" "$real_root"

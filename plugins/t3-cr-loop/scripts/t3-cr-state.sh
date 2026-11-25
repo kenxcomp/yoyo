@@ -275,7 +275,7 @@ cmd_config_set() {
   in_tmp="$cfg.in.$$"
   if [ -n "$infile" ]; then
     [ -f "$infile" ] || die "config-set: file not found: $infile"
-    cat -- "$infile" > "$in_tmp" || { rm -f -- "$in_tmp"; die "cannot copy $infile"; }
+    cat < "$infile" > "$in_tmp" || { rm -f -- "$in_tmp"; die "cannot copy $infile"; }
   else
     cat > "$in_tmp" || { rm -f "$in_tmp"; die "cannot read config JSON from stdin"; }
   fi
@@ -1936,8 +1936,8 @@ cmd_finish() {
   fi
   while [ $# -gt 0 ]; do
     case "$1" in
-      --merged) [ $# -ge 2 ] || die "finish: --merged requires a file"; merged_file="$2"; shift 2 ;;
-      --dismissed-findings) [ $# -ge 2 ] || die "finish: --dismissed-findings requires a file"; dismissed_file="$2"; shift 2 ;;
+      --merged) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --merged requires a non-empty file path"; merged_file="$2"; shift 2 ;;
+      --dismissed-findings) [ $# -ge 2 ] && [ -n "${2:-}" ] || die "finish: --dismissed-findings requires a non-empty file path"; dismissed_file="$2"; shift 2 ;;
       --partial-approved) [ $# -ge 2 ] || die "finish: --partial-approved requires a reason"; partial_reason="$2"; shift 2 ;;
       --ignore-project-config) ign_arg=1; shift ;;
       --use-project-config) ign_arg=0; shift ;;
@@ -2239,32 +2239,46 @@ cmd_finish() {
           die "--dismissed-findings[$idx].reopens must be a JSON string\n" unless $dh->{reopens}[0] eq "str";
           $reo = $dh->{reopens}[1];
         }
+        my $d_index = undef;
+        if (exists $dh->{index} && $dh->{index}[0] ne "null") {
+          die "--dismissed-findings[$idx].index must be a non-negative integer\n"
+            unless $dh->{index}[0] eq "num" && defined($dh->{index}[1]) && $dh->{index}[1] =~ /\A(?:0|[1-9][0-9]*)\z/;
+          $d_index = int($dh->{index}[1]);
+        }
         push @dismissed, {
           slot          => $dh->{slot}[1],
           title         => $dh->{title}[1],
           severity      => $sev,
           code_evidence => $dh->{code_evidence}[1],
           reopens       => $reo,
+          index         => $d_index,
         };
       }
     }
 
     my @dism_used = (0) x scalar(@dismissed);
     my $consume_dismissal = sub {
-      my ($slot, $model_tag, $f) = @_;
-      for my $idx (0 .. $#dismissed) {
-        next if $dism_used[$idx];
-        my $d = $dismissed[$idx];
-        next unless ($d->{slot} eq $slot || $d->{slot} eq $model_tag);
-        next unless $d->{severity} eq $f->{severity};
-        next unless $d->{title} eq $f->{title};
-        my $f_reo = $f->{reopens} // "";
-        my $d_reo = $d->{reopens} // "";
-        if (length($f_reo) || length($d_reo)) {
-          next unless $d_reo eq $f_reo;
+      my ($slot, $model_tag, $f, $f_idx) = @_;
+      for my $pass (0, 1) {
+        for my $idx (0 .. $#dismissed) {
+          next if $dism_used[$idx];
+          my $d = $dismissed[$idx];
+          if ($pass == 0) {
+            next unless defined($d->{index}) && defined($f_idx) && $d->{index} == $f_idx;
+          } else {
+            next if defined($d->{index});
+          }
+          next unless ($d->{slot} eq $slot || $d->{slot} eq $model_tag);
+          next unless $d->{severity} eq $f->{severity};
+          next unless $d->{title} eq $f->{title};
+          my $f_reo = $f->{reopens} // "";
+          my $d_reo = $d->{reopens} // "";
+          if (length($f_reo) || length($d_reo)) {
+            next unless $d_reo eq $f_reo;
+          }
+          $dism_used[$idx] = 1;
+          return 1;
         }
-        $dism_used[$idx] = 1;
-        return 1;
       }
       return 0;
     };
@@ -2277,11 +2291,18 @@ cmd_finish() {
       return $s;
     };
 
+    my $norm_loc = sub {
+      my ($s) = @_;
+      $s = defined $s ? $s : "";
+      $s =~ s/\A\s+|\s+\z//g;
+      return $s;
+    };
+
     my $finding_locs = sub {
       my ($f) = @_;
       my %locs;
       for my $raw (($f->{location} // ""), @{$f->{instances} || []}) {
-        my $n = $norm->($raw);
+        my $n = $norm_loc->($raw);
         $locs{$n} = 1 if length $n;
       }
       return \%locs;
@@ -2357,7 +2378,14 @@ cmd_finish() {
     };
 
     my $finding_corresponds = sub {
-      my ($orig, $mf) = @_;
+      my ($orig, $mf, $is_cross_slot) = @_;
+      if ($is_cross_slot) {
+        return 1 if $text_matches->($orig->{pattern}, $mf->{pattern});
+        return $corresponds->(
+          join(" ", $orig->{pattern} // "", $orig->{fix} // ""),
+          join(" ", $mf->{pattern}   // "", $mf->{fix}   // "")
+        );
+      }
       return 1 if $text_matches->($orig->{title}, $mf->{title})
                || $text_matches->($orig->{pattern}, $mf->{pattern});
       return $corresponds->(
@@ -2436,7 +2464,7 @@ cmd_finish() {
         }
         if (!(length($oreo) && ($mf->{reopens} // "") eq $oreo)) {
           die "findings[$mi] lacks root-cause correspondence with slot $sn findings[$idx] (\x27$orig->{title}\x27)\n"
-            unless $finding_corresponds->($orig, $mf);
+            unless $finding_corresponds->($orig, $mf, scalar(@$mfrom) >= 2 ? 1 : 0);
         }
         $claimed_blocking_f{$ckey} = 1 if $is_blocking->($mf->{severity});
       }
@@ -2505,6 +2533,16 @@ cmd_finish() {
       }
     }
 
+    # Reject explicit-index dismissals pointing to already-claimed findings (contradictory claim + dismiss).
+    for my $d (@dismissed) {
+      next unless defined $d->{index};
+      my $so = eval { $resolve_slot->($d->{slot}, "--dismissed-findings") };
+      next if $@ || !$so;
+      my $ck = "$so->{slot}\0$d->{index}";
+      die "contradictory --dismissed-findings: slot $so->{slot} findings[$d->{index}] is already claimed in merged findings[]\n"
+        if $claimed_f{$ck};
+    }
+
     # 3. Verify 100% coverage of EVERY undismissed blocking finding and EVERY step_back[] proposal across all valid slots.
     my @unaccounted;
     for my $vs (@valid_slots) {
@@ -2514,10 +2552,9 @@ cmd_finish() {
       for my $idx (0 .. $#$s_findings) {
         my $f = $s_findings->[$idx];
         next unless $is_blocking->($f->{severity});
-        next if $consume_dismissal->($sn, $mtag, $f);
-        if (!$claimed_blocking_f{"$sn\0$idx"}) {
-          push @unaccounted, "slot $sn ($mtag) blocking finding[$idx] ($f->{severity}:$f->{title}) not claimed by any merged blocking finding via merged_from[] without evidenced --dismissed-findings";
-        }
+        next if $claimed_blocking_f{"$sn\0$idx"};
+        next if $consume_dismissal->($sn, $mtag, $f, $idx);
+        push @unaccounted, "slot $sn ($mtag) blocking finding[$idx] ($f->{severity}:$f->{title}) not claimed by any merged blocking finding via merged_from[] without evidenced --dismissed-findings";
       }
       my $s_sbs = $vs->{obj}{step_back} || [];
       for my $idx (0 .. $#$s_sbs) {

@@ -481,11 +481,14 @@ sub cmd_config_show {
   my %opt = @_;
   my $ucfg = user_config_path();
   my $st_ro;
-  if (defined $opt{task} && -d $opt{task} && !-l $opt{task}) {
-    my $rt = abs_path($opt{task});
-    if (defined $rt && -f "$rt/research/plans/planning-state.json" && !-l "$rt/research/plans/planning-state.json") {
-      my $loaded = eval { load_json_file("$rt/research/plans/planning-state.json") };
-      $st_ro = $loaded if !$@ && ref $loaded eq 'HASH';
+  if (defined $opt{task} && length $opt{task}) {
+    my $task_lex = _strip_trailing_slashes($opt{task});
+    if (-d $task_lex && !-l $task_lex) {
+      my $rt = abs_path($task_lex);
+      if (defined $rt && -f "$rt/research/plans/planning-state.json" && !-l "$rt/research/plans/planning-state.json") {
+        my $loaded = eval { load_json_file("$rt/research/plans/planning-state.json") };
+        $st_ro = $loaded if !$@ && ref $loaded eq 'HASH';
+      }
     }
   }
   my $repo = resolve_repo_root($opt{repo}, $opt{task});
@@ -3149,32 +3152,46 @@ sub _verify_review_slot_binding {
         die_err("--dismissed-findings[$idx].reopens must be a string", 3) unless $dh->{reopens}[0] eq 'str';
         $reo = $dh->{reopens}[1];
       }
+      my $d_index = undef;
+      if (exists $dh->{index} && $dh->{index}[0] ne 'null') {
+        die_err("--dismissed-findings[$idx].index must be a non-negative integer", 3)
+          unless $dh->{index}[0] eq 'num' && defined($dh->{index}[1]) && $dh->{index}[1] =~ /\A(?:0|[1-9][0-9]*)\z/;
+        $d_index = int($dh->{index}[1]);
+      }
       push @dismissed, {
         slot          => $dh->{slot}[1],
         title         => $dh->{title}[1],
         severity      => $sev,
         code_evidence => $dh->{code_evidence}[1],
         reopens       => $reo,
+        index         => $d_index,
       };
     }
   }
 
   my @dism_used = (0) x scalar(@dismissed);
   my $consume_dismissal = sub {
-    my ($sn, $mtag, $f) = @_;
-    for my $idx (0 .. $#dismissed) {
-      next if $dism_used[$idx];
-      my $d = $dismissed[$idx];
-      next unless $d->{slot} eq $sn || $d->{slot} eq $mtag;
-      next unless $d->{severity} eq $f->{severity};
-      next unless $d->{title} eq $f->{title};
-      my $f_reo = $f->{reopens} // '';
-      my $d_reo = $d->{reopens} // '';
-      if (length($f_reo) || length($d_reo)) {
-        next unless $d_reo eq $f_reo;
+    my ($sn, $mtag, $f, $f_idx) = @_;
+    for my $pass (0, 1) {
+      for my $idx (0 .. $#dismissed) {
+        next if $dism_used[$idx];
+        my $d = $dismissed[$idx];
+        if ($pass == 0) {
+          next unless defined($d->{index}) && defined($f_idx) && $d->{index} == $f_idx;
+        } else {
+          next if defined($d->{index});
+        }
+        next unless $d->{slot} eq $sn || $d->{slot} eq $mtag;
+        next unless $d->{severity} eq $f->{severity};
+        next unless $d->{title} eq $f->{title};
+        my $f_reo = $f->{reopens} // '';
+        my $d_reo = $d->{reopens} // '';
+        if (length($f_reo) || length($d_reo)) {
+          next unless $d_reo eq $f_reo;
+        }
+        $dism_used[$idx] = 1;
+        return 1;
       }
-      $dism_used[$idx] = 1;
-      return 1;
     }
     return 0;
   };
@@ -3244,11 +3261,18 @@ sub _verify_review_slot_binding {
     return $s;
   };
 
+  my $norm_loc = sub {
+    my ($s) = @_;
+    $s = defined $s ? $s : '';
+    $s =~ s/\A\s+|\s+\z//g;
+    return $s;
+  };
+
   my $finding_locs = sub {
     my ($f) = @_;
     my %locs;
     for my $raw (($f->{location} // ''), @{$f->{instances} || []}) {
-      my $n = $norm->($raw);
+      my $n = $norm_loc->($raw);
       $locs{$n} = 1 if length $n;
     }
     return \%locs;
@@ -3324,13 +3348,37 @@ sub _verify_review_slot_binding {
   };
 
   my $finding_corresponds = sub {
-    my ($orig, $mf) = @_;
+    my ($orig, $mf, $is_cross_slot) = @_;
+    if ($is_cross_slot) {
+      return 1 if $text_matches->($orig->{pattern}, $mf->{pattern});
+      return $corresponds->(
+        join(' ', $orig->{pattern} // '', $orig->{fix} // ''),
+        join(' ', $mf->{pattern}   // '', $mf->{fix}   // '')
+      );
+    }
     return 1 if $text_matches->($orig->{title}, $mf->{title})
              || $text_matches->($orig->{pattern}, $mf->{pattern});
     return $corresponds->(
       join(' ', $orig->{title} // '', $orig->{pattern} // '', $orig->{fix} // ''),
       join(' ', $mf->{title}   // '', $mf->{pattern}   // '', $mf->{fix}   // '')
     );
+  };
+
+  my $evidence_preserved = sub {
+    my ($orig_ev, $merged_ev) = @_;
+    my $oe = $norm_loc->($orig_ev);
+    my $me = $norm_loc->($merged_ev);
+    return 1 unless length $oe;
+    return 0 unless length $me;
+    return 1 if index($me, $oe) >= 0;
+    my @cites = ($oe =~ m{([A-Za-z0-9_./-]+:\d+)}g);
+    if (@cites) {
+      for my $c (@cites) {
+        return 0 if index($me, $c) < 0;
+      }
+      return 1;
+    }
+    return $corresponds->($oe, $me);
   };
 
   my $sb_corresponds = sub {
@@ -3392,9 +3440,14 @@ sub _verify_review_slot_binding {
         die_err("findings[$mi] omits location/instance '$loc' from slot $sn findings[$idx]", 3)
           unless $mf_locs->{$loc};
       }
+      my $is_cross = (scalar(@$mfrom) >= 2) ? 1 : 0;
       if (!(length($oreo) && ($mf->{reopens} // '') eq $oreo)) {
         die_err("findings[$mi] lacks root-cause correspondence with slot $sn findings[$idx] ('$orig->{title}')", 3)
-          unless $finding_corresponds->($orig, $mf);
+          unless $finding_corresponds->($orig, $mf, $is_cross);
+      }
+      if ($is_cross) {
+        die_err("findings[$mi].evidence omits evidence from slot $sn findings[$idx]", 3)
+          unless $evidence_preserved->($orig->{evidence}, $mf->{evidence});
       }
       $claimed_blocking_f{$ckey} = 1 if $is_blocking->($mf->{severity});
     }
@@ -3463,6 +3516,16 @@ sub _verify_review_slot_binding {
     }
   }
 
+  # Reject explicit-index dismissals pointing to already-claimed findings (contradictory claim + dismiss).
+  for my $d (@dismissed) {
+    next unless defined $d->{index};
+    my $so = eval { $resolve_slot->($d->{slot}, '--dismissed-findings') };
+    next if $@ || !$so;
+    my $ck = "$so->{slot}\0$d->{index}";
+    die_err("contradictory --dismissed-findings: slot $so->{slot} findings[$d->{index}] is already claimed in merged findings[]", 3)
+      if $claimed_f{$ck};
+  }
+
   # 3. Verify 100% coverage of EVERY undismissed/undisputed blocking finding and EVERY step_back[] proposal.
   my @unaccounted;
   for my $so (@slot_objs) {
@@ -3476,7 +3539,7 @@ sub _verify_review_slot_binding {
         my $dres = $disputed_classes{$f->{reopens}} // '';
         if ($dres eq 'reopen') {
           die_err("contradictory --dismissed-findings for reopened blocking class $f->{reopens} whose dispute resolved as 'reopen'", 3)
-            if $consume_dismissal->($sn, $mtag, $f);
+            if $consume_dismissal->($sn, $mtag, $f, $idx);
           if (!$claimed_blocking_f{"$sn\0$idx"}) {
             push @unaccounted, "slot $sn ($mtag) reopened blocking finding[$idx] ($f->{severity}:$f->{reopens}:$f->{title}) not claimed at >= severity via merged_from[]";
           }
@@ -3484,10 +3547,9 @@ sub _verify_review_slot_binding {
         }
         next if $dres eq 'verified' || $dres eq 'unresolved';
       }
-      next if $consume_dismissal->($sn, $mtag, $f);
-      if (!$claimed_blocking_f{"$sn\0$idx"}) {
-        push @unaccounted, "slot $sn ($mtag) blocking finding[$idx] ($f->{severity}:$f->{title}) not claimed by any merged blocking finding via merged_from[] without validated dispute or evidenced --dismissed-findings";
-      }
+      next if $claimed_blocking_f{"$sn\0$idx"};
+      next if $consume_dismissal->($sn, $mtag, $f, $idx);
+      push @unaccounted, "slot $sn ($mtag) blocking finding[$idx] ($f->{severity}:$f->{title}) not claimed by any merged blocking finding via merged_from[] without validated dispute or evidenced --dismissed-findings";
     }
     my $s_sbs = $so->{obj}{step_back} || [];
     for my $idx (0 .. $#$s_sbs) {
@@ -5086,7 +5148,7 @@ while (@ARGV) {
   elsif ($a eq '--reconciled-child-thread-id')   { $opt{reconciled_child_thread_id} = _decode_cli_text(shift @ARGV, $a); }
   elsif ($a eq '--input')                        { $opt{input}                      = shift @ARGV; }
   elsif ($a eq '--merged-input')                 { $opt{merged_input}               = shift @ARGV; }
-  elsif ($a eq '--dismissed-findings')           { $opt{dismissed_findings}         = shift @ARGV; }
+  elsif ($a eq '--dismissed-findings')           { my $v = shift @ARGV; die_err("--dismissed-findings requires a non-empty file path") unless defined $v && length $v; $opt{dismissed_findings} = $v; }
   elsif ($a eq '--inherit-wording-confirmation') { $opt{inherit_wording_confirmation} = 1; }
   elsif ($a eq '--assemble')                     { $opt{assemble}                   = 1; }
   elsif ($a eq '--dispositions-json')            { $opt{dispositions_json}          = shift @ARGV; }

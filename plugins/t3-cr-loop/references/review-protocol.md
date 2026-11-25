@@ -30,7 +30,7 @@ Resolve `PLUGIN_ROOT` from the directory containing the active `SKILL.md` (follo
 
 ```bash
 # If this skill was opened via <skill-dir>/SKILL.md:
-PLUGIN_ROOT=$(cd "$(dirname "$(readlink -f "<skill-dir>/SKILL.md" 2>/dev/null || perl -MCwd=abs_path -e 'print abs_path(shift)' "<skill-dir>/SKILL.md")")/../.." && pwd -P)
+PLUGIN_ROOT=$(cd -- "$(dirname "$(readlink -f -- "<skill-dir>/SKILL.md" 2>/dev/null || perl -MCwd=abs_path -e 'print abs_path(shift)' -- "<skill-dir>/SKILL.md")")/../.." && pwd -P)
 T3_STATE="$PLUGIN_ROOT/scripts/t3-cr-state.sh"
 ```
 

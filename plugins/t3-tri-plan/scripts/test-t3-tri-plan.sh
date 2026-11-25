@@ -2304,7 +2304,7 @@ assert_rc "t3-tri-plan council rejects substituting 2 copies of Prop 1 (superset
 out=$(bash "$STATE" finish-review-round --task "$TASK_K" --repo "$REPO_K" --merged-input "$TMP/rev-ksb-both.json" 2>&1); rc=$?
 assert_rc "t3-tri-plan council accepts preserving both step_back[] proposals 1-to-1" "$rc" 0
 
-# K4d. Round 5 High #3: different root causes on SAME line CANNOT collapse into 1 merged finding; same-name distinct step_back[] CAN coexist!
+# K4d. Round 5 High #3 + Round 6 High #2: different root causes on SAME line (even with IDENTICAL title!) CANNOT collapse into 1 merged finding!
 pr_kh3=$(bash "$STATE" prepare-review --task "$TASK_K" --repo "$REPO_K" --purpose full --mode full --slots-json "$TMP/two-rev.json" --owner "owner-k1")
 PRKH3_RUN=$(printf '%s\n' "$pr_kh3" | sed -n 's/^RUN_ID=//p')
 PRKH3_DSHA=$(printf '%s\n' "$pr_kh3" | sed -n 's/^REVIEWED_DESIGN_SHA256=//p')
@@ -2312,7 +2312,7 @@ cat > "$TMP/rev-kh3-s1.json" <<EOF
 {
   "summary": "Auth check missing", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
   "findings": [{
-    "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
     "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
     "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
   }],
@@ -2323,7 +2323,7 @@ cat > "$TMP/rev-kh3-s2.json" <<EOF
 {
   "summary": "Stream not closed", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
   "findings": [{
-    "severity": "BLOCKER", "reopens": "", "title": "Stream not closed", "location": "design.md:1",
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
     "pattern": "file stream leaks descriptor on error return path", "still_wrong": "", "instances": ["design.md:1"],
     "fix": "close stream handle in finally block", "prevent": "add leak test", "evidence": "src/app.py:1", "violates_review_md_rule": ""
   }],
@@ -2332,14 +2332,14 @@ cat > "$TMP/rev-kh3-s2.json" <<EOF
 EOF
 cat > "$TMP/rev-kh3-bad-merge.json" <<EOF
 {
-  "summary": "Collapsed distinct root causes", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
+  "summary": "Collapsed distinct root causes despite same title", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
   "findings": [{
-    "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+    "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
     "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
     "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
     "sources": ["slot1", "slot2"],
     "merged_from": [{ "slot": "slot1", "index": 0 }, { "slot": "slot2", "index": 0 }],
-    "merge_rationale": "same line design.md:1"
+    "merge_rationale": "same line and same title"
   }],
   "verified": [], "step_back": [], "out_of_scope": []
 }
@@ -2349,13 +2349,13 @@ cat > "$TMP/rev-kh3-good-sep.json" <<EOF
   "summary": "Preserved both distinct same-line root causes", "mode": "full", "reviewed_design_sha256": "$PRKH3_DSHA", "verdict": "findings",
   "findings": [
     {
-      "severity": "BLOCKER", "reopens": "", "title": "Missing auth check", "location": "design.md:1",
+      "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
       "pattern": "handler accepts unauthenticated request without authz guard", "still_wrong": "", "instances": ["design.md:1"],
       "fix": "verify session token before handler", "prevent": "add authz test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
       "sources": ["slot1"], "merged_from": [{ "slot": "slot1", "index": 0 }]
     },
     {
-      "severity": "BLOCKER", "reopens": "", "title": "Stream not closed", "location": "design.md:1",
+      "severity": "BLOCKER", "reopens": "", "title": "Input handling bug", "location": "design.md:1",
       "pattern": "file stream leaks descriptor on error return path", "still_wrong": "", "instances": ["design.md:1"],
       "fix": "close stream handle in finally block", "prevent": "add leak test", "evidence": "src/app.py:1", "violates_review_md_rule": "",
       "sources": ["slot2"], "merged_from": [{ "slot": "slot2", "index": 0 }]
@@ -2472,6 +2472,21 @@ FP1=$(perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'print compute_worktree_
 printf 'untr-v2\n' > "$SUB_K_HOST/vendor/sub/untr.txt"
 FP2=$(perl -I"$HERE/lib" -MTriTx=compute_worktree_fp -e 'print compute_worktree_fp($ARGV[0], "")->{digest}' "$SUB_K_HOST")
 [ -n "$FP1" ] && [ -n "$FP2" ] && [ "$FP1" != "$FP2" ] && ok "TriTx compute_worktree_fp catches 2nd edit to untracked file inside tracked submodule" || fail "TriTx missed 2nd edit to submodule untracked file! ($FP1 == $FP2)"
+
+# K8. Round 6 High #1: t3-tri-plan install-skills.sh handles leading '-' and '-e;BEGIN{...}' target dirs safely!
+INST_TRI_DASH="$TMP/inst-tri-dash"
+mkdir -p "$INST_TRI_DASH"
+(
+  cd "$INST_TRI_DASH" || exit 2
+  bash "$INSTALLER" --target "-foo" >/dev/null || exit 51
+  [ -L "-foo/t3-tri-plan" ] || exit 52
+  bash "$INSTALLER" --uninstall --target "-foo" >/dev/null || exit 53
+  [ ! -L "-foo/t3-tri-plan" ] || exit 54
+  POC_DIR='-e;BEGIN{open(my $f,">","INJECTED_TRI");print $f "bad";close $f}#'
+  bash "$INSTALLER" --target "$POC_DIR" >/dev/null || exit 55
+  bash "$INSTALLER" --uninstall --target "$POC_DIR" >/dev/null || exit 56
+  [ ! -e "INJECTED_TRI" ] && [ ! -L "$POC_DIR/t3-tri-plan" ] || exit 57
+) && ok "t3-tri-plan install-skills.sh handles leading-dash and -e target dirs safely" || fail "t3-tri-plan install-skills.sh failed or executed Perl switch code"
 
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -14,7 +14,7 @@ Works across **any repository with Trellis** without modifying the repository's 
 Resolve `PLUGIN_ROOT` by following this `SKILL.md`'s real path (`../../` from `skills/t3-tri-plan/SKILL.md`), then **read `<PLUGIN_ROOT>/references/plan-protocol.md` in full** before taking action:
 
 ```bash
-PLUGIN_ROOT=$(cd "$(dirname "$(readlink -f "<skill-dir>/SKILL.md" 2>/dev/null || perl -MCwd=abs_path -e 'print abs_path(shift)' "<skill-dir>/SKILL.md")")/../.." && pwd -P)
+PLUGIN_ROOT=$(cd -- "$(dirname "$(readlink -f -- "<skill-dir>/SKILL.md" 2>/dev/null || perl -MCwd=abs_path -e 'print abs_path(shift)' -- "<skill-dir>/SKILL.md")")/../.." && pwd -P)
 TRI_STATE="$PLUGIN_ROOT/scripts/t3-tri-plan-state.sh"
 ```
 
