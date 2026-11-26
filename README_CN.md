@@ -12,6 +12,16 @@
 | [socratic-questioning](./plugins/socratic-questioning) | 引导 Claude 使用苏格拉底式提问方法，在行动前澄清不明确的需求 | 思维, 方法论, 钩子 |
 | [bug-fix-testcase](./plugins/bug-fix-testcase) | 端到端 `/bugfix` 命令 + 在隔离的 git worktree 中生成子代理编写回归测试 | 测试, 修复, 回归, 代理, worktree |
 
+### T3 Code 套件插件（`.agents/plugins/marketplace.json`）
+
+以下三个 T3 Code 原生插件组合构成完整的发布分支工作流（`t3-branch-coordinator` → `t3-tri-plan` → `t3-tdd-adversarial` → `t3-cr-loop` → `t3-task-cleanup`）：
+
+| 插件 | 包含 Skill | 描述 |
+|------|------------|------|
+| [t3-workflow](./plugins/t3-workflow) | `t3-branch-coordinator`、`t3-tdd-adversarial`、`t3-task-cleanup` | 分支统筹规划（需求 interview、双模型 UI 出图、`t3_thread_launch` 派单）、契约先行红蓝对抗 TDD、以及任务级安全收尾清理 |
+| [t3-tri-plan](./plugins/t3-tri-plan) | `t3-tri-plan` | 三盲多模型 Trellis 规划、零历史盲评裁决、多模型设计审查收敛与带锁 Phase 6 激活 |
+| [t3-cr-loop](./plugins/t3-cr-loop) | `t3-cr-loop`、`t3-cr-loop-merge`、`t3-cr-loop-pr` | 多模型代码审查收敛循环（首轮与 step-back 走 Council，增量与确认走单模型），支持本地收敛、合并与提 PR |
+
 ## 安装方法
 
 ### 方法一：添加市场并安装插件（推荐）
