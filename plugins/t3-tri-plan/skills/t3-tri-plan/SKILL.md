@@ -1,6 +1,6 @@
 ---
 name: t3-tri-plan
-description: Run the T3 Code-native triple-blind Trellis planning pipeline: parallel read-only multi-model design (3 blind candidates), zero-history anonymous blind judge locking winner + surgical cherry-picks + initial design before reveal, multi-model council/default design-review convergence loop, execution plan validation, and safe Phase 6 activation.
+description: "Run the T3 Code-native triple-blind Trellis planning pipeline: parallel read-only multi-model design (3 blind candidates), zero-history anonymous blind judge locking winner + surgical cherry-picks + initial design before reveal, multi-model council/default design-review convergence loop, execution plan validation, and safe Phase 6 activation."
 ---
 
 # T3 Tri-Plan (Triple-Blind Trellis Planning Pipeline)
