@@ -1,0 +1,41 @@
+{
+  "name": "t3-workflow",
+  "version": "1.0.0",
+  "description": "T3 Code-native branch coordination, Red/Blue adversarial TDD, and task wrap-up cleanup skills (t3-branch-coordinator, t3-tdd-adversarial, t3-task-cleanup). Works seamlessly with t3-tri-plan and t3-cr-loop for end-to-end release-branch orchestration.",
+  "author": {
+    "name": "kenxcomp",
+    "url": "https://github.com/kenxcomp"
+  },
+  "repository": "https://github.com/kenxcomp/yoyo",
+  "license": "MIT",
+  "keywords": [
+    "t3-code",
+    "branch-coordinator",
+    "tdd",
+    "red-blue",
+    "worktree",
+    "cleanup",
+    "orchestration",
+    "multi-model"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "T3 Workflow",
+    "shortDescription": "Branch coordinator, contract-first Red/Blue adversarial TDD, and fail-closed task cleanup for T3 Code.",
+    "longDescription": "T3 Code-native orchestration suite containing three composable skills: t3-branch-coordinator (bootstrap/bind target branch, interview requirements, run dual-model UI mockups, and launch governed top-level task sessions via t3_thread_launch), t3-tdd-adversarial (contract-first Red/Blue parallel worktree TDD with audited net-patch allowlist gates, per-ID red-to-green verification, and pre-push SHA/PR-coverage gates), and t3-task-cleanup (fail-closed, identity-bound post-merge cleanup of task temp files, child worktrees, and atomic CAS temp-branch deletion).",
+    "developerName": "kenxcomp",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Plan",
+      "Write",
+      "Test",
+      "Review"
+    ],
+    "defaultPrompt": [
+      "Use t3-branch-coordinator to manage this release branch.",
+      "Run t3-tdd-adversarial on the current activated task.",
+      "Run t3-task-cleanup to wrap up this completed task."
+    ],
+    "brandColor": "#7C3AED"
+  }
+}

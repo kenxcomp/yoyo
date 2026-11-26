@@ -12,6 +12,16 @@ A curated collection of useful plugins for Claude Code.
 | [socratic-questioning](./plugins/socratic-questioning) | A plugin that guides Claude to use Socratic questioning methods to clarify unclear prompts before action | thinking, methodology, hooks |
 | [bug-fix-testcase](./plugins/bug-fix-testcase) | End-to-end `/bugfix` command + subagent in isolated git worktree for regression tests | testing, bugfix, regression, agents, worktree |
 
+### T3 Code Plugins (`.agents/plugins/marketplace.json`)
+
+The three T3 Code-native plugins work together as a unified release-branch pipeline (`t3-branch-coordinator` → `t3-tri-plan` → `t3-tdd-adversarial` → `t3-cr-loop` → `t3-task-cleanup`):
+
+| Plugin | Skills | Description |
+|--------|--------|-------------|
+| [t3-workflow](./plugins/t3-workflow) | `t3-branch-coordinator`, `t3-tdd-adversarial`, `t3-task-cleanup` | Release-branch coordinator (interview, dual-model UI mockups, `t3_thread_launch` dispatch), contract-first Red/Blue adversarial TDD, and fail-closed post-merge task cleanup |
+| [t3-tri-plan](./plugins/t3-tri-plan) | `t3-tri-plan` | Triple-blind multi-model Trellis planning, blind judge synthesis, council design-review convergence, and process-locked Phase 6 activation |
+| [t3-cr-loop](./plugins/t3-cr-loop) | `t3-cr-loop`, `t3-cr-loop-merge`, `t3-cr-loop-pr` | Multi-model code review convergence loop (council on Round 1 & step-back, single reviewer on incremental/confirmation) with stop, local merge, and PR modes |
+
 ## Installation
 
 ### Method 1: Add Marketplace and Install Plugins (Recommended)
